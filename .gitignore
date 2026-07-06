@@ -1,6 +1,7 @@
 node_modules
 dist
 .env
+.vercel
 
 # Prisma generated client (regenerated via `prisma generate`)
 # Keep the schema tracked; the generated client is not.

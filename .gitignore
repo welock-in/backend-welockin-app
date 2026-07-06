@@ -1,0 +1,11 @@
+node_modules
+dist
+.env
+
+# Prisma generated client (regenerated via `prisma generate`)
+# Keep the schema tracked; the generated client is not.
+
+# Logs & OS cruft
+*.log
+.DS_Store
+Thumbs.db

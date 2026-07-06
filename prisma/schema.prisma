@@ -1,0 +1,70 @@
+// WeLockin backend — Prisma schema (MongoDB provider).
+//
+// NOTE: Prisma's MongoDB connector requires a replica set. MongoDB Atlas
+// provisions one by default (even on the free M0 tier), so no extra setup is
+// needed there. A bare local `mongod` will NOT work unless started as a
+// replica set.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String    @id @default(auto()) @map("_id") @db.ObjectId
+  email        String    @unique
+  passwordHash String
+  plan         String    @default("trial")
+  trialEndsAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  devices     Device[]
+  focusEvents FocusEvent[]
+  snapshot    SyncSnapshot?
+}
+
+model Device {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId     String   @db.ObjectId
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name       String
+  platform   String
+  lastSeenAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, name])
+  @@index([userId])
+}
+
+model SyncSnapshot {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId     String   @unique @db.ObjectId
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  blocklists Json
+  sessions   Json
+  revision   Int      @default(0)
+  updatedAt  DateTime @updatedAt
+}
+
+model FocusEvent {
+  id             String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId         String   @db.ObjectId
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceId       String?
+  name           String
+  startedAt      DateTime
+  endedAt        DateTime
+  plannedSeconds Int
+  completed      Boolean
+  hardLock       Boolean
+  killedTotal    Int      @default(0)
+  createdAt      DateTime @default(now())
+
+  @@index([userId])
+  @@index([userId, startedAt])
+}

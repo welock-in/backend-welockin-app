@@ -7,10 +7,11 @@
 
 generator client {
   provider = "prisma-client-js"
-  // "native" for local dev; "rhel-openssl-3.0.x" is the Vercel/AWS Lambda
-  // runtime (Amazon Linux 2023). Both engines are bundled so the same client
-  // works locally and when deployed.
-  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+  // "native" for local dev. The rhel targets cover the Vercel/AWS Lambda
+  // runtime: Node 20+ (Amazon Linux 2023) uses openssl-3.0.x, Node 18
+  // (Amazon Linux 2) uses openssl-1.0.x. Bundling both means the client works
+  // regardless of the Node version Vercel picks.
+  binaryTargets = ["native", "rhel-openssl-1.0.x", "rhel-openssl-3.0.x"]
 }
 
 datasource db {

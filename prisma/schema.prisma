@@ -52,6 +52,10 @@ model SyncSnapshot {
   user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   blocklists Json
   sessions   Json
+  // Weekly recurring schedule plan (client-defined SchedEvent[]). Optional so
+  // snapshots created before this field existed still read back cleanly, and so
+  // a client that never sends schedules (e.g. mobile) doesn't wipe them.
+  schedules  Json?
   revision   Int      @default(0)
   updatedAt  DateTime @updatedAt
 }

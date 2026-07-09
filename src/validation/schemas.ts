@@ -46,6 +46,9 @@ export const focusEventInputSchema = z.object({
 export const syncPushSchema = z.object({
   blocklists: z.array(z.unknown()),
   sessions: z.array(z.unknown()),
+  // Optional (no default): a client that omits `schedules` must NOT clobber the
+  // stored plan — the push handler only writes it when explicitly present.
+  schedules: z.array(z.unknown()).optional(),
   events: z.array(focusEventInputSchema).optional(),
 });
 

@@ -15,24 +15,31 @@ syncRouter.post(
   "/push",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const { blocklists, sessions, events } = syncPushSchema.parse(req.body);
+    const { blocklists, sessions, schedules, events } = syncPushSchema.parse(req.body);
     const userId = req.user!.id;
 
     // Cast the validated arrays to Prisma's JSON input type.
     const blocklistsJson = blocklists as unknown as Prisma.InputJsonValue;
     const sessionsJson = sessions as unknown as Prisma.InputJsonValue;
+    // Only overwrite the stored schedule plan when the client actually sent one.
+    // A client that omits `schedules` (e.g. the mobile app reporting a focus
+    // event) must leave the desktop's plan untouched.
+    const schedulesJson =
+      schedules === undefined ? undefined : (schedules as unknown as Prisma.InputJsonValue);
 
     const snapshot = await prisma.syncSnapshot.upsert({
       where: { userId },
       update: {
         blocklists: blocklistsJson,
         sessions: sessionsJson,
+        ...(schedulesJson === undefined ? {} : { schedules: schedulesJson }),
         revision: { increment: 1 },
       },
       create: {
         userId,
         blocklists: blocklistsJson,
         sessions: sessionsJson,
+        schedules: schedulesJson ?? [],
         revision: 1,
       },
     });
@@ -73,6 +80,7 @@ syncRouter.get(
       res.json({
         blocklists: [],
         sessions: [],
+        schedules: [],
         revision: 0,
         updatedAt: null,
       });
@@ -82,6 +90,9 @@ syncRouter.get(
     res.json({
       blocklists: snapshot.blocklists,
       sessions: snapshot.sessions,
+      // `schedules` is optional in the schema and null on snapshots that predate
+      // it — normalize to an empty array for clients.
+      schedules: snapshot.schedules ?? [],
       revision: snapshot.revision,
       updatedAt: snapshot.updatedAt,
     });

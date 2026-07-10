@@ -296,9 +296,68 @@ backend/
       error.ts           # 404 + central error handler ({ error })
       async-handler.ts   # forwards async errors to the error handler
     routes/
-      health.ts  auth.ts  me.ts  devices.ts  sync.ts  analytics.ts
+      health.ts  auth.ts  me.ts  devices.ts  sync.ts  focus-events.ts  analytics.ts
     services/
       analytics.ts       # summary + day-streak computation
+      focus-events.ts    # idempotent FocusEvent ingestion (dedup on clientEventId)
     validation/
       schemas.ts         # zod request schemas
+    lib/
+      apple.ts           # Sign in with Apple identityToken verification
 ```
+
+## Mobile integration (multi-platform: iOS ⇄ PC)
+
+The mobile app shares the **account, devices and stats** with the PC app. All
+changes below are **additive and backward-compatible** — the PC flow
+(register/login, `POST /devices`, `POST /sync/push`, `GET /sync/pull`,
+`GET /analytics/summary`) is unchanged, and `SyncSnapshot` is untouched. Mobile
+blocklists stay local (opaque iOS Screen Time tokens are never sent to the server).
+
+### New / changed routes
+
+- **`POST /api/auth/apple`** — no auth. Body `{ identityToken, fullName?, email? }`.
+  Verifies the Sign-in-with-Apple token against Apple's public keys (`aud` =
+  `APPLE_BUNDLE_ID`, `iss` = apple, valid signature/exp), then find-or-creates the
+  account by `AuthProvider(provider:"apple", providerUid: sub)`. If Apple returns
+  an email that matches an existing account it links Apple to it (merge). Returns
+  the same `{ token, user }` as email/password login → works with `requireAuth`.
+  `201` on first create, `200` afterwards.
+- **`POST /api/devices`** — auth. Now accepts optional `deviceId` (stable
+  client-generated UUID — the real identity key), plus `model`, `osVersion`,
+  `appVersion`, `pushToken`. Matches on `(userId, deviceId)` when present, else
+  falls back to the legacy `(userId, name)` upsert. Still refreshes `lastSeenAt`.
+- **`POST /api/focus-events`** — auth. Ingest one focus event. Body is the same
+  `FocusEventInput` (now also accepts `platform`, `clientEventId`, `emergencyUsed`).
+  **Idempotent**: replaying the same `clientEventId` stores it once (`200` +
+  `{ deduped: true }`). `POST /sync/push`'s `events[]` is idempotent the same way.
+
+### Schema additions (all optional / defaulted → safe `prisma db push`)
+
+- `User.email`, `User.passwordHash` → **optional** (Apple accounts can be fully social).
+- New model **`AuthProvider`** `{ provider, providerUid }` with `@@unique([provider, providerUid])`.
+- `Device` → `deviceId?`, `model?`, `osVersion?`, `appVersion?`, `pushToken?` + `@@index([userId, deviceId])`.
+- `FocusEvent` → `platform?`, `clientEventId?`, `emergencyUsed @default(false)` + `@@index([userId, clientEventId])`.
+
+### Migration
+
+```bash
+npm install            # regenerates the Prisma client
+npx prisma db push     # applies the additive schema (run against a staging DB first)
+```
+
+> **Why no `@@unique` on `deviceId` / `clientEventId`?** Existing PC rows have
+> these as `null`; a plain Mongo unique index rejects multiple nulls, so
+> `db push` would fail on live data. Uniqueness is enforced in the handlers
+> (device upsert + focus-event dedup). To also enforce it at the DB level, add
+> **partial** unique indexes (they ignore the null PC rows) directly in Mongo:
+
+```js
+// mongosh — safe on existing data (only indexes rows where the field is a string)
+db.Device.createIndex({ userId: 1, deviceId: 1 }, { unique: true, partialFilterExpression: { deviceId: { $type: "string" } } });
+db.FocusEvent.createIndex({ userId: 1, clientEventId: 1 }, { unique: true, partialFilterExpression: { clientEventId: { $type: "string" } } });
+```
+
+### Env
+
+Set `APPLE_BUNDLE_ID` (defaults to `in.welock.app`) — the `aud` the Apple token must carry.

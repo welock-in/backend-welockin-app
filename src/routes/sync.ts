@@ -4,6 +4,7 @@ import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { syncPushSchema } from "../validation/schemas";
+import { upsertFocusEvents } from "../services/focus-events";
 
 export const syncRouter = Router();
 
@@ -44,19 +45,10 @@ syncRouter.post(
       },
     });
 
+    // Idempotent per event: the mobile app replays its offline queue, so we
+    // dedup on clientEventId. Desktop events (no clientEventId) insert as before.
     if (events && events.length > 0) {
-      await prisma.focusEvent.createMany({
-        data: events.map((e) => ({
-          userId,
-          name: e.name,
-          startedAt: e.startedAt,
-          endedAt: e.endedAt,
-          plannedSeconds: e.plannedSeconds,
-          completed: e.completed,
-          hardLock: e.hardLock,
-          killedTotal: e.killedTotal,
-        })),
-      });
+      await upsertFocusEvents(userId, events);
     }
 
     res.json({ revision: snapshot.revision, updatedAt: snapshot.updatedAt });

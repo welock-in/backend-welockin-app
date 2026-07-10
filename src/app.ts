@@ -8,6 +8,7 @@ import { authRouter } from "./routes/auth";
 import { meRouter } from "./routes/me";
 import { devicesRouter } from "./routes/devices";
 import { syncRouter } from "./routes/sync";
+import { focusEventsRouter } from "./routes/focus-events";
 import { analyticsRouter } from "./routes/analytics";
 import { errorHandler, notFoundHandler } from "./middleware/error";
 
@@ -31,6 +32,7 @@ export function createApp(): Express {
   app.use("/api/me", meRouter);
   app.use("/api/devices", devicesRouter);
   app.use("/api/sync", syncRouter);
+  app.use("/api/focus-events", focusEventsRouter);
   app.use("/api/analytics", analyticsRouter);
 
   // Fallbacks.

@@ -55,10 +55,17 @@ devicesRouter.post(
     const userId = req.user!.id;
     const now = new Date();
 
-    // Cap genuinely NEW registrations at MAX_DEVICES. Called only in the create
-    // branches (an existing/legacy match is always an update/heartbeat, never
-    // counted), so it never adds lookups to the identity-resolution paths.
+    // Gate genuinely NEW registrations. Called only in the create branches (an
+    // existing/legacy match is always an update/heartbeat, never gated). The plan
+    // is ONE device per form factor (1 desktop + 1 phone + 1 tablet), with a
+    // 3-total safety net for legacy clients that don't send a `kind`.
     const ensureUnderLimit = async () => {
+      if (kind) {
+        const sameKind = await prisma.device.findFirst({ where: { userId, kind } });
+        if (sameKind) {
+          throw conflict(`This account already has a ${kind}. Remove it from that device to sign in here.`);
+        }
+      }
       const count = await prisma.device.count({ where: { userId } });
       if (count >= MAX_DEVICES) {
         throw conflict(`Device limit reached — ${MAX_DEVICES} devices max. Remove one first.`);

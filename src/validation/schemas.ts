@@ -13,6 +13,8 @@ export const loginSchema = z.object({
 export const deviceSchema = z.object({
   name: z.string().trim().min(1, "name is required"),
   platform: z.string().trim().min(1, "platform is required"),
+  // Form factor, so the UI can slot desktop/phone/tablet distinctly.
+  kind: z.enum(["desktop", "phone", "tablet"]).optional(),
   // Stable client-generated UUID — the real cross-platform identity key.
   // Optional so old PC clients (name-only) keep working.
   deviceId: z.string().trim().min(1).optional(),

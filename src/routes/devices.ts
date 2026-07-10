@@ -5,8 +5,24 @@ import { asyncHandler } from "../middleware/async-handler";
 import { deviceSchema } from "../validation/schemas";
 import { deterministicObjectId } from "../lib/deterministic-id";
 import { legacyNameOnlyDeviceWhere } from "../services/device-identity";
+import { conflict } from "../lib/http-error";
 
 export const devicesRouter = Router();
+
+const MAX_DEVICES = 3;
+
+/** List the account's devices (newest registration last). */
+devicesRouter.get(
+  "/",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const devices = await prisma.device.findMany({
+      where: { userId: req.user!.id },
+      orderBy: { createdAt: "asc" },
+    });
+    res.json({ devices, max: MAX_DEVICES });
+  }),
+);
 
 /**
  * Register / heartbeat a device. Matches on the stable client `deviceId` when
@@ -18,15 +34,26 @@ devicesRouter.post(
   "/",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const { name, platform, deviceId, model, osVersion, appVersion, pushToken } =
+    const { name, platform, kind, deviceId, model, osVersion, appVersion, pushToken } =
       deviceSchema.parse(req.body);
     const userId = req.user!.id;
     const now = new Date();
+
+    // Cap genuinely NEW registrations at MAX_DEVICES. Called only in the create
+    // branches (an existing/legacy match is always an update/heartbeat, never
+    // counted), so it never adds lookups to the identity-resolution paths.
+    const ensureUnderLimit = async () => {
+      const count = await prisma.device.count({ where: { userId } });
+      if (count >= MAX_DEVICES) {
+        throw conflict(`Device limit reached — ${MAX_DEVICES} devices max. Remove one first.`);
+      }
+    };
 
     // Only include optional columns that were actually sent (don't null them out).
     const meta = {
       platform,
       lastSeenAt: now,
+      ...(kind !== undefined ? { kind } : {}),
       ...(model !== undefined ? { model } : {}),
       ...(osVersion !== undefined ? { osVersion } : {}),
       ...(appVersion !== undefined ? { appVersion } : {}),
@@ -53,6 +80,7 @@ devicesRouter.post(
             data: { name, deviceId, ...meta },
           });
         } else {
+          await ensureUnderLimit();
           const id = deterministicObjectId("device", userId, deviceId);
           device = await prisma.device.upsert({
             where: { id },
@@ -68,6 +96,7 @@ devicesRouter.post(
       if (existing) {
         device = await prisma.device.update({ where: { id: existing.id }, data: meta });
       } else {
+        await ensureUnderLimit();
         const id = deterministicObjectId("legacy-device", userId, name);
         device = await prisma.device.upsert({
           where: { id },

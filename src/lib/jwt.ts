@@ -3,7 +3,7 @@ import { env } from "./env";
 
 export interface JwtPayload {
   sub: string; // user id
-  email?: string | null; // absent for social accounts that mask the email
+  email: string;
 }
 
 export function signToken(payload: JwtPayload): string {

@@ -2,10 +2,11 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import type { FocusEventInput } from "../validation/schemas";
 import { DEVICE_GRACE_MS } from "../middleware/bound-device";
+import { deterministicObjectId } from "../lib/deterministic-id";
 
-// Idempotent FocusEvent ingestion. The mobile app is offline-first and replays
-// its queue on reconnect, so the same event (identified by `clientEventId`) can
-// arrive more than once — we must store it only ONCE. Events without a
+// Idempotent FocusEvent ingestion. Mobile clients may retry after an uncertain
+// network response, so the same event (identified by `clientEventId`) can arrive
+// more than once — we must store it only ONCE. Events without a
 // clientEventId (e.g. the desktop's existing /sync/push payload) are inserted
 // as before, so PC behaviour is unchanged.
 
@@ -19,10 +20,10 @@ function toData(userId: string, e: FocusEventInput, quarantined: boolean) {
     completed: e.completed,
     hardLock: e.hardLock,
     killedTotal: e.killedTotal,
+    deviceId: e.deviceId,
     platform: e.platform,
     clientEventId: e.clientEventId,
     emergencyUsed: e.emergencyUsed,
-    deviceId: e.deviceId,
     quarantined,
   };
 }
@@ -69,16 +70,22 @@ export async function upsertFocusEvent(userId: string, e: FocusEventInput): Prom
   if (existing) return { event: existing, deduped: true };
 
   const quarantined = await shouldQuarantine(userId, e);
+  // Deterministic _id → atomic idempotency across serverless instances (no nullable
+  // unique index needed); still carries the quarantine flag.
+  const id = deterministicObjectId("focus-event", userId, e.clientEventId);
+
   try {
-    const event = await prisma.focusEvent.create({ data: toData(userId, e, quarantined) });
+    const event = await prisma.focusEvent.create({ data: { id, ...toData(userId, e, quarantined) } });
     return { event, deduped: false };
   } catch (err) {
-    // Race: a concurrent replay inserted it first. With the optional partial
-    // unique index (see README) this surfaces as P2002 — re-read and dedup.
+    // Race: a concurrent replay inserted the same deterministic _id first.
+    // Mongo surfaces that primary-key collision as P2002 — re-read and dedup.
     if (isDuplicateKey(err)) {
-      const raced = await prisma.focusEvent.findFirst({
-        where: { userId, clientEventId: e.clientEventId },
-      });
+      const raced =
+        (await prisma.focusEvent.findUnique({ where: { id } })) ??
+        (await prisma.focusEvent.findFirst({
+          where: { userId, clientEventId: e.clientEventId },
+        }));
       if (raced) return { event: raced, deduped: true };
     }
     throw err;

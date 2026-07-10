@@ -21,11 +21,14 @@ datasource db {
 
 model User {
   id           String    @id @default(auto()) @map("_id") @db.ObjectId
-  // Optional now: a Sign-in-with-Apple account can be fully social (Apple may
-  // mask the email) and has no password. Existing email/password (PC) accounts
-  // still populate both — backward-compatible.
-  email        String?   @unique
+  // Apple supplies a verified real or private-relay email on first consent.
+  // Keeping this required preserves the existing PC contract and avoids the
+  // single-null limitation of a MongoDB unique index.
+  email        String    @unique
   passwordHash String?
+  // Password registrations are unverified until an email-verification flow is
+  // completed. Apple users are created with a verified token email.
+  emailVerified Boolean? @default(false)
   plan         String    @default("trial")
   trialEndsAt  DateTime?
   // Admin gate for the feedback board (moderation, status changes). We gate on
@@ -66,13 +69,12 @@ model Device {
   userId     String   @db.ObjectId
   user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   name       String
-  platform   String
+  platform   String // OS: "windows" | "macos" | "android" | "ios" | "ipados"
+  kind       String? // form factor: "desktop" | "phone" | "tablet"
   // Stable client-generated UUID = the real cross-platform identity key. Optional
-  // for backward-compat: old PC clients that only send `name` keep working, and
-  // the upsert falls back to (userId, name) when deviceId is absent. We do NOT add
-  // @@unique([userId, deviceId]) because existing PC devices have deviceId=null
-  // (multiple nulls would collide); uniqueness is enforced in the upsert handler
-  // and can be hardened with a partial unique index (see README).
+  // for backward-compat: old clients that only send `name` keep working. New
+  // identities use a deterministic Mongo _id, so concurrent heartbeats converge
+  // without requiring a nullable unique index.
   deviceId   String?
   model      String?
   osVersion  String?
@@ -83,7 +85,7 @@ model Device {
   // docs that predate the column (breaking device registration). Optional → they
   // read back as null, and the post-push backfill sets sane values (status active,
   // kind by platform, boundAt=createdAt). `null` status is treated as "active".
-  kind          String? // "phone" | "desktop" — only phone-class devices are bind-managed
+  // (`kind` is declared above — form factor: "desktop" | "phone" | "tablet".)
   status        String?   @default("active") // "active" | "superseded" | "revoked"
   boundAt       DateTime?
   supersededAt  DateTime?
@@ -171,17 +173,17 @@ model FocusEvent {
   // Mobile / multi-platform additions (all optional → PC events unaffected).
   platform       String? // "ios" | "ipados" | "macos" | "windows"
   clientEventId  String? // idempotency key for offline replay
-  emergencyUsed  Boolean  @default(false)
+  // Optional during the first rollout so pre-existing Mongo documents that do
+  // not contain the field remain readable. New writes always provide a boolean.
+  emergencyUsed  Boolean? @default(false)
   // Anti-abuse (Part D): set true when the reporting deviceId does not resolve to
   // the user's active phone (kept for audit, excluded from stats/streaks/quotas).
   // Optional so legacy events read back cleanly; null/false both count.
   quarantined    Boolean? @default(false)
   createdAt      DateTime @default(now())
 
-  // No @@unique([userId, clientEventId]): existing PC events have
-  // clientEventId=null and multiple nulls would fail `db push`. Idempotency is
-  // enforced in the ingestion route (dedup on clientEventId) and can be hardened
-  // with a partial unique index (see README).
+  // No nullable unique index is needed: events carrying a clientEventId use a
+  // deterministic Mongo _id, making concurrent replay atomic at the DB level.
   @@index([userId])
   @@index([userId, startedAt])
   @@index([userId, clientEventId])

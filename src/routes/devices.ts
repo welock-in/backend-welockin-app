@@ -11,6 +11,22 @@ export const devicesRouter = Router();
 
 const MAX_DEVICES = 3;
 
+/**
+ * Unpair (remove) a device by its client `deviceId`. Scoped to the caller's
+ * account — a device only ever removes itself (the desktop sends its own id on
+ * "log out and unpair"); there is no cross-device deletion.
+ */
+devicesRouter.delete(
+  "/:deviceId",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const result = await prisma.device.deleteMany({
+      where: { userId: req.user!.id, deviceId: req.params.deviceId },
+    });
+    res.json({ removed: result.count });
+  }),
+);
+
 /** List the account's devices (newest registration last). */
 devicesRouter.get(
   "/",

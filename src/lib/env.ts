@@ -19,7 +19,7 @@ export const env = {
   nodeEnv: process.env.NODE_ENV ?? "development",
   // Sign in with Apple: the `aud` claim the client's identityToken must carry
   // (your iOS app bundle id). Defaults to the WeLockIn bundle id.
-  appleBundleId: process.env.APPLE_BUNDLE_ID ?? "in.welock.app",
+  appleBundleId: process.env.APPLE_BUNDLE_ID ?? "in.welock.mobile",
 };
 
 export type Env = typeof env;

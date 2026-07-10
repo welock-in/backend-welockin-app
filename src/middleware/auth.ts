@@ -4,7 +4,7 @@ import { unauthorized } from "../lib/http-error";
 
 export interface AuthUser {
   id: string;
-  email?: string | null;
+  email: string;
 }
 
 // Augment Express's Request so `req.user` is typed everywhere.

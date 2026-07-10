@@ -24,12 +24,8 @@ export const deviceSchema = z.object({
 
 export const appleAuthSchema = z.object({
   identityToken: z.string().min(1, "identityToken is required"),
-  // Apple returns the display name only on the FIRST authorization and NOT inside
-  // the token, so the client forwards it once. Optional.
-  fullName: z.string().trim().min(1).optional(),
-  // Optional email hint from the credential (first sign-in). The token's email is
-  // trusted first; this is only a fallback.
-  email: z.string().trim().toLowerCase().email().optional(),
+  // Extra client-supplied fields are deliberately stripped. In particular, an
+  // email hint must never influence account linking; only the signed token may.
 });
 
 /**
@@ -59,19 +55,35 @@ export const focusEventInputSchema = z.object({
   hardLock: z.boolean(),
   killedTotal: z.number().int().nonnegative().optional().default(0),
   // Multi-platform / mobile additions (all optional → PC payloads unchanged).
-  platform: z.enum(["ios", "ipados", "macos", "windows"]).optional(),
+  platform: z.enum(["android", "ios", "ipados", "macos", "windows"]).optional(),
+  deviceId: z.string().trim().min(1).optional(),
   clientEventId: z.string().trim().min(1).optional(),
   emergencyUsed: z.boolean().optional().default(false),
 });
 
-export const syncPushSchema = z.object({
-  blocklists: z.array(z.unknown()),
-  sessions: z.array(z.unknown()),
-  // Optional (no default): a client that omits `schedules` must NOT clobber the
-  // stored plan — the push handler only writes it when explicitly present.
-  schedules: z.array(z.unknown()).optional(),
-  events: z.array(focusEventInputSchema).optional(),
-});
+export const syncPushSchema = z
+  .object({
+    blocklists: z.array(z.unknown()).optional(),
+    sessions: z.array(z.unknown()).optional(),
+    // Optional (no default): a client that omits `schedules` must NOT clobber the
+    // stored plan — the push handler only writes it when explicitly present.
+    schedules: z.array(z.unknown()).optional(),
+    events: z.array(focusEventInputSchema).optional(),
+    // An event-bearing request without schedules is treated as append-only by
+    // default, protecting the PC snapshot from a stale mobile pull -> push cycle.
+    // A caller that intentionally combines an event and a snapshot can opt in.
+    replaceSnapshot: z.boolean().optional().default(false),
+  })
+  .superRefine((value, ctx) => {
+    const hasEvents = (value.events?.length ?? 0) > 0;
+    const replacesSnapshot = value.replaceSnapshot || !hasEvents || value.schedules !== undefined;
+    if (replacesSnapshot && (value.blocklists === undefined || value.sessions === undefined)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "blocklists and sessions are required when replacing the snapshot",
+      });
+    }
+  });
 
 export type RegisterInput = z.infer<typeof registerSchema>;
 export type LoginInput = z.infer<typeof loginSchema>;

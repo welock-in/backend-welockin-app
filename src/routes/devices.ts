@@ -3,6 +3,8 @@ import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { deviceSchema } from "../validation/schemas";
+import { deterministicObjectId } from "../lib/deterministic-id";
+import { legacyNameOnlyDeviceWhere } from "../services/device-identity";
 
 export const devicesRouter = Router();
 
@@ -33,19 +35,46 @@ devicesRouter.post(
 
     let device;
     if (deviceId) {
-      // Identity-based. No DB unique on (userId, deviceId) — see schema note — so
-      // find-then-write. `name` is a mutable label here.
+      // First preserve rows written by an earlier version of this route.
       const existing = await prisma.device.findFirst({ where: { userId, deviceId } });
-      device = existing
-        ? await prisma.device.update({ where: { id: existing.id }, data: { name, ...meta } })
-        : await prisma.device.create({ data: { userId, name, deviceId, ...meta } });
+      if (existing) {
+        device = await prisma.device.update({
+          where: { id: existing.id },
+          data: { name, ...meta },
+        });
+      } else {
+        // Upgrade a legacy name-only row instead of creating a conflicting copy.
+        const legacy = await prisma.device.findFirst({
+          where: legacyNameOnlyDeviceWhere(userId, name),
+        });
+        if (legacy) {
+          device = await prisma.device.update({
+            where: { id: legacy.id },
+            data: { name, deviceId, ...meta },
+          });
+        } else {
+          const id = deterministicObjectId("device", userId, deviceId);
+          device = await prisma.device.upsert({
+            where: { id },
+            update: { name, deviceId, ...meta },
+            create: { id, userId, name, deviceId, ...meta },
+          });
+        }
+      }
     } else {
-      // Legacy desktop path: upsert by (userId, name).
-      device = await prisma.device.upsert({
-        where: { userId_name: { userId, name } },
-        update: meta,
-        create: { userId, name, ...meta },
-      });
+      // Legacy name-only path. Existing random-id rows are retained; fresh rows
+      // get a deterministic id so concurrent heartbeats still converge.
+      const existing = await prisma.device.findFirst({ where: { userId, name } });
+      if (existing) {
+        device = await prisma.device.update({ where: { id: existing.id }, data: meta });
+      } else {
+        const id = deterministicObjectId("legacy-device", userId, name);
+        device = await prisma.device.upsert({
+          where: { id },
+          update: meta,
+          create: { id, userId, name, ...meta },
+        });
+      }
     }
 
     res.json({ device });

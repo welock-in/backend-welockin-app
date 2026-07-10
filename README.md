@@ -87,6 +87,7 @@ The server listens on `http://localhost:8787` by default (`PORT` in `.env`).
 | `JWT_EXPIRES_IN` | `30d`                           | Token lifetime (`30d`, `12h`, `3600`, …).          |
 | `PORT`           | `8787`                          | HTTP port.                                         |
 | `CORS_ORIGIN`    | `*`                             | `*` or a comma-separated allow-list of origins.    |
+| `APPLE_BUNDLE_ID` | `in.welock.mobile`             | Expected audience for Sign in with Apple tokens.   |
 
 ---
 
@@ -144,7 +145,10 @@ register). Returns `401` on bad credentials.
 
 ### `POST /api/devices` — auth
 
-Upserts a device by `(userId, name)` and refreshes `lastSeenAt`.
+Upserts by stable `(userId, deviceId)` when `deviceId` is present, otherwise
+uses the legacy `(userId, name)` identity. It refreshes `lastSeenAt` in both
+cases. A legacy name-only row is upgraded in place when that client starts
+sending a `deviceId`.
 
 Request:
 
@@ -170,7 +174,11 @@ Response:
 ### `POST /api/sync/push` — auth
 
 Last-write-wins upsert of the user's snapshot, plus optional append of focus
-events.
+events. For backward compatibility with the Android client, a request that has
+events but omits `schedules` is **append-only by default**: its
+`blocklists`/`sessions` are ignored so a stale mobile pull cannot overwrite a
+newer PC snapshot. Set `replaceSnapshot: true` only when the caller intentionally
+wants to replace the snapshot and append events in one request.
 
 Request:
 
@@ -316,28 +324,40 @@ blocklists stay local (opaque iOS Screen Time tokens are never sent to the serve
 
 ### New / changed routes
 
-- **`POST /api/auth/apple`** — no auth. Body `{ identityToken, fullName?, email? }`.
+- **`POST /api/auth/apple`** — no auth. Body `{ identityToken }`.
   Verifies the Sign-in-with-Apple token against Apple's public keys (`aud` =
   `APPLE_BUNDLE_ID`, `iss` = apple, valid signature/exp), then find-or-creates the
   account by `AuthProvider(provider:"apple", providerUid: sub)`. If Apple returns
-  an email that matches an existing account it links Apple to it (merge). Returns
+  a **verified token email** that matches an existing, already email-verified
+  account it links Apple to it (merge). Unverified password accounts return a
+  conflict to prevent account pre-hijacking; a future authenticated linking flow
+  can connect them safely. Client-supplied email hints are ignored. On first sign-in a
+  verified real or Apple relay email is required; later sign-ins use the stored
+  provider link. Returns
   the same `{ token, user }` as email/password login → works with `requireAuth`.
   `201` on first create, `200` afterwards.
 - **`POST /api/devices`** — auth. Now accepts optional `deviceId` (stable
   client-generated UUID — the real identity key), plus `model`, `osVersion`,
   `appVersion`, `pushToken`. Matches on `(userId, deviceId)` when present, else
-  falls back to the legacy `(userId, name)` upsert. Still refreshes `lastSeenAt`.
+  falls back to the legacy name-only upsert. Existing name-only rows are upgraded
+  in place. Deterministic Mongo `_id` values make concurrent first heartbeats
+  converge without a nullable unique index. Still refreshes `lastSeenAt`.
 - **`POST /api/focus-events`** — auth. Ingest one focus event. Body is the same
   `FocusEventInput` (now also accepts `platform`, `clientEventId`, `emergencyUsed`).
   **Idempotent**: replaying the same `clientEventId` stores it once (`200` +
   `{ deduped: true }`). `POST /sync/push`'s `events[]` is idempotent the same way.
+  The event platform accepts `android`, `ios`, `ipados`, `macos`, and `windows`.
 
 ### Schema additions (all optional / defaulted → safe `prisma db push`)
 
-- `User.email`, `User.passwordHash` → **optional** (Apple accounts can be fully social).
+- `User.passwordHash` → optional for Apple accounts; `User.email` stays required
+  and unique so the existing PC response contract remains unchanged.
+- `User.emailVerified?` distinguishes verified Apple emails from current
+  password registrations, whose email ownership has not yet been verified.
 - New model **`AuthProvider`** `{ provider, providerUid }` with `@@unique([provider, providerUid])`.
-- `Device` → `deviceId?`, `model?`, `osVersion?`, `appVersion?`, `pushToken?` + `@@index([userId, deviceId])`.
-- `FocusEvent` → `platform?`, `clientEventId?`, `emergencyUsed @default(false)` + `@@index([userId, clientEventId])`.
+- `Device` → `deviceId?`, `model?`, `osVersion?`, `appVersion?`, `pushToken?` + indexes for lookup.
+- `FocusEvent` → `platform?`, `deviceId?`, `clientEventId?`, and an optional
+  `emergencyUsed` rollout field (new writes default to `false`).
 
 ### Migration
 
@@ -346,18 +366,11 @@ npm install            # regenerates the Prisma client
 npx prisma db push     # applies the additive schema (run against a staging DB first)
 ```
 
-> **Why no `@@unique` on `deviceId` / `clientEventId`?** Existing PC rows have
-> these as `null`; a plain Mongo unique index rejects multiple nulls, so
-> `db push` would fail on live data. Uniqueness is enforced in the handlers
-> (device upsert + focus-event dedup). To also enforce it at the DB level, add
-> **partial** unique indexes (they ignore the null PC rows) directly in Mongo:
-
-```js
-// mongosh — safe on existing data (only indexes rows where the field is a string)
-db.Device.createIndex({ userId: 1, deviceId: 1 }, { unique: true, partialFilterExpression: { deviceId: { $type: "string" } } });
-db.FocusEvent.createIndex({ userId: 1, clientEventId: 1 }, { unique: true, partialFilterExpression: { clientEventId: { $type: "string" } } });
-```
+Stable device identities and idempotent focus events use deterministic Mongo
+`_id` values, whose built-in uniqueness is atomic across concurrent serverless
+instances. This avoids nullable unique-index migration failures on existing PC
+records while preserving the legacy unique `(userId, name)` fallback.
 
 ### Env
 
-Set `APPLE_BUNDLE_ID` (defaults to `in.welock.app`) — the `aud` the Apple token must carry.
+Set `APPLE_BUNDLE_ID` (defaults to `in.welock.mobile`) — the `aud` the Apple token must carry.

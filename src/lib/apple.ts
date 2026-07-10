@@ -26,8 +26,10 @@ interface AppleJwk {
 
 let keyCache: { keys: AppleJwk[]; fetchedAt: number } | null = null;
 
-async function getAppleKeys(): Promise<AppleJwk[]> {
-  if (keyCache && Date.now() - keyCache.fetchedAt < KEY_TTL_MS) return keyCache.keys;
+async function getAppleKeys(forceRefresh = false): Promise<AppleJwk[]> {
+  if (!forceRefresh && keyCache && Date.now() - keyCache.fetchedAt < KEY_TTL_MS) {
+    return keyCache.keys;
+  }
   const res = await fetch(APPLE_KEYS_URL);
   if (!res.ok) throw new Error(`Apple JWKS fetch failed: ${res.status}`);
   const body = (await res.json()) as { keys: AppleJwk[] };
@@ -41,6 +43,16 @@ export interface AppleIdentity {
   emailVerified?: boolean;
 }
 
+/** Only a verified claim from Apple's signed token may be used for account linking. */
+export function getVerifiedAppleEmail(identity: AppleIdentity): string | null {
+  return identity.email && identity.emailVerified === true ? identity.email : null;
+}
+
+/** Prevent pre-hijacking: only an already-verified account may be auto-linked. */
+export function canAutoLinkAppleAccount(user: { emailVerified?: boolean | null }): boolean {
+  return user.emailVerified === true;
+}
+
 /** Verify a Sign-in-with-Apple identityToken and return its verified claims. */
 export async function verifyAppleIdentityToken(identityToken: string): Promise<AppleIdentity> {
   const decoded = jwt.decode(identityToken, { complete: true });
@@ -49,8 +61,15 @@ export async function verifyAppleIdentityToken(identityToken: string): Promise<A
   }
   const header = decoded.header as JwtHeader;
 
-  const keys = await getAppleKeys();
-  const jwk = keys.find((k) => k.kid === header.kid);
+  let keys = await getAppleKeys();
+  let jwk = keys.find((k) => k.kid === header.kid);
+  // Apple may rotate signing keys before our one-hour cache expires. Refresh
+  // once on an unknown kid so a warm serverless instance does not reject valid
+  // sign-ins until the TTL elapses.
+  if (!jwk) {
+    keys = await getAppleKeys(true);
+    jwk = keys.find((k) => k.kid === header.kid);
+  }
   if (!jwk) throw unauthorized("Unknown Apple signing key");
 
   const publicKey = crypto.createPublicKey({

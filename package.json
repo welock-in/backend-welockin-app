@@ -17,6 +17,9 @@
     "test": "tsx --test src/**/*.test.ts",
     "prisma:generate": "prisma generate",
     "prisma:push": "prisma db push",
+    "reconcile:feedback": "tsx scripts/reconcile-feedback.ts",
+    "feedback:set-admin": "tsx scripts/set-admin.ts",
+    "device:migrate": "tsx scripts/device-migrate.ts",
     "postinstall": "prisma generate"
   },
   "dependencies": {

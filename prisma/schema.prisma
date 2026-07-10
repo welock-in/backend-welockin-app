@@ -28,13 +28,23 @@ model User {
   passwordHash String?
   plan         String    @default("trial")
   trialEndsAt  DateTime?
+  // Admin gate for the feedback board (moderation, status changes). We gate on
+  // this column, NOT an email allowlist: Sign in with Apple + Private Relay puts
+  // an @privaterelay.appleid.com email in the JWT, so an email allowlist would
+  // silently break. OPTIONAL on purpose: on MongoDB `@default` is a create-time
+  // default only and `db push` never rewrites existing docs — a REQUIRED field
+  // would make Prisma throw when reading any legacy user (locking out login).
+  // Optional → legacy docs read back as null, and every check is `!user?.isAdmin`.
+  isAdmin      Boolean?  @default(false)
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 
-  devices       Device[]
-  focusEvents   FocusEvent[]
-  snapshot      SyncSnapshot?
-  authProviders AuthProvider[]
+  devices         Device[]
+  focusEvents     FocusEvent[]
+  snapshot        SyncSnapshot?
+  authProviders   AuthProvider[]
+  featureRequests FeatureRequest[] @relation("UserFeatureRequests")
+  votes           Vote[]           @relation("UserVotes")
 }
 
 // Social / password login identities linked to a User (1-N). Lets one account
@@ -68,12 +78,68 @@ model Device {
   osVersion  String?
   appVersion String?
   pushToken  String? // APNs token (mobile push)
+  // Anti-abuse / one-active-phone-per-account (Part D). ALL optional on purpose:
+  // on MongoDB a required field would make Prisma throw when reading legacy Device
+  // docs that predate the column (breaking device registration). Optional → they
+  // read back as null, and the post-push backfill sets sane values (status active,
+  // kind by platform, boundAt=createdAt). `null` status is treated as "active".
+  kind          String? // "phone" | "desktop" — only phone-class devices are bind-managed
+  status        String?   @default("active") // "active" | "superseded" | "revoked"
+  boundAt       DateTime?
+  supersededAt  DateTime?
+  lastRebindAt  DateTime?
+  idfv          String? // Apple IDFV — WEAK correlation hint only (regenerates on reinstall)
+  attestKeyId   String? // App Attest key id (base64)
+  attestPubKey  Bytes? //  App Attest public key (raw/DER), set at key registration
+  attestCounter Int?      @default(0) // strictly-increasing App Attest assertion counter (anti-replay)
   lastSeenAt DateTime @default(now())
   createdAt  DateTime @default(now())
 
-  @@unique([userId, name])
+  // NOTE: (userId, name) is intentionally NON-unique. Two iPhones report the same
+  // UIDevice.name ("iPhone") to unentitled apps, and a takeover keeps the old row
+  // (superseded) while binding the new phone — a unique(userId,name) would make the
+  // new "iPhone" row collide and block takeover for the whole iOS base. Uniqueness
+  // is enforced by the partial unique indexes (one active phone; one row per
+  // (userId, deviceId)) created in scripts/device-migrate.ts.
+  @@index([userId, name])
   @@index([userId])
   @@index([userId, deviceId])
+  @@index([userId, status])
+}
+
+// Audit trail of one-active-phone handovers. Keyed by the stable client deviceId
+// (a UUID string), not the Device row id. Drives the rebind cooldown ("last real
+// transfer") and gives support a history. `first-bind` transfers are excluded
+// from cooldown math.
+model DeviceTransfer {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId       String   @db.ObjectId
+  fromDeviceId String? // previous active phone's client deviceId (null on first-bind)
+  toDeviceId   String // new active phone's client deviceId
+  reason       String // "takeover" | "first-bind" | "revoke"
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+  @@index([userId, createdAt])
+}
+
+// Server-side break accounting (Part C/D). The mobile app enforces breaks locally
+// & offline; this row is the authoritative record for the per-user daily budget.
+// Over-budget breaks are recorded quarantined (server veto) without blocking the
+// offline grant. Idempotent on (userId, clientBreakId).
+model Break {
+  id              String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId          String   @db.ObjectId
+  deviceId        String?
+  clientBreakId   String?
+  durationSeconds Int
+  startedAt       DateTime @default(now())
+  endsAt          DateTime
+  quarantined     Boolean? @default(false)
+  createdAt       DateTime @default(now())
+
+  @@index([userId, startedAt])
+  @@index([userId, clientBreakId])
 }
 
 model SyncSnapshot {
@@ -106,6 +172,10 @@ model FocusEvent {
   platform       String? // "ios" | "ipados" | "macos" | "windows"
   clientEventId  String? // idempotency key for offline replay
   emergencyUsed  Boolean  @default(false)
+  // Anti-abuse (Part D): set true when the reporting deviceId does not resolve to
+  // the user's active phone (kept for audit, excluded from stats/streaks/quotas).
+  // Optional so legacy events read back cleanly; null/false both count.
+  quarantined    Boolean? @default(false)
   createdAt      DateTime @default(now())
 
   // No @@unique([userId, clientEventId]): existing PC events have
@@ -115,4 +185,72 @@ model FocusEvent {
   @@index([userId])
   @@index([userId, startedAt])
   @@index([userId, clientEventId])
+}
+
+// ---------------------------------------------------------------------------
+// Feedback / feature-request board (public, auth-gated, UGC — Apple 1.2 compliant
+// via report + delete + auto-hide). All models below are NEW → purely additive.
+// ---------------------------------------------------------------------------
+
+enum FeatureRequestStatus {
+  open
+  planned
+  in_progress
+  done
+  declined
+}
+
+model FeatureRequest {
+  id           String               @id @default(auto()) @map("_id") @db.ObjectId
+  authorId     String               @db.ObjectId
+  author       User                 @relation("UserFeatureRequests", fields: [authorId], references: [id], onDelete: Cascade)
+  title        String
+  body         String               @default("")
+  status       FeatureRequestStatus @default(open)
+  voteCount    Int                  @default(0) // denormalized; recomputed as count(votes) on every vote write
+  commentCount Int                  @default(0) // reserved — comment routes are out of MVP scope
+  hidden       Boolean              @default(false) // moderation: hidden rows never appear in GET /
+  reportCount  Int                  @default(0)
+  // Idempotency key for create retries (offline replay of the same POST). Every
+  // FeatureRequest is created with one; the compound unique below makes a retried
+  // POST return the existing row instead of inserting a duplicate. This is a NEW
+  // model so every row has a non-null value — the @@unique is safe on `db push`.
+  clientRequestId String
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+
+  votes   Vote[]
+  reports FeatureReport[]
+
+  @@unique([authorId, clientRequestId])
+  @@index([authorId])
+  @@index([status, voteCount])
+  @@index([createdAt])
+}
+
+model Vote {
+  id               String         @id @default(auto()) @map("_id") @db.ObjectId
+  featureRequestId String         @db.ObjectId
+  featureRequest   FeatureRequest @relation(fields: [featureRequestId], references: [id], onDelete: Cascade)
+  userId           String         @db.ObjectId
+  user             User           @relation("UserVotes", fields: [userId], references: [id], onDelete: Cascade)
+  createdAt        DateTime       @default(now())
+
+  // One vote per user per request. Idempotency of add/remove is enforced in the
+  // route (catch P2002 on add, deleteMany on remove) so the client never sees a
+  // 409/500 on a double-tap.
+  @@unique([featureRequestId, userId])
+  @@index([userId])
+}
+
+model FeatureReport {
+  id               String         @id @default(auto()) @map("_id") @db.ObjectId
+  featureRequestId String         @db.ObjectId
+  featureRequest   FeatureRequest @relation(fields: [featureRequestId], references: [id], onDelete: Cascade)
+  reporterId       String         @db.ObjectId
+  reason           String
+  createdAt        DateTime       @default(now())
+
+  @@unique([featureRequestId, reporterId]) // one report per user per post
+  @@index([featureRequestId])
 }

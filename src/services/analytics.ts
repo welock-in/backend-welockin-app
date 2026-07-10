@@ -23,16 +23,21 @@ export async function computeSummary(
 ): Promise<AnalyticsSummary> {
   const weekAgo = new Date(now.getTime() - 7 * DAY_MS);
 
+  // Exclude quarantined events (Part D) from every stat — anti-abuse events are
+  // kept for audit but never credited. `{ not: true }` also matches legacy events
+  // where the field is null/false.
+  const notQuarantined = { quarantined: { not: true } };
+
   const [weekEvents, totalSessions, completedEvents] = await Promise.all([
     // Events started in the last 7 days — drive week focus + session count.
     prisma.focusEvent.findMany({
-      where: { userId, startedAt: { gte: weekAgo } },
+      where: { userId, startedAt: { gte: weekAgo }, ...notQuarantined },
       select: { startedAt: true, endedAt: true },
     }),
-    prisma.focusEvent.count({ where: { userId } }),
+    prisma.focusEvent.count({ where: { userId, ...notQuarantined } }),
     // Completed events — drive the day streak.
     prisma.focusEvent.findMany({
-      where: { userId, completed: true },
+      where: { userId, completed: true, ...notQuarantined },
       select: { startedAt: true },
     }),
   ]);

@@ -14,6 +14,8 @@ import { feedbackRouter } from "./routes/feedback";
 import { attestRouter } from "./routes/attest";
 import { breaksRouter } from "./routes/breaks";
 import { adminPageHtml } from "./admin/page";
+import { sessionsRouter } from "./routes/sessions";
+import { adminRouter } from "./routes/admin";
 import { errorHandler, notFoundHandler } from "./middleware/error";
 
 export function createApp(): Express {
@@ -44,6 +46,11 @@ export function createApp(): Express {
   app.use("/api/feedback", feedbackRouter);
   app.use("/api/attest", attestRouter);
   app.use("/api/breaks", breaksRouter);
+  // Live-session heartbeats (client) + the admin console API (distinct from the
+  // feedback-board /admin HTML page below; this is a JSON API for the separate
+  // admin-dashboard app, gated by env-cred admin JWT, not User.isAdmin).
+  app.use("/api/sessions", sessionsRouter);
+  app.use("/api/admin", adminRouter);
 
   // Same-origin admin dashboard for the feedback board (gated by admin login;
   // all data/actions require User.isAdmin). Route-scoped CSP relaxes helmet's

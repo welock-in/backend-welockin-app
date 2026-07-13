@@ -39,6 +39,9 @@ model User {
   // would make Prisma throw when reading any legacy user (locking out login).
   // Optional → legacy docs read back as null, and every check is `!user?.isAdmin`.
   isAdmin      Boolean?  @default(false)
+  // Account moderation state, set from the admin console: "active" | "suspended".
+  // Optional so documents written before this field existed still read cleanly.
+  status       String?   @default("active")
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 
@@ -48,6 +51,43 @@ model User {
   authProviders   AuthProvider[]
   featureRequests FeatureRequest[] @relation("UserFeatureRequests")
   votes           Vote[]           @relation("UserVotes")
+  liveSessions    LiveSession[]
+}
+
+// A focus session that is HAPPENING RIGHT NOW, reported by a client via
+// `POST /api/sessions/heartbeat` roughly every 5 minutes while it runs (and once
+// on start / on end). The admin console reads these to show live activity in
+// near-real-time. One row per (user, device): a device has at most one live
+// session, upserted on each beat and deleted when the session ends. A row whose
+// `lastHeartbeatAt` is older than the staleness window is treated as ended
+// (the client crashed / went offline without a clean stop).
+model LiveSession {
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId        String   @db.ObjectId
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Stable client device id (e.g. "win-<MachineGuid>"); the identity key.
+  deviceId      String
+  deviceName    String?
+  platform      String? // "windows" | "macos" | "android" | "ios" | "ipados"
+  name          String // session title
+  phase         String   @default("running") // "running" | "break"
+  hardLock      Boolean  @default(false)
+  totalSeconds  Int      @default(0)
+  remainSeconds Int      @default(0)
+  killedTotal   Int      @default(0)
+  appsCount     Int      @default(0)
+  sitesCount    Int      @default(0)
+  originEventId String? // schedule block id that auto-started it, if any
+  startedAt     DateTime
+  endsAt        DateTime? // predicted end (now + remaining)
+  // Admin "force end" signal: set true from the console; the client stops the
+  // session (overriding a hard lock) on its next heartbeat and deletes the row.
+  forceEnd      Boolean  @default(false)
+  lastHeartbeatAt DateTime @default(now())
+  createdAt     DateTime @default(now())
+
+  @@unique([userId, deviceId])
+  @@index([lastHeartbeatAt])
 }
 
 // Social / password login identities linked to a User (1-N). Lets one account

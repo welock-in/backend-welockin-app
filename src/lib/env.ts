@@ -34,6 +34,20 @@ export const env = {
   appAttestEnv: process.env.APP_ATTEST_ENV ?? "production",
   // App Attest app identifier = "<TeamID>.<BundleID>".
   appAttestAppId: process.env.APP_ATTEST_APP_ID ?? "YF7AFPJRYH.in.welock.app",
+
+  // --- Admin console (POST /api/admin/login) ---
+  // Credentials checked by the admin API. Set these in the backend's environment
+  // / .env — NOT in the admin web app. Admin login is DISABLED when adminPassword
+  // is empty (no blank-password admin in prod).
+  adminUsername: process.env.ADMIN_USERNAME ?? "admin",
+  adminPassword: process.env.ADMIN_PASSWORD ?? "",
+  // Separate signing secret for admin tokens so a leaked user JWT can never be a
+  // valid admin token (and vice-versa). Falls back to jwtSecret for convenience.
+  adminJwtSecret: process.env.ADMIN_JWT_SECRET ?? process.env.JWT_SECRET ?? "change-me",
+  adminJwtExpiresIn: process.env.ADMIN_JWT_EXPIRES_IN ?? "12h",
+  // A live session with no heartbeat for longer than this is considered ended
+  // (client crashed/offline). Default = 2 missed 5-min beats + grace.
+  liveSessionStaleSeconds: Number.parseInt(process.env.LIVE_SESSION_STALE_SECONDS ?? "660", 10),
 };
 
 export type Env = typeof env;

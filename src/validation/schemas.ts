@@ -145,6 +145,43 @@ export const reportFeedbackSchema = z.object({
   reason: z.string().trim().min(3).max(500),
 });
 
+// ── live sessions (client heartbeat) ─────────────────────────────────────────
+
+export const sessionHeartbeatSchema = z.object({
+  deviceId: z.string().trim().min(1, "deviceId is required"),
+  deviceName: z.string().trim().min(1).optional(),
+  platform: z.enum(["android", "ios", "ipados", "macos", "windows"]).optional(),
+  name: z.string().trim().min(1).default("Focus session"),
+  phase: z.enum(["running", "break"]).optional().default("running"),
+  hardLock: z.boolean().optional().default(false),
+  totalSeconds: z.number().int().nonnegative().optional().default(0),
+  remainSeconds: z.number().int().nonnegative().optional().default(0),
+  killedTotal: z.number().int().nonnegative().optional().default(0),
+  appsCount: z.number().int().nonnegative().optional().default(0),
+  sitesCount: z.number().int().nonnegative().optional().default(0),
+  originEventId: z.string().trim().min(1).optional(),
+  startedAt: dateInput,
+});
+
+export const sessionEndSchema = z.object({
+  deviceId: z.string().trim().min(1, "deviceId is required"),
+});
+
+// ── admin console ────────────────────────────────────────────────────────────
+
+export const adminLoginSchema = z.object({
+  username: z.string().min(1, "username is required"),
+  password: z.string().min(1, "password is required"),
+});
+
+export const adminSetPlanSchema = z.object({
+  plan: z.string().trim().min(1, "plan is required"),
+});
+
+export type SessionHeartbeatInput = z.infer<typeof sessionHeartbeatSchema>;
+export type SessionEndInput = z.infer<typeof sessionEndSchema>;
+export type AdminLoginInput = z.infer<typeof adminLoginSchema>;
+
 export type RegisterInput = z.infer<typeof registerSchema>;
 export type LoginInput = z.infer<typeof loginSchema>;
 export type AppleAuthInput = z.infer<typeof appleAuthSchema>;

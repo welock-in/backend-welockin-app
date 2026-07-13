@@ -250,3 +250,40 @@ devicesRouter.post(
     res.json({ device: updated, reason: reason ?? null });
   }),
 );
+
+/**
+ * List the account's devices — used by the DESKTOP app (Devices page + the
+ * Start-Focus picker). Additive/read-only: it does not touch the phone-binding
+ * logic above. Excludes superseded/revoked devices so the list reflects what's
+ * currently paired. `max` is a soft cap the desktop UI reads to hide "Add device".
+ */
+devicesRouter.get(
+  "/",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const devices = await prisma.device.findMany({
+      where: {
+        userId: req.user!.id,
+        status: { notIn: ["superseded", "revoked"] },
+      },
+      orderBy: { createdAt: "asc" },
+    });
+    res.json({ devices, max: 3 });
+  }),
+);
+
+/**
+ * Unpair (remove) a device by its client `deviceId`, scoped to the caller — the
+ * DESKTOP "log out & unpair this device" action (runs while still authed). A
+ * device only ever removes itself; there is no cross-device deletion.
+ */
+devicesRouter.delete(
+  "/:deviceId",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const result = await prisma.device.deleteMany({
+      where: { userId: req.user!.id, deviceId: req.params.deviceId },
+    });
+    res.json({ removed: result.count });
+  }),
+);

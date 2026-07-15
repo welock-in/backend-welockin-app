@@ -16,6 +16,8 @@ import { breaksRouter } from "./routes/breaks";
 import { adminPageHtml } from "./admin/page";
 import { sessionsRouter } from "./routes/sessions";
 import { adminRouter } from "./routes/admin";
+import { addictionProtectionRouter } from "./routes/addiction-protection";
+import { adminProtectionRouter } from "./routes/admin-protection";
 import { errorHandler, notFoundHandler } from "./middleware/error";
 
 export function createApp(): Express {
@@ -51,6 +53,10 @@ export function createApp(): Express {
   // admin-dashboard app, gated by env-cred admin JWT, not User.isAdmin).
   app.use("/api/sessions", sessionsRouter);
   app.use("/api/admin", adminRouter);
+  // Addiction protection: the curated list + partner-OTP / dated lock (client),
+  // and the admin CRUD + active-protection panel.
+  app.use("/api/addiction-protection", addictionProtectionRouter);
+  app.use("/api/admin/addiction-protection", adminProtectionRouter);
 
   // Same-origin admin dashboard for the feedback board (gated by admin login;
   // all data/actions require User.isAdmin). Route-scoped CSP relaxes helmet's

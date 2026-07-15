@@ -48,6 +48,12 @@ export const env = {
   // A live session with no heartbeat for longer than this is considered ended
   // (client crashed/offline). Default = 2 missed 5-min beats + grace.
   liveSessionStaleSeconds: Number.parseInt(process.env.LIVE_SESSION_STALE_SECONDS ?? "660", 10),
+
+  // --- Resend (transactional email — addiction-protection partner OTP) ---
+  // API key from resend.com. Email sending is DISABLED (no-op, logged) while empty.
+  resendApiKey: process.env.RESEND_API_KEY ?? "",
+  // Verified sender. Must be on a domain verified in your Resend account.
+  resendFrom: process.env.RESEND_FROM ?? "WeLockin <protection@welock.in>",
 };
 
 export type Env = typeof env;

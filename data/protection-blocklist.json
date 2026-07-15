@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "note": "Seed for the Mongo `protection` collection (npm run protection:seed). Idempotent: it only ensures these entries exist and never overrides admin edits. Same content as the app's bundled floor (windows/src/protection/blocklist.seed.json).",
+  "categories": {
+    "explicit": {
+      "label": "Explicit sites",
+      "sites": [
+        "pornhub.com",
+        "xvideos.com",
+        "xnxx.com",
+        "xhamster.com",
+        "redtube.com",
+        "youporn.com",
+        "spankbang.com",
+        "eporner.com",
+        "tube8.com",
+        "porn.com",
+        "porntrex.com",
+        "hclips.com",
+        "txxx.com",
+        "onlyfans.com",
+        "fansly.com",
+        "chaturbate.com",
+        "stripchat.com",
+        "bongacams.com",
+        "livejasmin.com",
+        "cam4.com",
+        "myfreecams.com",
+        "brazzers.com",
+        "adultfriendfinder.com",
+        "fapello.com",
+        "motherless.com",
+        "rule34.xxx",
+        "e-hentai.org",
+        "nhentai.net"
+      ],
+      "apps": []
+    },
+    "gambling": {
+      "label": "Gambling",
+      "sites": [
+        "bet365.com",
+        "williamhill.com",
+        "ladbrokes.com",
+        "paddypower.com",
+        "betfair.com",
+        "betway.com",
+        "unibet.com",
+        "bwin.com",
+        "888casino.com",
+        "888poker.com",
+        "pokerstars.com",
+        "pokerstars.eu",
+        "draftkings.com",
+        "fanduel.com",
+        "stake.com",
+        "roobet.com",
+        "bovada.lv",
+        "casino.com",
+        "jackpotcity.com",
+        "betmgm.com"
+      ],
+      "apps": []
+    }
+  }
+}

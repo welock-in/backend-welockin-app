@@ -52,6 +52,7 @@ model User {
   featureRequests FeatureRequest[] @relation("UserFeatureRequests")
   votes           Vote[]           @relation("UserVotes")
   liveSessions    LiveSession[]
+  protectionLock  ProtectionLock?
 }
 
 // A focus session that is HAPPENING RIGHT NOW, reported by a client via
@@ -295,4 +296,55 @@ model FeatureReport {
 
   @@unique([featureRequestId, reporterId]) // one report per user per post
   @@index([featureRequestId])
+}
+
+// ---------------------------------------------------------------------------
+// Addiction protection: a GLOBAL curated blocklist (admin-managed) + per-user
+// lock state (partner OTP / dated). NEW → purely additive.
+// ---------------------------------------------------------------------------
+
+// One entry (a site or app) in the global curated addiction-protection list.
+// Seeded from the app's bundled JSON, then admin-managed via the console; clients
+// fetch the active set on launch (GET /api/addiction-protection). Collection is
+// named "protection" in Mongo.
+model ProtectionEntry {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  category  String // "explicit" | "gambling" | ...
+  kind      String // "site" | "app"
+  value     String // normalized domain (host-only) or app id / exe name
+  label     String? // display name
+  platform  String?  @default("all") // "all" | "windows" | "macos" | "android" | "ios"
+  active    Boolean  @default(true) // soft-disable without deleting
+  source    String   @default("admin") // "seed" | "admin"
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([kind, value]) // dedup + idempotent upsert
+  @@index([category, active])
+  @@map("protection")
+}
+
+// Per-user addiction-protection lock. `method` = "partner" (unlock needs a
+// one-time code emailed to the partner via Resend) or "date" (no unlock before
+// `lockedUntil`). The OTP is stored so the admin console can display it and
+// support/override an unlock (a friction code, not a credential).
+model ProtectionLock {
+  id             String    @id @default(auto()) @map("_id") @db.ObjectId
+  userId         String    @unique @db.ObjectId
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  active         Boolean   @default(false)
+  method         String    @default("partner") // "partner" | "date"
+  categories     String[] // enabled categories, e.g. ["explicit","gambling"]
+  partnerContact String? // partner email the OTP is sent to
+  otp            String? // current one-time code (partner method)
+  otpSentAt      DateTime?
+  // Failed unlock attempts against the CURRENT otp. Capped so a user can't brute-
+  // force the 6-digit code: past the cap the otp is invalidated (a new one must be
+  // requested, re-involving the partner). Reset on every (re)send.
+  otpAttempts    Int?      @default(0)
+  lockedUntil    DateTime? // date method: no unlock before this
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@map("protection_locks")
 }

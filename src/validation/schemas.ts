@@ -178,6 +178,56 @@ export const adminSetPlanSchema = z.object({
   plan: z.string().trim().min(1, "plan is required"),
 });
 
+// ── addiction protection ─────────────────────────────────────────────────────
+
+// Client turns protection on. Partner method needs a partner email (the OTP is
+// mailed there); date method needs the lock-until date.
+export const protectionLockSchema = z
+  .object({
+    method: z.enum(["partner", "date"]),
+    categories: z.array(z.string().trim().min(1)).default([]),
+    partnerContact: z.string().trim().email().optional(),
+    lockedUntil: dateInput.optional(),
+  })
+  .superRefine((v, ctx) => {
+    if (v.method === "partner" && !v.partnerContact) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "partnerContact (email) is required for the partner method", path: ["partnerContact"] });
+    }
+    if (v.method === "date" && !v.lockedUntil) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "lockedUntil is required for the date method", path: ["lockedUntil"] });
+    }
+  });
+
+export const protectionUnlockSchema = z.object({
+  code: z.string().trim().min(1, "code is required"),
+});
+
+// Admin: create / bulk-import / update curated protection entries.
+export const protectionEntrySchema = z.object({
+  category: z.string().trim().min(1),
+  kind: z.enum(["site", "app"]),
+  value: z.string().trim().min(1),
+  label: z.string().trim().min(1).optional(),
+  platform: z.string().trim().min(1).optional(),
+  active: z.boolean().optional(),
+});
+
+export const protectionEntryUpdateSchema = z.object({
+  category: z.string().trim().min(1).optional(),
+  label: z.string().trim().min(1).optional(),
+  platform: z.string().trim().min(1).optional(),
+  active: z.boolean().optional(),
+});
+
+export const protectionImportSchema = z.object({
+  category: z.string().trim().min(1),
+  kind: z.enum(["site", "app"]),
+  values: z.array(z.string().trim().min(1)).min(1, "at least one value"),
+});
+
+export type ProtectionLockInput = z.infer<typeof protectionLockSchema>;
+export type ProtectionEntryInput = z.infer<typeof protectionEntrySchema>;
+
 export type SessionHeartbeatInput = z.infer<typeof sessionHeartbeatSchema>;
 export type SessionEndInput = z.infer<typeof sessionEndSchema>;
 export type AdminLoginInput = z.infer<typeof adminLoginSchema>;

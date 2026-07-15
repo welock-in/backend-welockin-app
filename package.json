@@ -20,6 +20,7 @@
     "reconcile:feedback": "tsx scripts/reconcile-feedback.ts",
     "feedback:set-admin": "tsx scripts/set-admin.ts",
     "device:migrate": "tsx scripts/device-migrate.ts",
+    "protection:seed": "tsx scripts/seed-protection.ts",
     "postinstall": "prisma generate"
   },
   "dependencies": {

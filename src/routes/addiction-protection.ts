@@ -48,6 +48,9 @@ addictionProtectionRouter.get(
   asyncHandler(async (req, res) => {
     const lock = await prisma.protectionLock.findUnique({ where: { userId: req.user!.id } });
     res.json({
+      // The desktop enforcer binds the always-on block to this id so a status from
+      // a DIFFERENT account can never lift it (no account-switch bypass).
+      userId: req.user!.id,
       active: lock?.active ?? false,
       method: lock?.method ?? null,
       categories: lock?.categories ?? [],

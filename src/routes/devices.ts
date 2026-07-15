@@ -67,7 +67,13 @@ devicesRouter.post(
         ? await prisma.device.findFirst({ where: { userId, deviceId: input.deviceId } })
         : await prisma.device.findFirst({ where: { userId, name: input.name } });
       const device = existing
-        ? await prisma.device.update({ where: { id: existing.id }, data: { name: input.name, ...meta } })
+        ? await prisma.device.update({
+            where: { id: existing.id },
+            // Reset status so re-registering a previously deactivated desktop
+            // re-activates it (the /deactivate route documents re-bind as reversible;
+            // otherwise the row stays "revoked" and never returns from GET /devices).
+            data: { name: input.name, status: "active", ...meta },
+          })
         : await prisma.device.create({
             data: {
               userId,

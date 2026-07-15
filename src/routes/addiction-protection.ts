@@ -146,14 +146,20 @@ addictionProtectionRouter.post(
     }
     // partner
     if (!lock.otp || code.trim() !== lock.otp) {
-      const attempts = (lock.otpAttempts ?? 0) + 1;
-      const exhausted = attempts >= MAX_OTP_ATTEMPTS;
-      await prisma.protectionLock.update({
+      // ATOMIC increment: a plain read-modify-write lets N concurrent wrong guesses
+      // all read the same otpAttempts and collectively stay under the cap, defeating
+      // it. `{ increment: 1 }` is applied server-side, so each request sees a
+      // distinct count.
+      const updated = await prisma.protectionLock.update({
         where: { userId },
-        // Past the cap, invalidate the code so it can't be brute-forced — the user
-        // must request a new one (which re-emails the partner).
-        data: exhausted ? { otpAttempts: attempts, otp: null } : { otpAttempts: attempts },
+        data: { otpAttempts: { increment: 1 } },
       });
+      const exhausted = (updated.otpAttempts ?? 0) >= MAX_OTP_ATTEMPTS;
+      // Past the cap, invalidate the code so it can't be brute-forced — the user
+      // must request a new one (which re-emails the partner).
+      if (exhausted && updated.otp) {
+        await prisma.protectionLock.update({ where: { userId }, data: { otp: null } });
+      }
       throw unauthorized(
         exhausted ? "Too many attempts — ask your partner for a new code" : "Incorrect or expired code",
       );

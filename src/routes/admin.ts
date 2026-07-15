@@ -150,7 +150,10 @@ adminRouter.get(
   requireAdmin,
   asyncHandler(async (req, res) => {
     const id = req.params.id;
-    const skip = req.query.skip ? Number.parseInt(String(req.query.skip), 10) : 0;
+    const skipRaw = req.query.skip ? Number.parseInt(String(req.query.skip), 10) : 0;
+    // Clamp to >= 0: a negative skip is finite, so it would otherwise reach Prisma
+    // and throw a PrismaClientValidationError (no `code` → uncaught 500).
+    const skip = Math.max(Number.isFinite(skipRaw) ? skipRaw : 0, 0);
     const takeRaw = req.query.take ? Number.parseInt(String(req.query.take), 10) : 50;
     const take = Math.min(Math.max(Number.isFinite(takeRaw) ? takeRaw : 50, 1), 200);
 
@@ -159,7 +162,7 @@ adminRouter.get(
       prisma.focusEvent.findMany({
         where: { userId: id },
         orderBy: { startedAt: "desc" },
-        skip: Number.isFinite(skip) ? skip : 0,
+        skip,
         take,
       }),
     ]);

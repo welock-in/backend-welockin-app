@@ -26,6 +26,6 @@ test("Apple auto-linking rejects unverified password accounts", () => {
   assert.equal(canAutoLinkAppleAccount({ emailVerified: true }), true);
 });
 
-test("Apple audience defaults to the mobile bundle identifier", () => {
-  assert.equal(env.appleBundleId, process.env.APPLE_BUNDLE_ID ?? "in.welock.mobile");
+test("Apple audience defaults to the app bundle identifier", () => {
+  assert.equal(env.appleBundleId, process.env.APPLE_BUNDLE_ID ?? "in.welock.app");
 });

@@ -15,6 +15,7 @@ healthRouter.get("/db", async (_req, res) => {
     res.json({ db: "ok" });
   } catch (err) {
     console.error("DB readiness check failed:", err);
-    res.status(503).json({ db: "error" });
+    // Keep the { error } shape every other endpoint uses, plus the db flag.
+    res.status(503).json({ error: "Database unreachable", db: "error" });
   }
 });

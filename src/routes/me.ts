@@ -35,18 +35,26 @@ meRouter.delete(
     const del = (model: { deleteMany: (a: { where: { userId: string } }) => Promise<unknown> }) =>
       model.deleteMany({ where: { userId } }).catch(() => undefined);
 
+    // Best-effort explicit cleanup of models that ALSO cascade from user.delete
+    // (belt-and-suspenders — a swallowed failure here is still covered by Prisma's
+    // emulated onDelete: Cascade when the user row goes).
     await Promise.all([
       del(prisma.focusEvent),
       del(prisma.device),
-      del(prisma.deviceTransfer),
       del(prisma.liveSession),
       del(prisma.authProvider),
       del(prisma.syncSnapshot),
-      del(prisma.break),
       del(prisma.vote),
     ]);
-    // Feature requests authored by the user (authorId, not userId).
+    // Feature requests authored by the user (authorId, not userId) — also cascades.
     await prisma.featureRequest.deleteMany({ where: { authorId: userId } }).catch(() => undefined);
+
+    // DeviceTransfer and Break have NO User back-relation, so nothing cascades them:
+    // their deletion must actually succeed, or a transient failure would leave rows
+    // (deviceId + timestamps) orphaned to a deleted user — a data-deletion gap. Fail
+    // loud (→ 500 → the client retries; deleteMany is idempotent).
+    await prisma.deviceTransfer.deleteMany({ where: { userId } });
+    await prisma.break.deleteMany({ where: { userId } });
 
     // The account row itself is the deletion that MUST succeed — do NOT swallow a
     // real failure (returning 204 while the account and its credentials survive is

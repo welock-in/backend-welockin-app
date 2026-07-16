@@ -66,7 +66,9 @@ sessionsRouter.post(
       // one hits a P2002 duplicate key. The row now exists → apply this beat as a
       // plain update instead of surfacing a spurious 409 to the client.
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-        await prisma.liveSession.update({ where: { id }, data });
+        // updateMany (not update) so a POST /end that raced away the row between the
+        // failed create and here is a harmless no-op (count 0) instead of a P2025.
+        await prisma.liveSession.updateMany({ where: { id }, data });
       } else {
         throw err;
       }

@@ -25,7 +25,6 @@ export const deviceSchema = z.object({
   // Part D — device identity / one-active-phone binding (kind above covers phone/desktop/tablet).
   idfv: z.string().trim().min(1).optional(), // weak correlation hint (regenerates on reinstall)
   takeover: z.boolean().optional(), // opt in to superseding the current active phone
-  clientRebindId: z.string().trim().min(1).max(64).optional(), // takeover idempotency key
 });
 
 export const deactivateDeviceSchema = z.object({
@@ -149,6 +148,9 @@ export const reportFeedbackSchema = z.object({
 
 export const sessionHeartbeatSchema = z.object({
   deviceId: z.string().trim().min(1, "deviceId is required"),
+  // Per-session id (a device runs up to two sessions at once). Defaults to
+  // "default" for older single-session clients that don't send one.
+  sessionId: z.string().trim().min(1).default("default"),
   deviceName: z.string().trim().min(1).optional(),
   platform: z.enum(["android", "ios", "ipados", "macos", "windows"]).optional(),
   name: z.string().trim().min(1).default("Focus session"),
@@ -165,6 +167,8 @@ export const sessionHeartbeatSchema = z.object({
 
 export const sessionEndSchema = z.object({
   deviceId: z.string().trim().min(1, "deviceId is required"),
+  // End one specific session; omit to end ALL of the device's live sessions.
+  sessionId: z.string().trim().min(1).optional(),
 });
 
 // ── admin console ────────────────────────────────────────────────────────────
@@ -225,24 +229,8 @@ export const protectionImportSchema = z.object({
   values: z.array(z.string().trim().min(1)).min(1, "at least one value"),
 });
 
-export type ProtectionLockInput = z.infer<typeof protectionLockSchema>;
-export type ProtectionEntryInput = z.infer<typeof protectionEntrySchema>;
-
-export type SessionHeartbeatInput = z.infer<typeof sessionHeartbeatSchema>;
-export type SessionEndInput = z.infer<typeof sessionEndSchema>;
-export type AdminLoginInput = z.infer<typeof adminLoginSchema>;
-
-export type RegisterInput = z.infer<typeof registerSchema>;
-export type LoginInput = z.infer<typeof loginSchema>;
-export type AppleAuthInput = z.infer<typeof appleAuthSchema>;
-export type DeviceInput = z.infer<typeof deviceSchema>;
+// Only the inferred types actually consumed elsewhere are exported; every other
+// route parses its schema inline (`schema.parse(req.body)`), which infers the type
+// locally, so a full mirror of `*Input` aliases would just be dead surface.
 export type FocusEventInput = z.infer<typeof focusEventInputSchema>;
 export type SyncPushInput = z.infer<typeof syncPushSchema>;
-export type CreateFeedbackInput = z.infer<typeof createFeedbackSchema>;
-export type ListFeedbackQuery = z.infer<typeof listFeedbackQuerySchema>;
-export type UpdateFeedbackStatusInput = z.infer<typeof updateFeedbackStatusSchema>;
-export type UpdateFeedbackHiddenInput = z.infer<typeof updateFeedbackHiddenSchema>;
-export type ReportFeedbackInput = z.infer<typeof reportFeedbackSchema>;
-export type DeactivateDeviceInput = z.infer<typeof deactivateDeviceSchema>;
-export type CreateBreakInput = z.infer<typeof createBreakSchema>;
-export type AttestRegisterInput = z.infer<typeof attestRegisterSchema>;

@@ -84,8 +84,8 @@ project's environment settings.
 
 | Var | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` | `mongodb://localhost:27017/welockin` | Mongo connection string (Atlas `mongodb+srv`, DB name included). |
-| `JWT_SECRET` | `change-me` | HMAC secret for user JWTs. **Set a long random value in prod** (see security note). |
+| `DATABASE_URL` | `mongodb://localhost:27017/welockin` *(dev only)* | Mongo connection string (Atlas `mongodb+srv`, DB name included). **Required in production** — boot fails closed if unset. |
+| `JWT_SECRET` | `change-me` *(dev only)* | HMAC secret for user JWTs. **Required in production** — boot fails closed if unset or left at the `change-me` placeholder (a guessable secret would let anyone forge tokens). |
 | `JWT_EXPIRES_IN` | `30d` | User-token lifetime (`30d`, `12h`, `3600`, …). |
 | `PORT` | `8787` | Local server port (ignored on Vercel). |
 | `CORS_ORIGIN` | `*` | `*` or a comma-separated allow-list. |
@@ -284,6 +284,16 @@ on install; run `npx prisma db push` once against the production `DATABASE_URL`
 (locally with that URL, or a one-off job) to create collections/indexes, and
 `npm run device:migrate` once to create the phone-binding partial indexes.
 
+**Production checklist (boot fails closed without the required secrets):**
+
+- [ ] `DATABASE_URL` — the Atlas connection string (**required**; boot throws otherwise).
+- [ ] `JWT_SECRET` — a long random value, **not** `change-me` (**required**; boot throws otherwise).
+- [ ] `ADMIN_USERNAME` + `ADMIN_PASSWORD` — a strong password (admin login is disabled while the password is empty).
+- [ ] `APPLE_BUNDLE_ID` = `in.welock.app` (if Sign in with Apple is used).
+- [ ] `RESEND_API_KEY` + `RESEND_FROM` — for the addiction-protection partner OTP email.
+- [ ] `CORS_ORIGIN` — the web/admin origins (not `*`) if browser clients call the API.
+- [ ] Run `npx prisma db push` and `npm run device:migrate` once, and `npm run protection:seed` to load the curated blocklist.
+
 ### Generic Node host (Render / Railway / Docker)
 
 Build `npm install && npm run build`, start `npm start`. Provide `DATABASE_URL`,
@@ -296,7 +306,7 @@ Build `npm install && npm run build`, start `npm start`. Provide `DATABASE_URL`,
 Honest posture (some are intentional product decisions, some are open work):
 
 - **No rate limiting** on `POST /api/auth/login`, `/register`, `POST /api/admin/login`, or the OTP `POST /api/addiction-protection/{lock,resend}` (the latter can email an attacker-chosen partner address repeatedly). Proper limiting on serverless needs a DB/Redis-backed limiter — tracked, not yet implemented.
-- **Secrets fail *open* to public defaults when unset.** `JWT_SECRET` and `DATABASE_URL` fall back to `change-me` / `localhost`, so a missing var doesn't crash the boot — **you must set real values in production** (a `change-me` JWT secret means anyone can forge a user token).
+- **Secrets fail *closed* in production.** With `NODE_ENV=production`, boot throws if `DATABASE_URL` or `JWT_SECRET` is unset (or `JWT_SECRET` is still the `change-me` placeholder) — no silent fallback to a guessable secret. In dev/test the fallbacks keep zero-config runs working.
 - **Partner OTP is stored in plaintext and shown to admins** — *intentional*: it's a friction code (with a 5-try cap), not a credential.
 - **Day-streak analytics use the server timezone (UTC on Vercel)**, so a streak can flip at a different local time than a non-UTC user expects.
 - **App Attest is scaffolded but fail-closed** — `/api/attest/register` always returns `501` and `ATTEST_REQUIRED` must stay `false` until the native verifier is wired. Focus/break counters are binding-protected but forgeable by the account owner until then.

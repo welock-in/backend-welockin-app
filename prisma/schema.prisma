@@ -66,8 +66,14 @@ model LiveSession {
   id            String   @id @default(auto()) @map("_id") @db.ObjectId
   userId        String   @db.ObjectId
   user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  // Stable client device id (e.g. "win-<MachineGuid>"); the identity key.
+  // Stable client device id (e.g. "win-<MachineGuid>").
   deviceId      String
+  // Client session id (the desktop's per-session id). A device runs UP TO TWO
+  // sessions at once (a manual "Start Focus" + a scheduled one), so a device has
+  // one LiveSession row PER session, not per device. Optional so rows written by
+  // the earlier one-per-device version still read back (they expire quickly). The
+  // row `id` is deterministic from (user, device, session).
+  sessionId     String?
   deviceName    String?
   platform      String? // "windows" | "macos" | "android" | "ios" | "ipados"
   name          String // session title
@@ -87,7 +93,7 @@ model LiveSession {
   lastHeartbeatAt DateTime @default(now())
   createdAt     DateTime @default(now())
 
-  @@unique([userId, deviceId])
+  @@index([userId, deviceId])
   @@index([lastHeartbeatAt])
 }
 

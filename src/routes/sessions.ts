@@ -1,19 +1,25 @@
 import { Router } from "express";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
+import { deterministicObjectId } from "../lib/deterministic-id";
 import { sessionHeartbeatSchema, sessionEndSchema } from "../validation/schemas";
 
 export const sessionsRouter = Router();
 
 /**
  * Live-session heartbeat. A client posts this on session start and roughly every
- * 5 minutes while a focus session runs. Upserts the single LiveSession row for
- * this (user, device) so the admin console can see who is focusing right now.
+ * 5 minutes while a focus session runs. There is one LiveSession row PER session
+ * (a device runs up to two at once — a manual "Start Focus" plus a scheduled one),
+ * keyed by a deterministic id from (user, device, session), so the admin console
+ * sees each concurrent focus as its own row.
  *
  * The response carries `forceEnd`: when an admin has requested a force-stop for
  * this session, the client must end the session (overriding a hard lock) and
- * then call `/end`. Returns `forceEnd: false` in the normal case.
+ * then call `/end`. Returns `forceEnd: false` in the normal case. Because rows
+ * are per-session, a force-end is scoped to exactly one session by construction —
+ * a fresh session is a distinct row and can never inherit a stale flag.
  */
 sessionsRouter.post(
   "/heartbeat",
@@ -25,19 +31,9 @@ sessionsRouter.post(
     const endsAt =
       input.remainSeconds > 0 ? new Date(now.getTime() + input.remainSeconds * 1000) : null;
 
-    const existing = await prisma.liveSession.findUnique({
-      where: { userId_deviceId: { userId, deviceId: input.deviceId } },
-    });
+    const id = deterministicObjectId("live-session", userId, input.deviceId, input.sessionId);
 
-    // A force-end targets ONE specific running session. The live row is keyed by
-    // (user, device) and reused across a device's sessions, so bind the flag to
-    // the session identity (startedAt): if this beat is a *different* session than
-    // the one that was force-ended, the flag is stale and must be cleared, or a
-    // brand-new (possibly hard-locked) session would inherit someone else's
-    // force-end. Only a beat from the SAME session (same startedAt) honours it.
-    const sameSession =
-      !!existing && existing.startedAt.getTime() === input.startedAt.getTime();
-    const effectiveForceEnd = sameSession ? existing!.forceEnd : false;
+    const existing = await prisma.liveSession.findUnique({ where: { id } });
 
     const data = {
       deviceName: input.deviceName,
@@ -56,26 +52,42 @@ sessionsRouter.post(
       lastHeartbeatAt: now,
     };
 
-    await prisma.liveSession.upsert({
-      where: { userId_deviceId: { userId, deviceId: input.deviceId } },
-      // Reset a stale flag on a new session; never resurrect it on create.
-      update: { ...data, ...(sameSession ? {} : { forceEnd: false }) },
-      create: { userId, deviceId: input.deviceId, ...data },
-    });
+    try {
+      await prisma.liveSession.upsert({
+        where: { id },
+        // `update` never touches `forceEnd`: an admin-set flag persists across beats
+        // until the client obeys it. `create` leaves it at its schema default.
+        update: data,
+        create: { id, userId, deviceId: input.deviceId, sessionId: input.sessionId, ...data },
+      });
+    } catch (err) {
+      // Mongo has no native upsert — Prisma emulates it as find-then-write, so two
+      // concurrent first beats for the same deterministic id both try to create and
+      // one hits a P2002 duplicate key. The row now exists → apply this beat as a
+      // plain update instead of surfacing a spurious 409 to the client.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        await prisma.liveSession.update({ where: { id }, data });
+      } else {
+        throw err;
+      }
+    }
 
-    // Surface a pending admin force-end only to the session it targeted.
-    res.json({ forceEnd: effectiveForceEnd });
+    res.json({ forceEnd: existing?.forceEnd ?? false });
   }),
 );
 
-/** End the live session for this device (called on stop / completion). */
+/**
+ * End a live session (called on stop / completion). Pass `sessionId` to end that
+ * one session; omit it to end ALL of the device's live sessions (e.g. a clean
+ * shutdown that clears whatever was running).
+ */
 sessionsRouter.post(
   "/end",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const { deviceId } = sessionEndSchema.parse(req.body);
+    const { deviceId, sessionId } = sessionEndSchema.parse(req.body);
     const result = await prisma.liveSession.deleteMany({
-      where: { userId: req.user!.id, deviceId },
+      where: { userId: req.user!.id, deviceId, ...(sessionId ? { sessionId } : {}) },
     });
     res.json({ ended: result.count });
   }),

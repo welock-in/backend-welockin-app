@@ -384,3 +384,25 @@ model PushToken {
   @@index([userId, valid])
   @@map("push_tokens")
 }
+
+// One row per push sent to one device — the audit log + inbox source + receipt
+// reconciliation target. No User back-relation (raw userId, like Break) → cleaned
+// up explicitly in me.ts. NEW → purely additive (P1).
+model NotificationDelivery {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String?  @db.ObjectId // recipient (null for a token with no known owner)
+  token     String? // the push token targeted
+  title     String
+  body      String
+  data      Json?
+  channel   String   @default("push")
+  status    String   @default("queued") // "queued" | "sent" | "error" | "invalid"
+  ticketId  String? // Expo ticket id (for later receipt polling)
+  error     String? // Expo/transport error message when status="error"
+  source    String   @default("admin") // "admin" | "rule:<event>"
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+  @@map("notification_deliveries")
+}

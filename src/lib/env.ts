@@ -82,4 +82,9 @@ export const env = {
   resendApiKey: process.env.RESEND_API_KEY ?? "",
   // Verified sender. Must be on a domain verified in your Resend account.
   resendFrom: process.env.RESEND_FROM ?? "WeLockin <protection@welock.in>",
+
+  // --- Expo push notifications ---
+  // Optional Expo access token (recommended for enhanced security + higher rate
+  // limits). Sends still work without it via the open Expo Push API.
+  expoAccessToken: process.env.EXPO_ACCESS_TOKEN ?? "",
 };

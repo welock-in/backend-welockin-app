@@ -19,6 +19,7 @@ import { sessionsRouter } from "./routes/sessions";
 import { adminRouter } from "./routes/admin";
 import { addictionProtectionRouter } from "./routes/addiction-protection";
 import { adminProtectionRouter } from "./routes/admin-protection";
+import { adminNotificationsRouter } from "./routes/admin-notifications";
 import { errorHandler, notFoundHandler } from "./middleware/error";
 
 export function createApp(): Express {
@@ -59,6 +60,7 @@ export function createApp(): Express {
   // and the admin CRUD + active-protection panel.
   app.use("/api/addiction-protection", addictionProtectionRouter);
   app.use("/api/admin/addiction-protection", adminProtectionRouter);
+  app.use("/api/admin/notifications", adminNotificationsRouter);
 
   // Same-origin admin dashboard for the feedback board (gated by admin login;
   // all data/actions require User.isAdmin). Route-scoped CSP relaxes helmet's

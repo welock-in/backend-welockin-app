@@ -240,6 +240,24 @@ export const pushTokenSchema = z.object({
   appVersion: z.string().trim().min(1).optional(),
 });
 
+// Admin: send an ad-hoc push to an audience (POST /api/admin/notifications/send).
+export const sendNotificationSchema = z
+  .object({
+    audience: z.object({
+      mode: z.enum(["all", "user"]),
+      userId: z.string().trim().min(1).optional(),
+    }),
+    title: z.string().trim().min(1).max(120),
+    body: z.string().trim().min(1).max(500),
+    // Arbitrary deep-link payload the client routes on tap (e.g. { route, params }).
+    data: z.record(z.unknown()).optional(),
+  })
+  .superRefine((v, ctx) => {
+    if (v.audience.mode === "user" && !v.audience.userId) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "audience.userId is required when mode is 'user'", path: ["audience", "userId"] });
+    }
+  });
+
 // Only the inferred types actually consumed elsewhere are exported; every other
 // route parses its schema inline (`schema.parse(req.body)`), which infers the type
 // locally, so a full mirror of `*Input` aliases would just be dead surface.

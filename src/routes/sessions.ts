@@ -5,6 +5,7 @@ import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { deterministicObjectId } from "../lib/deterministic-id";
 import { sessionHeartbeatSchema, sessionEndSchema } from "../validation/schemas";
+import { dispatchEvent } from "../services/notifications/dispatcher";
 
 export const sessionsRouter = Router();
 
@@ -72,6 +73,22 @@ sessionsRouter.post(
       } else {
         throw err;
       }
+    }
+
+    // First beat of this session → run the data-driven notification engine. AWAITED
+    // so it actually executes on Vercel (post-response work can be frozen); it never
+    // throws and the Expo call is time-bounded, so it can't break/hang the heartbeat.
+    // Concurrent first-beats are deduped downstream (rule dedupeKey on sessionId).
+    if (existing === null) {
+      await dispatchEvent("session.started", {
+        userId,
+        deviceId: input.deviceId,
+        platform: input.platform,
+        kind: input.platform === "windows" || input.platform === "macos" ? "desktop" : "phone",
+        sessionName: input.name,
+        sessionId: input.sessionId,
+        hardLock: input.hardLock,
+      });
     }
 
     res.json({ forceEnd: existing?.forceEnd ?? false });

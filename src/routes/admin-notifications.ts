@@ -1,73 +1,35 @@
 import { Router } from "express";
-import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { requireAdmin } from "../middleware/admin-auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { sendNotificationSchema } from "../validation/schemas";
-import { sendExpoPush } from "../lib/expo-push";
+import { resolveAudience } from "../services/notifications/audience";
+import { deliver } from "../services/notifications/deliver";
 
 export const adminNotificationsRouter = Router();
 
 /**
- * Send an ad-hoc push to an audience (P1 — first real send). Resolves the valid
- * push tokens, sends via the Expo Push service, logs one NotificationDelivery per
- * recipient, and prunes tokens Expo reports as DeviceNotRegistered. This is the
- * imperative path; the data-driven rule engine (P2) will reuse the same send +
- * delivery-log primitives.
+ * Send an ad-hoc push to an audience. Reuses the shared engine primitives
+ * (resolveAudience + deliver), so an admin broadcast and a rule-triggered send
+ * behave identically (same Expo send, delivery log, and dead-token pruning).
  */
 adminNotificationsRouter.post(
   "/send",
   requireAdmin,
   asyncHandler(async (req, res) => {
     const input = sendNotificationSchema.parse(req.body);
-
-    const where =
+    const targets = await resolveAudience(
       input.audience.mode === "user"
-        ? { userId: input.audience.userId, valid: true }
-        : { valid: true };
-    const rows = await prisma.pushToken.findMany({ where, select: { token: true, userId: true } });
-
-    if (rows.length === 0) {
-      res.json({ audience: input.audience.mode, recipients: 0, sent: 0, failed: 0, invalid: 0, pruned: 0 });
-      return;
-    }
-
-    const tokens = rows.map((r) => r.token);
-    const ownerByToken = new Map(rows.map((r) => [r.token, r.userId]));
-    const results = await sendExpoPush(tokens, { title: input.title, body: input.body, data: input.data });
-
-    const dataJson = input.data as Prisma.InputJsonValue | undefined;
-    await prisma.notificationDelivery.createMany({
-      data: results.map((r) => ({
-        userId: ownerByToken.get(r.token) ?? null,
-        token: r.token,
-        title: input.title,
-        body: input.body,
-        ...(dataJson !== undefined ? { data: dataJson } : {}),
-        status: r.status,
-        ticketId: r.ticketId ?? null,
-        error: r.error ?? null,
-        source: "admin",
-      })),
-    });
-
-    // Expo says these tokens are gone → mark invalid so future sends skip them.
-    const dead = results.filter((r) => r.errorCode === "DeviceNotRegistered").map((r) => r.token);
-    if (dead.length > 0) {
-      await prisma.pushToken.updateMany({
-        where: { token: { in: dead } },
-        data: { valid: false, disabledReason: "DeviceNotRegistered" },
-      });
-    }
-
-    res.json({
-      audience: input.audience.mode,
-      recipients: results.length,
-      sent: results.filter((r) => r.status === "sent").length,
-      failed: results.filter((r) => r.status === "error").length,
-      invalid: results.filter((r) => r.status === "invalid").length,
-      pruned: dead.length,
-    });
+        ? { mode: "user", userId: input.audience.userId }
+        : { mode: "all" },
+      { userId: input.audience.userId ?? "" },
+    );
+    const summary = await deliver(
+      targets,
+      { title: input.title, body: input.body, data: input.data },
+      { source: "admin" },
+    );
+    res.json({ audience: input.audience.mode, ...summary });
   }),
 );
 

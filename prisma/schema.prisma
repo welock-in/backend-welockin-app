@@ -400,9 +400,52 @@ model NotificationDelivery {
   ticketId  String? // Expo ticket id (for later receipt polling)
   error     String? // Expo/transport error message when status="error"
   source    String   @default("admin") // "admin" | "rule:<event>"
+  // Best-effort idempotency key (from a rule's dedupeKeyTemplate) so concurrent
+  // first-beats of the same session don't double-notify the same user.
+  dedupeKey String?
   createdAt DateTime @default(now())
 
   @@index([userId])
   @@index([createdAt])
+  @@index([dedupeKey])
   @@map("notification_deliveries")
+}
+
+// ---------------------------------------------------------------------------
+// Data-driven notification engine (P2). A TEMPLATE is the content (title/body/data
+// with {{variables}}); a RULE binds an event to a template + audience + throttle,
+// entirely in data — so new notifications are added from the admin with NO code.
+// ---------------------------------------------------------------------------
+model NotificationTemplate {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  key       String   @unique // e.g. "pc_locked"
+  title     String // supports {{variables}}
+  body      String // supports {{variables}}
+  data      Json? // deep-link payload template; string values support {{variables}}
+  category  String   @default("system") // "cross_device" | "lifecycle" | "system" | "marketing" | "security"
+  sound     String?  @default("default")
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("notification_templates")
+}
+
+model NotificationRule {
+  id                String   @id @default(auto()) @map("_id") @db.ObjectId
+  name              String
+  event             String // "session.started"
+  // Match against the event context, e.g. { "platform": { "$in": ["windows","macos"] } }.
+  condition         Json     @default("{}")
+  templateKey       String
+  // e.g. { "mode": "sameUserOtherDevices", "excludeOrigin": true }.
+  audience          Json
+  dedupeKeyTemplate String? // e.g. "pc_locked:{{sessionId}}"
+  enabled           Boolean  @default(true)
+  priority          Int      @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([event, enabled])
+  @@map("notification_rules")
 }

@@ -46,6 +46,9 @@ async function postChunk(messages: Array<Record<string, unknown>>): Promise<Expo
       ...(env.expoAccessToken ? { Authorization: `Bearer ${env.expoAccessToken}` } : {}),
     },
     body: JSON.stringify(messages),
+    // Bound the call so an awaited dispatch (e.g. on the session heartbeat) can
+    // never hang the request if Expo is slow/unreachable.
+    signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) throw new Error(`Expo push HTTP ${res.status}`);
   const json = (await res.json()) as { data?: ExpoTicket[] };

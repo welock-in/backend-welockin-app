@@ -45,6 +45,7 @@ meRouter.delete(
       del(prisma.authProvider),
       del(prisma.syncSnapshot),
       del(prisma.vote),
+      del(prisma.pushToken),
     ]);
     // Feature requests authored by the user (authorId, not userId) — also cascades.
     await prisma.featureRequest.deleteMany({ where: { authorId: userId } }).catch(() => undefined);

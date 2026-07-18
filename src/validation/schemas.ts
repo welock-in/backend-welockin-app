@@ -229,6 +229,17 @@ export const protectionImportSchema = z.object({
   values: z.array(z.string().trim().min(1)).min(1, "at least one value"),
 });
 
+// ── push notifications ────────────────────────────────────────────────────────
+
+// Register / refresh a device's push token (POST /api/notifications/token).
+export const pushTokenSchema = z.object({
+  token: z.string().trim().min(1), // "ExponentPushToken[...]" (or a raw APNs/FCM token)
+  platform: z.string().trim().min(1).optional(), // "ios" | "ipados" | "android"
+  tokenType: z.enum(["expo", "apns", "fcm"]).optional().default("expo"),
+  deviceId: z.string().trim().min(1).optional(), // links the token to a Device row
+  appVersion: z.string().trim().min(1).optional(),
+});
+
 // Only the inferred types actually consumed elsewhere are exported; every other
 // route parses its schema inline (`schema.parse(req.body)`), which infers the type
 // locally, so a full mirror of `*Input` aliases would just be dead surface.

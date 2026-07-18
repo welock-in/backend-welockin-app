@@ -13,6 +13,7 @@ import { analyticsRouter } from "./routes/analytics";
 import { feedbackRouter } from "./routes/feedback";
 import { attestRouter } from "./routes/attest";
 import { breaksRouter } from "./routes/breaks";
+import { notificationsRouter } from "./routes/notifications";
 import { adminPageHtml } from "./admin/page";
 import { sessionsRouter } from "./routes/sessions";
 import { adminRouter } from "./routes/admin";
@@ -48,6 +49,7 @@ export function createApp(): Express {
   app.use("/api/feedback", feedbackRouter);
   app.use("/api/attest", attestRouter);
   app.use("/api/breaks", breaksRouter);
+  app.use("/api/notifications", notificationsRouter);
   // Live-session heartbeats (client) + the admin console API (distinct from the
   // feedback-board /admin HTML page below; this is a JSON API for the separate
   // admin-dashboard app, gated by env-cred admin JWT, not User.isAdmin).

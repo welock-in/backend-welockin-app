@@ -53,6 +53,7 @@ model User {
   votes           Vote[]           @relation("UserVotes")
   liveSessions    LiveSession[]
   protectionLock  ProtectionLock?
+  pushTokens      PushToken[]
 }
 
 // A focus session that is HAPPENING RIGHT NOW, reported by a client via
@@ -353,4 +354,33 @@ model ProtectionLock {
   updatedAt      DateTime  @updatedAt
 
   @@map("protection_locks")
+}
+
+// ---------------------------------------------------------------------------
+// Push notifications: one row per push token owned by a user's device. NEW →
+// purely additive. `@unique(token)` makes registration idempotent AND gives the
+// receipt worker a natural key to prune tokens the Expo Push service reports as
+// DeviceNotRegistered. This is the foundation (P0) of the notification system.
+// ---------------------------------------------------------------------------
+model PushToken {
+  id             String    @id @default(auto()) @map("_id") @db.ObjectId
+  userId         String    @db.ObjectId
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // The client deviceId this token belongs to (links to a Device row). Optional so
+  // a token can be stored even before/without a registered Device row.
+  deviceId       String?
+  token          String    @unique // e.g. "ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]"
+  platform       String? // "ios" | "ipados" | "android"
+  tokenType      String    @default("expo") // "expo" | "apns" | "fcm"
+  valid          Boolean   @default(true)
+  disabledReason String? // set by the receipt worker, e.g. "DeviceNotRegistered"
+  appVersion     String?
+  failureCount   Int       @default(0)
+  lastUsedAt     DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([userId, valid])
+  @@map("push_tokens")
 }

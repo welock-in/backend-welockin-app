@@ -1,21 +1,29 @@
-import { Expo, type ExpoPushMessage, type ExpoPushTicket } from "expo-server-sdk";
 import { env } from "./env";
 
-// One shared client. An access token is optional (recommended for higher limits /
-// enhanced security); sends work without it via the open Expo Push API.
-const expo = new Expo(env.expoAccessToken ? { accessToken: env.expoAccessToken } : {});
+/* ─────────────────────────────────────────────────────────────
+   Expo Push send path — implemented directly against the Expo Push
+   HTTP API (no expo-server-sdk). expo-server-sdk v6 is ESM-only and
+   this backend compiles to CommonJS on Vercel, so `require()`-ing it
+   throws ERR_REQUIRE_ESM and crashes the whole function. The Expo
+   Push API is a plain JSON POST — Node's global fetch (18+) covers it.
+   Docs: https://docs.expo.dev/push-notifications/sending-notifications/
+   ───────────────────────────────────────────────────────────── */
 
-export const isExpoPushToken = (token: string): boolean => Expo.isExpoPushToken(token);
+const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
+const CHUNK = 100; // Expo accepts up to 100 messages per request.
+
+// Accepts both the modern "ExponentPushToken[...]" and legacy "ExpoPushToken[...]".
+const EXPO_TOKEN_RE = /^Expo(nent)?PushToken\[[^\]]+\]$/;
+export const isExpoPushToken = (t: string): boolean => EXPO_TOKEN_RE.test(t);
 
 export interface PushPayload {
   title: string;
   body: string;
   data?: Record<string, unknown>;
-  sound?: string | null; // default "default"; pass null for a silent notification
+  sound?: string | null; // default "default"; null = silent
   badge?: number;
 }
 
-/** Per-token send outcome (index-aligned semantics via the returned `token`). */
 export interface PushResult {
   token: string;
   status: "sent" | "invalid" | "error";
@@ -25,9 +33,28 @@ export interface PushResult {
   errorCode?: string;
 }
 
+type ExpoTicket =
+  | { status: "ok"; id: string }
+  | { status: "error"; message: string; details?: { error?: string } };
+
+async function postChunk(messages: Array<Record<string, unknown>>): Promise<ExpoTicket[]> {
+  const res = await fetch(EXPO_PUSH_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(env.expoAccessToken ? { Authorization: `Bearer ${env.expoAccessToken}` } : {}),
+    },
+    body: JSON.stringify(messages),
+  });
+  if (!res.ok) throw new Error(`Expo push HTTP ${res.status}`);
+  const json = (await res.json()) as { data?: ExpoTicket[] };
+  return json.data ?? [];
+}
+
 /**
- * Send one payload to many push tokens. Chunks per Expo limits, sends each chunk,
- * and returns a per-token result. Invalid tokens are reported (never sent); a
+ * Send one payload to many push tokens. Chunks per Expo's 100/request limit and
+ * returns a per-token result. Invalid tokens are reported (never sent); a
  * ticket-level "DeviceNotRegistered" surfaces as `errorCode` so the caller can
  * mark that PushToken invalid. (Full delivery confirmation needs a later receipts
  * poll — out of P1 scope.)
@@ -35,32 +62,30 @@ export interface PushResult {
 export async function sendExpoPush(tokens: string[], payload: PushPayload): Promise<PushResult[]> {
   const out: PushResult[] = tokens.map((token) => ({
     token,
-    status: Expo.isExpoPushToken(token) ? "sent" : "invalid",
+    status: isExpoPushToken(token) ? "sent" : "invalid",
   }));
 
-  const validIdx = tokens.map((_, i) => i).filter((i) => Expo.isExpoPushToken(tokens[i]));
+  const validIdx = tokens.map((_, i) => i).filter((i) => isExpoPushToken(tokens[i]));
   if (validIdx.length === 0) return out;
 
-  const messages: ExpoPushMessage[] = validIdx.map((i) => ({
+  const messages = validIdx.map((i) => ({
     to: tokens[i],
     title: payload.title,
     body: payload.body,
     data: payload.data ?? {},
-    sound: payload.sound === null ? undefined : (payload.sound ?? "default"),
+    ...(payload.sound === null ? {} : { sound: payload.sound ?? "default" }),
     ...(payload.badge !== undefined ? { badge: payload.badge } : {}),
   }));
 
-  // chunkPushNotifications preserves order, so concatenated tickets align 1:1 with
-  // `messages` (hence with `validIdx`).
-  const tickets: ExpoPushTicket[] = [];
-  for (const chunk of expo.chunkPushNotifications(messages)) {
+  // Order is preserved, so concatenated tickets align 1:1 with `messages` / `validIdx`.
+  const tickets: ExpoTicket[] = [];
+  for (let i = 0; i < messages.length; i += CHUNK) {
+    const chunk = messages.slice(i, i + CHUNK);
     try {
-      tickets.push(...(await expo.sendPushNotificationsAsync(chunk)));
+      tickets.push(...(await postChunk(chunk)));
     } catch (err) {
       const message = err instanceof Error ? err.message : "send failed";
-      for (let k = 0; k < chunk.length; k++) {
-        tickets.push({ status: "error", message } as ExpoPushTicket);
-      }
+      for (let k = 0; k < chunk.length; k++) tickets.push({ status: "error", message });
     }
   }
 
@@ -74,7 +99,7 @@ export async function sendExpoPush(tokens: string[], payload: PushPayload): Prom
         token: tokens[origIdx],
         status: "error",
         error: t.message,
-        errorCode: typeof t.details?.error === "string" ? t.details.error : undefined,
+        errorCode: t.details?.error,
       };
     }
   });

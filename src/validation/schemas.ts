@@ -258,6 +258,33 @@ export const sendNotificationSchema = z
     }
   });
 
+// Admin CRUD: notification templates (the content) + rules (the wiring). The JSON
+// fields (data / condition / audience) are validated as objects; their inner shape
+// is the engine's concern (render / matchCondition / resolveAudience).
+export const notificationTemplateSchema = z.object({
+  key: z.string().trim().min(1).max(64),
+  title: z.string().trim().min(1).max(200),
+  body: z.string().trim().min(1).max(1000),
+  data: z.record(z.unknown()).optional(),
+  category: z.string().trim().min(1).max(40).optional(),
+  sound: z.string().trim().min(1).nullable().optional(),
+  active: z.boolean().optional(),
+});
+// `key` is immutable (it's the reference used by rules).
+export const notificationTemplateUpdateSchema = notificationTemplateSchema.omit({ key: true }).partial();
+
+export const notificationRuleSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  event: z.string().trim().min(1).max(64),
+  condition: z.record(z.unknown()).optional(),
+  templateKey: z.string().trim().min(1),
+  audience: z.record(z.unknown()),
+  dedupeKeyTemplate: z.string().trim().min(1).nullable().optional(),
+  enabled: z.boolean().optional(),
+  priority: z.number().int().optional(),
+});
+export const notificationRuleUpdateSchema = notificationRuleSchema.partial();
+
 // Only the inferred types actually consumed elsewhere are exported; every other
 // route parses its schema inline (`schema.parse(req.body)`), which infers the type
 // locally, so a full mirror of `*Input` aliases would just be dead surface.

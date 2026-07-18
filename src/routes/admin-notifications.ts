@@ -1,8 +1,16 @@
 import { Router } from "express";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { requireAdmin } from "../middleware/admin-auth";
 import { asyncHandler } from "../middleware/async-handler";
-import { sendNotificationSchema } from "../validation/schemas";
+import { conflict, notFound } from "../lib/http-error";
+import {
+  sendNotificationSchema,
+  notificationTemplateSchema,
+  notificationTemplateUpdateSchema,
+  notificationRuleSchema,
+  notificationRuleUpdateSchema,
+} from "../validation/schemas";
 import { resolveAudience } from "../services/notifications/audience";
 import { deliver } from "../services/notifications/deliver";
 
@@ -46,5 +54,145 @@ adminNotificationsRouter.get(
       prisma.notificationDelivery.count(),
     ]);
     res.json({ deliveries, total, skip, take });
+  }),
+);
+
+// ── templates (the content, {{variables}}) ─────────────────────────────────────
+
+adminNotificationsRouter.get(
+  "/templates",
+  requireAdmin,
+  asyncHandler(async (_req, res) => {
+    const templates = await prisma.notificationTemplate.findMany({ orderBy: { createdAt: "desc" } });
+    res.json({ templates });
+  }),
+);
+
+adminNotificationsRouter.post(
+  "/templates",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const input = notificationTemplateSchema.parse(req.body);
+    try {
+      const template = await prisma.notificationTemplate.create({
+        data: {
+          key: input.key,
+          title: input.title,
+          body: input.body,
+          ...(input.data !== undefined ? { data: input.data as Prisma.InputJsonValue } : {}),
+          ...(input.category !== undefined ? { category: input.category } : {}),
+          ...(input.sound !== undefined ? { sound: input.sound } : {}),
+          ...(input.active !== undefined ? { active: input.active } : {}),
+        },
+      });
+      res.status(201).json({ template });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        throw conflict("A template with this key already exists");
+      }
+      throw err;
+    }
+  }),
+);
+
+adminNotificationsRouter.patch(
+  "/templates/:id",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const input = notificationTemplateUpdateSchema.parse(req.body);
+    const data: Prisma.NotificationTemplateUpdateInput = {};
+    if (input.title !== undefined) data.title = input.title;
+    if (input.body !== undefined) data.body = input.body;
+    if (input.data !== undefined) data.data = input.data as Prisma.InputJsonValue;
+    if (input.category !== undefined) data.category = input.category;
+    if (input.sound !== undefined) data.sound = input.sound;
+    if (input.active !== undefined) data.active = input.active;
+    try {
+      const template = await prisma.notificationTemplate.update({ where: { id: req.params.id }, data });
+      res.json({ template });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2025") {
+        throw notFound("Template not found");
+      }
+      throw err;
+    }
+  }),
+);
+
+adminNotificationsRouter.delete(
+  "/templates/:id",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    await prisma.notificationTemplate.deleteMany({ where: { id: req.params.id } });
+    res.json({ deleted: true });
+  }),
+);
+
+// ── rules (the wiring: event + condition + audience + template) ─────────────────
+
+adminNotificationsRouter.get(
+  "/rules",
+  requireAdmin,
+  asyncHandler(async (_req, res) => {
+    const rules = await prisma.notificationRule.findMany({
+      orderBy: [{ priority: "desc" }, { createdAt: "desc" }],
+    });
+    res.json({ rules });
+  }),
+);
+
+adminNotificationsRouter.post(
+  "/rules",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const input = notificationRuleSchema.parse(req.body);
+    const rule = await prisma.notificationRule.create({
+      data: {
+        name: input.name,
+        event: input.event,
+        templateKey: input.templateKey,
+        audience: input.audience as Prisma.InputJsonValue,
+        ...(input.condition !== undefined ? { condition: input.condition as Prisma.InputJsonValue } : {}),
+        ...(input.dedupeKeyTemplate !== undefined ? { dedupeKeyTemplate: input.dedupeKeyTemplate } : {}),
+        ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
+        ...(input.priority !== undefined ? { priority: input.priority } : {}),
+      },
+    });
+    res.status(201).json({ rule });
+  }),
+);
+
+adminNotificationsRouter.patch(
+  "/rules/:id",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const input = notificationRuleUpdateSchema.parse(req.body);
+    const data: Prisma.NotificationRuleUpdateInput = {};
+    if (input.name !== undefined) data.name = input.name;
+    if (input.event !== undefined) data.event = input.event;
+    if (input.templateKey !== undefined) data.templateKey = input.templateKey;
+    if (input.audience !== undefined) data.audience = input.audience as Prisma.InputJsonValue;
+    if (input.condition !== undefined) data.condition = input.condition as Prisma.InputJsonValue;
+    if (input.dedupeKeyTemplate !== undefined) data.dedupeKeyTemplate = input.dedupeKeyTemplate;
+    if (input.enabled !== undefined) data.enabled = input.enabled;
+    if (input.priority !== undefined) data.priority = input.priority;
+    try {
+      const rule = await prisma.notificationRule.update({ where: { id: req.params.id }, data });
+      res.json({ rule });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2025") {
+        throw notFound("Rule not found");
+      }
+      throw err;
+    }
+  }),
+);
+
+adminNotificationsRouter.delete(
+  "/rules/:id",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    await prisma.notificationRule.deleteMany({ where: { id: req.params.id } });
+    res.json({ deleted: true });
   }),
 );

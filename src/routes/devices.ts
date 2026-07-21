@@ -9,11 +9,22 @@ import { badRequest, deviceConflict, forbidden, notFound, rebindCooldown } from 
 
 export const devicesRouter = Router();
 
-const DESKTOP_PLATFORMS = new Set(["windows", "macos", "mac", "linux", "desktop"]);
+/**
+ * Platforms that claim the single binding phone slot. Deliberately an ALLOWLIST:
+ * only a known phone OS binds, and everything else — a typo, a future "web" or
+ * "watchos", any new desktop platform — falls through to the unbound desktop
+ * branch. Failing open into "no slot" is the safe direction; the previous
+ * "phone unless clearly a desktop" default meant an unrecognised platform string
+ * entered the binding branch and could take over the user's real iPhone.
+ *
+ * Note this is only a FALLBACK: a client that sends an explicit `kind` (as both
+ * shipping clients do) never reaches here.
+ */
+const PHONE_PLATFORMS = new Set(["ios", "android"]);
 
-/** Phone-class unless the platform is clearly a desktop OS. */
+/** Desktop-class unless the platform is a known phone OS. */
 function inferKind(platform: string): "phone" | "desktop" {
-  return DESKTOP_PLATFORMS.has(platform.toLowerCase()) ? "desktop" : "phone";
+  return PHONE_PLATFORMS.has(platform.toLowerCase()) ? "phone" : "desktop";
 }
 
 const isRaceError = (err: unknown) =>
@@ -24,6 +35,75 @@ const isRaceError = (err: unknown) =>
 function activeDeviceInfo(d: Device) {
   return { name: d.name, model: d.model ?? null, lastSeenAt: d.lastSeenAt ?? null };
 }
+
+/**
+ * Device slots a paid plan covers (one computer, one phone, one tablet).
+ * ADVISORY ONLY — nothing server-side counts devices, and nothing should: the
+ * one-active-phone partial unique index is what enforces anti-abuse. This value
+ * exists purely so the client can decide whether to show an "add a device" hint.
+ */
+const DEVICE_SOFT_CAP = 3;
+
+/** No heartbeat for this long → the UI dims the row. Derived, never stored. */
+const STALE_AFTER_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * The PUBLIC shape of a device.
+ *
+ * Redacts `pushToken`, `idfv` and the App Attest columns. Echoing those back to
+ * the device that owns them is fine; including them in a LIST of every device on
+ * the account would hand each device its siblings' push tokens.
+ *
+ * Field names and casing are pinned by the existing mobile client
+ * (welockin-mobile/src/services/devices.ts → DeviceDTO). Do not rename them.
+ */
+function deviceDto(d: Device) {
+  return {
+    id: d.id,
+    deviceId: d.deviceId ?? null,
+    name: d.name,
+    platform: d.platform,
+    kind: d.kind ?? null,
+    model: d.model ?? null,
+    osVersion: d.osVersion ?? null,
+    appVersion: d.appVersion ?? null,
+    // Legacy rows predate the column and read back as null, which every other
+    // code path already treats as "active" — normalise here so no client has to.
+    status: d.status ?? "active",
+    lastSeenAt: d.lastSeenAt?.toISOString() ?? null,
+    boundAt: d.boundAt?.toISOString() ?? null,
+    createdAt: d.createdAt?.toISOString() ?? null,
+    stale: d.lastSeenAt ? Date.now() - d.lastSeenAt.getTime() > STALE_AFTER_MS : false,
+  };
+}
+
+/**
+ * List the account's currently-paired devices.
+ *
+ * This is also the only way a client ever learns a device's Mongo `_id`, so it is
+ * a hard precondition for `POST /:id/deactivate` being callable at all — without
+ * it, the revoke path is unreachable code.
+ */
+devicesRouter.get(
+  "/",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const devices = await prisma.device.findMany({
+      where: {
+        userId: req.user!.id,
+        // A `null` status is LEGACY-ACTIVE (see schema.prisma). Filtering on
+        // status:"active" alone would make every pre-backfill device silently
+        // vanish from the list — the same literal-match bug the `otherActive`
+        // query below still has.
+        OR: [{ status: "active" }, { status: null }],
+      },
+      orderBy: { lastSeenAt: "desc" },
+    });
+    // `max` must never be 0: the client reads it as `r.max || DEFAULT`, so a 0
+    // would silently fall back to its own constant.
+    res.json({ devices: devices.map(deviceDto), max: DEVICE_SOFT_CAP });
+  }),
+);
 
 /**
  * Register / heartbeat a device, and — for phones — enforce ONE active phone per
@@ -77,7 +157,7 @@ devicesRouter.post(
               ...meta,
             },
           });
-      res.json({ device });
+      res.json({ device: deviceDto(device) });
       return;
     }
 
@@ -131,13 +211,13 @@ devicesRouter.post(
             data: { userId, fromDeviceId: null, toDeviceId: deviceId, reason: "first-bind" },
           });
         }
-        res.status(self ? 200 : 201).json({ device });
+        res.status(self ? 200 : 201).json({ device: deviceDto(device) });
       } catch (err) {
         // Concurrent same-deviceId create raced us — return the winner idempotently.
         if (isRaceError(err)) {
           const winner = await prisma.device.findFirst({ where: { userId, deviceId } });
           if (winner) {
-            res.json({ device: winner });
+            res.json({ device: deviceDto(winner) });
             return;
           }
         }
@@ -197,7 +277,7 @@ devicesRouter.post(
         });
         return bound;
       });
-      res.json({ device, takeover: true });
+      res.json({ device: deviceDto(device), takeover: true });
     } catch (err) {
       if (isRaceError(err)) {
         // Our own retried/concurrent takeover already won the slot → idempotent success.
@@ -205,7 +285,7 @@ devicesRouter.post(
           where: { userId, deviceId, status: "active" },
         });
         if (mine) {
-          res.json({ device: mine, takeover: true });
+          res.json({ device: deviceDto(mine), takeover: true });
           return;
         }
         // A DIFFERENT new phone won the slot — the loser sees it as the conflict.
@@ -239,14 +319,24 @@ devicesRouter.post(
       where: { id },
       data: { status: "revoked", supersededAt: new Date() },
     });
-    await prisma.deviceTransfer.create({
-      data: {
-        userId,
-        fromDeviceId: device.deviceId,
-        toDeviceId: device.deviceId ?? device.id,
-        reason: "revoke",
-      },
-    });
-    res.json({ device: updated, reason: reason ?? null });
+    // Ledger row only when we have a real client deviceId. Falling back to the
+    // Mongo `_id` used to mix two key spaces inside `toDeviceId`, in the very
+    // ledger the rebind-cooldown reads from.
+    if (device.deviceId) {
+      await prisma.deviceTransfer.create({
+        data: {
+          userId,
+          fromDeviceId: device.deviceId,
+          toDeviceId: device.deviceId,
+          // "self-revoke", NOT "revoke": the cooldown filter matches
+          // ["takeover","revoke"], so reusing "revoke" here meant a user who
+          // deactivated their own phone and bound another within the cooldown
+          // window locked themselves out with a 429. "revoke" stays reserved
+          // for a future admin/forced path, which SHOULD trip the cooldown.
+          reason: "self-revoke",
+        },
+      });
+    }
+    res.json({ device: deviceDto(updated), reason: reason ?? null });
   }),
 );

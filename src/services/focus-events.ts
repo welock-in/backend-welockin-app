@@ -1,7 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import type { FocusEventInput } from "../validation/schemas";
-import { DEVICE_GRACE_MS } from "../middleware/bound-device";
 import { deterministicObjectId } from "../lib/deterministic-id";
 
 // Idempotent FocusEvent ingestion. Mobile clients may retry after an uncertain
@@ -33,22 +32,19 @@ const isDuplicateKey = (err: unknown) =>
 
 /**
  * Decide whether an event should be quarantined (kept for audit, excluded from
- * stats). An event counts when it comes from the user's active phone — or from a
- * phone that was superseded only just before the session ended (grace window), so
- * credit legitimately earned right before a rebind isn't destroyed.
- * Events with no deviceId (legacy / desktop /sync/push) are never quarantined.
+ * stats). An event counts when it comes from a device that is actually on the
+ * account; one citing a deviceId with no Device row is not credited.
+ *
+ * This used to also quarantine events from a superseded/revoked phone, with a
+ * grace window so credit earned just before a handover survived. Device statuses
+ * no longer exist (there is no binding to supersede anything), so existence is
+ * the whole test. Events with no deviceId (desktop /sync/push) stay uncredited-by
+ * -default = false, i.e. they count, exactly as before.
  */
 async function shouldQuarantine(userId: string, e: FocusEventInput): Promise<boolean> {
   if (!e.deviceId) return false;
   const device = await prisma.device.findFirst({ where: { userId, deviceId: e.deviceId } });
-  if (!device) return true; // unknown device → not credited
-  const status = device.status ?? "active";
-  if (status === "active") return false;
-  if (status === "superseded" && device.supersededAt) {
-    // Count sessions that ended around the time this phone was still active.
-    if (e.endedAt.getTime() <= device.supersededAt.getTime() + DEVICE_GRACE_MS) return false;
-  }
-  return true; // superseded (stale) / revoked → quarantine
+  return device == null; // unknown device → not credited
 }
 
 export interface IngestResult {

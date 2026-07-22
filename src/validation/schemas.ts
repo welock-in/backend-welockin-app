@@ -10,25 +10,49 @@ export const loginSchema = z.object({
   password: z.string().min(1, "Password is required"),
 });
 
-export const deviceSchema = z.object({
-  name: z.string().trim().min(1, "name is required"),
-  platform: z.string().trim().min(1, "platform is required"),
-  // Form factor, so the UI can slot desktop/phone/tablet distinctly.
-  kind: z.enum(["desktop", "phone", "tablet"]).optional(),
-  // Stable client-generated UUID — the real cross-platform identity key.
-  // Optional so old PC clients (name-only) keep working.
-  deviceId: z.string().trim().min(1).optional(),
-  model: z.string().trim().min(1).optional(),
-  osVersion: z.string().trim().min(1).optional(),
-  appVersion: z.string().trim().min(1).optional(),
-  pushToken: z.string().trim().min(1).optional(),
-  // Part D — device identity / one-active-phone binding (kind above covers phone/desktop/tablet).
-  idfv: z.string().trim().min(1).optional(), // weak correlation hint (regenerates on reinstall)
-  takeover: z.boolean().optional(), // opt in to superseding the current active phone
-});
+/** Spellings seen in the wild, normalised so `platform` can be a real enum. */
+const PLATFORM_ALIASES: Record<string, string> = {
+  mac: "macos",
+  darwin: "macos",
+  osx: "macos",
+  win: "windows",
+  win32: "windows",
+};
 
-export const deactivateDeviceSchema = z.object({
-  reason: z.string().trim().min(1).max(200).optional(),
+export const devicePlatformSchema = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .transform((p) => PLATFORM_ALIASES[p] ?? p)
+  .pipe(z.enum(["ios", "ipados", "macos", "windows", "android"]));
+
+/**
+ * Device registration — one shape for every platform. The route is a plain
+ * upsert on (userId, deviceId): no binding, no takeover, no conflict.
+ *
+ * `deviceId` is now REQUIRED. It used to be optional, which forced the route to
+ * fall back to matching on `name` — and since every Mac called itself "Mac",
+ * that fallback silently merged or duplicated rows. Identity is the deviceId or
+ * it is nothing.
+ *
+ * The format check is deliberately permissive (charset + length) rather than a
+ * `^(ios|mac|win)-<uuid>$` shape: iOS ships a bare UUID and Windows ships
+ * `win-<MachineGuid>`, so demanding a per-platform prefix today would 400 every
+ * client already in the field. Tighten it only once every client sends one.
+ */
+export const deviceSchema = z.object({
+  name: z.string().trim().min(1, "name is required").max(120),
+  platform: devicePlatformSchema,
+  // Form factor hint for choosing an icon. Purely cosmetic now that nothing
+  // branches on it (it used to route phones into the binding path).
+  kind: z.enum(["desktop", "phone", "tablet"]).optional(),
+  deviceId: z
+    .string()
+    .trim()
+    .regex(/^[A-Za-z0-9._:-]{8,128}$/, "deviceId must be 8-128 chars of [A-Za-z0-9._:-]"),
+  model: z.string().trim().min(1).max(120).optional(),
+  osVersion: z.string().trim().min(1).max(60).optional(),
+  appVersion: z.string().trim().min(1).max(60).optional(),
 });
 
 export const createBreakSchema = z.object({

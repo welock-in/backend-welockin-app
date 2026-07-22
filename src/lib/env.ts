@@ -49,8 +49,6 @@ export const env = {
   appleBundleId: process.env.APPLE_BUNDLE_ID ?? "in.welock.app",
 
   // --- Device identity / anti-abuse (Part D) ---
-  // Hours a phone must wait between takeovers of the single active-phone slot.
-  rebindCooldownHours: Number.parseInt(process.env.REBIND_COOLDOWN_HOURS ?? "12", 10),
   // App Attest hard-enforcement on counter-crediting routes (focus-events,
   // breaks). Default OFF: turn on only once the native attestation client ships
   // and is device-tested, otherwise all focus reporting would be rejected.

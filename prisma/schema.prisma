@@ -128,55 +128,25 @@ model Device {
   osVersion  String?
   appVersion String?
   pushToken  String? // APNs token (mobile push)
-  // Anti-abuse / one-active-phone-per-account (Part D). ALL optional on purpose:
-  // on MongoDB a required field would make Prisma throw when reading legacy Device
-  // docs that predate the column (breaking device registration). Optional → they
-  // read back as null, and the post-push backfill sets sane values (status active,
-  // kind by platform, boundAt=createdAt). `null` status is treated as "active".
-  // (`kind` is declared above — form factor: "desktop" | "phone" | "tablet".)
-  status        String?   @default("active") // "active" | "superseded" | "revoked"
-  boundAt       DateTime?
-  supersededAt  DateTime?
-  lastRebindAt  DateTime?
-  idfv          String? // Apple IDFV — WEAK correlation hint only (regenerates on reinstall)
+  // The one-active-phone binding (status / boundAt / supersededAt / lastRebindAt
+  // / idfv) was removed: changing devices is not something WeLockIn polices, and
+  // the cooldown it powered was bypassable with a DELETE + POST anyway. Existing
+  // documents may still carry those keys; Prisma simply ignores them.
   attestKeyId   String? // App Attest key id (base64)
   attestPubKey  Bytes? //  App Attest public key (raw/DER), set at key registration
   attestCounter Int?      @default(0) // strictly-increasing App Attest assertion counter (anti-replay)
   lastSeenAt DateTime @default(now())
   createdAt  DateTime @default(now())
 
-  // NOTE: (userId, name) is intentionally NON-unique. Two iPhones report the same
-  // UIDevice.name ("iPhone") to unentitled apps, and a takeover keeps the old row
-  // (superseded) while binding the new phone — a unique(userId,name) would make the
-  // new "iPhone" row collide and block takeover for the whole iOS base. Uniqueness
-  // is enforced by the partial unique indexes (one active phone; one row per
-  // (userId, deviceId)) created in scripts/device-migrate.ts.
+  // NOTE: (userId, name) is intentionally NON-unique — two iPhones both report
+  // "iPhone" to unentitled apps, and every Mac used to report "Mac". Uniqueness is
+  // (userId, deviceId), enforced by the partial unique index `uniq_user_deviceId`
+  // created in scripts/device-migrate.ts.
   @@index([userId, name])
   @@index([userId])
   @@index([userId, deviceId])
-  @@index([userId, status])
 }
 
-// Audit trail of one-active-phone handovers. Keyed by the stable client deviceId
-// (a UUID string), not the Device row id. Drives the rebind cooldown ("last real
-// transfer") and gives support a history. `first-bind` transfers are excluded
-// from cooldown math.
-model DeviceTransfer {
-  id           String   @id @default(auto()) @map("_id") @db.ObjectId
-  userId       String   @db.ObjectId
-  fromDeviceId String? // previous active phone's client deviceId (null on first-bind)
-  toDeviceId   String // new active phone's client deviceId
-  reason       String // "takeover" | "first-bind" | "revoke"
-  createdAt    DateTime @default(now())
-
-  @@index([userId])
-  @@index([userId, createdAt])
-}
-
-// Server-side break accounting (Part C/D). The mobile app enforces breaks locally
-// & offline; this row is the authoritative record for the per-user daily budget.
-// Over-budget breaks are recorded quarantined (server veto) without blocking the
-// offline grant. Idempotent on (userId, clientBreakId).
 model Break {
   id              String   @id @default(auto()) @map("_id") @db.ObjectId
   userId          String   @db.ObjectId

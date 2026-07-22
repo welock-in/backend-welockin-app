@@ -1,43 +1,51 @@
 import { Router } from "express";
-import { Prisma, type Device } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
-import { deviceSchema, deactivateDeviceSchema } from "../validation/schemas";
-import { env } from "../lib/env";
-import { badRequest, deviceConflict, forbidden, notFound, rebindCooldown } from "../lib/http-error";
+import { deviceSchema } from "../validation/schemas";
+import { readDeviceId, toPublicDevice } from "../lib/device";
+import { conflict, notFound } from "../lib/http-error";
 
 export const devicesRouter = Router();
 
-const DESKTOP_PLATFORMS = new Set(["windows", "macos", "mac", "linux", "desktop"]);
+/**
+ * The devices API is an inventory, not a permission system.
+ *
+ * It used to enforce ONE ACTIVE PHONE per account: a second phone got a 409, a
+ * takeover superseded the first, a 12h cooldown throttled swaps, and every
+ * handover wrote a DeviceTransfer row. All of that is gone by product decision —
+ * changing devices is not a thing WeLockIn needs to police. It also never worked
+ * as anti-abuse: the cooldown was bypassable with a DELETE followed by a POST.
+ *
+ * What remains is what a device list actually needs:
+ *   POST   /                 register / heartbeat (idempotent upsert)
+ *   POST   /heartbeat        refresh lastSeenAt for an already-registered device
+ *   GET    /                 list the account's devices
+ *   DELETE /:deviceId        remove one (any device on the account, not just self)
+ *
+ * No 409 on registration, no 429, no statuses. A row exists or it does not.
+ */
 
-/** Phone-class unless the platform is clearly a desktop OS. */
-function inferKind(platform: string): "phone" | "desktop" {
-  return DESKTOP_PLATFORMS.has(platform.toLowerCase()) ? "desktop" : "phone";
-}
+/**
+ * Abuse ceiling, not a product limit. Nothing in the UI mentions it and a real
+ * person will never see it: with a hardware-derived deviceId a device upserts
+ * its own row instead of creating new ones. It exists so a scripted client
+ * inventing fresh ids cannot grow the collection without bound.
+ */
+const MAX_DEVICES_PER_ACCOUNT = 50;
+
+/** Don't write lastSeenAt on every single call. */
+const HEARTBEAT_THROTTLE_MS = 5 * 60 * 1000;
 
 const isRaceError = (err: unknown) =>
   err instanceof Prisma.PrismaClientKnownRequestError &&
   (err.code === "P2002" || err.code === "P2034");
 
-/** Public info about the current active phone, surfaced in a 409 conflict. */
-function activeDeviceInfo(d: Device) {
-  return { name: d.name, model: d.model ?? null, lastSeenAt: d.lastSeenAt ?? null };
-}
-
 /**
- * Register / heartbeat a device, and — for phones — enforce ONE active phone per
- * account.
- *
- * Desktop devices keep the legacy find-then-write / (userId,name) upsert with no
- * binding (they push via /api/sync). Phones bind to the single active slot:
- *   - first phone            → bound active (first-bind, no cooldown)
- *   - a second phone         → 409 DEVICE_CONFLICT (client shows the rebind sheet)
- *   - takeover:true          → supersede the old phone, bind this one
- *   - same idfv as active    → auto-takeover ("grace"), no cooldown (reinstall)
- *   - already the active one → 200 idempotent (safe network retry)
- * The invariant is ultimately guaranteed by a partial unique index on Mongo
- * ({userId} where status:active, kind:phone) — see scripts/device-migrate.
+ * Register or heartbeat a device. Idempotent on (userId, deviceId) — the pair a
+ * unique index already enforces (scripts/device-migrate.ts). Calling it twice
+ * with the same deviceId updates one row; it never creates a second.
  */
 devicesRouter.post(
   "/",
@@ -46,179 +54,50 @@ devicesRouter.post(
     const input = deviceSchema.parse(req.body);
     const userId = req.user!.id;
     const now = new Date();
-    const kind = input.kind ?? inferKind(input.platform);
 
-    const meta = {
+    const data = {
+      name: input.name,
       platform: input.platform,
       lastSeenAt: now,
-      kind,
+      ...(input.kind !== undefined ? { kind: input.kind } : {}),
       ...(input.model !== undefined ? { model: input.model } : {}),
       ...(input.osVersion !== undefined ? { osVersion: input.osVersion } : {}),
       ...(input.appVersion !== undefined ? { appVersion: input.appVersion } : {}),
-      ...(input.pushToken !== undefined ? { pushToken: input.pushToken } : {}),
-      ...(input.idfv !== undefined ? { idfv: input.idfv } : {}),
     };
 
-    // ---------- Desktop: legacy behaviour, no binding ----------
-    // find-then-write (no (userId,name) unique anymore); match on deviceId when
-    // present, else on name (legacy name-only desktop clients).
-    if (kind !== "phone") {
-      const existing = input.deviceId
-        ? await prisma.device.findFirst({ where: { userId, deviceId: input.deviceId } })
-        : await prisma.device.findFirst({ where: { userId, name: input.name } });
-      const device = existing
-        ? await prisma.device.update({
-            where: { id: existing.id },
-            // Reset status so re-registering a previously deactivated desktop
-            // re-activates it (the /deactivate route documents re-bind as reversible;
-            // otherwise the row stays "revoked" and never returns from GET /devices).
-            data: { name: input.name, status: "active", ...meta },
-          })
-        : await prisma.device.create({
-            data: {
-              userId,
-              name: input.name,
-              status: "active",
-              ...(input.deviceId ? { deviceId: input.deviceId } : {}),
-              ...meta,
-            },
-          });
-      res.json({ device });
-      return;
-    }
-
-    // ---------- Phone: one-active-phone binding ----------
-    const deviceId = input.deviceId;
-    if (!deviceId) throw badRequest("deviceId is required for phone devices");
-
-    const self = await prisma.device.findFirst({ where: { userId, deviceId } });
-    const otherActive = await prisma.device.findFirst({
-      where: { userId, kind: "phone", status: "active", deviceId: { not: deviceId } },
+    const existing = await prisma.device.findFirst({
+      where: { userId, deviceId: input.deviceId },
     });
 
-    // No conflicting active phone → bind / re-activate / heartbeat this one.
-    if (!otherActive) {
-      const wasActive = self?.status === "active" || (self != null && self.status == null);
-      // A rebind that's more than a heartbeat spends the cooldown too, so a
-      // deactivate-then-register can't bypass it. Exempt: a genuine first-ever bind
-      // (no prior real transfer → lastReal null passes) and re-activating the SAME
-      // device you just deactivated (reversible revoke).
-      const reversibleRevoke = self?.status === "revoked";
-      if (!wasActive && !reversibleRevoke) {
-        const cooldownMs = env.rebindCooldownHours * 60 * 60 * 1000;
-        const lastReal = await prisma.deviceTransfer.findFirst({
-          where: { userId, reason: { in: ["takeover", "revoke"] } },
-          orderBy: { createdAt: "desc" },
-        });
-        if (lastReal && now.getTime() - lastReal.createdAt.getTime() < cooldownMs) {
-          throw rebindCooldown();
-        }
-      }
-
-      try {
-        const device = self
-          ? await prisma.device.update({
-              where: { id: self.id },
-              data: {
-                name: input.name,
-                status: "active",
-                ...meta,
-                ...(wasActive ? {} : { boundAt: now, lastRebindAt: now }),
-              },
-            })
-          : await prisma.device.create({
-              data: { userId, name: input.name, deviceId, status: "active", boundAt: now, ...meta },
-            });
-
-        // Record a first-bind transfer the first time this device becomes the
-        // active phone (never counts toward the rebind cooldown).
-        if (!wasActive) {
-          await prisma.deviceTransfer.create({
-            data: { userId, fromDeviceId: null, toDeviceId: deviceId, reason: "first-bind" },
-          });
-        }
-        res.status(self ? 200 : 201).json({ device });
-      } catch (err) {
-        // Concurrent same-deviceId create raced us — return the winner idempotently.
-        if (isRaceError(err)) {
-          const winner = await prisma.device.findFirst({ where: { userId, deviceId } });
-          if (winner) {
-            res.json({ device: winner });
-            return;
-          }
-        }
-        throw err;
-      }
+    if (existing) {
+      const device = await prisma.device.update({ where: { id: existing.id }, data });
+      res.json({ device: toPublicDevice(device, input.deviceId) });
       return;
     }
 
-    // A different phone is active. Same physical phone reinstalled (idfv match) →
-    // auto-takeover without spending the cooldown.
-    const grace = Boolean(input.idfv && otherActive.idfv && input.idfv === otherActive.idfv);
-
-    if (!input.takeover && !grace) {
-      throw deviceConflict(activeDeviceInfo(otherActive));
+    const count = await prisma.device.count({ where: { userId } });
+    if (count >= MAX_DEVICES_PER_ACCOUNT) {
+      throw conflict(
+        `This account already has ${MAX_DEVICES_PER_ACCOUNT} devices. Remove one before adding another.`,
+      );
     }
 
-    // Cooldown: block rapid device-hopping. `grace` (reinstall) and `first-bind`
-    // are exempt. Uses the last REAL transfer, not the one we're about to write.
-    if (!grace) {
-      const cooldownMs = env.rebindCooldownHours * 60 * 60 * 1000;
-      const lastReal = await prisma.deviceTransfer.findFirst({
-        where: { userId, reason: { in: ["takeover", "revoke"] } },
-        orderBy: { createdAt: "desc" },
-      });
-      if (lastReal && now.getTime() - lastReal.createdAt.getTime() < cooldownMs) {
-        throw rebindCooldown();
-      }
-    }
-
-    // Atomic handover: supersede the old phone FIRST, then activate this one, so no
-    // committed state ever has two active phones (the partial unique index is the
-    // ultimate backstop under concurrency).
     try {
-      const device = await prisma.$transaction(async (tx) => {
-        await tx.device.update({
-          where: { id: otherActive.id },
-          data: { status: "superseded", supersededAt: now },
-        });
-        const bound = self
-          ? await tx.device.update({
-              where: { id: self.id },
-              data: { name: input.name, status: "active", boundAt: now, lastRebindAt: now, ...meta },
-            })
-          : await tx.device.create({
-              data: {
-                userId,
-                name: input.name,
-                deviceId,
-                status: "active",
-                boundAt: now,
-                lastRebindAt: now,
-                ...meta,
-              },
-            });
-        await tx.deviceTransfer.create({
-          data: { userId, fromDeviceId: otherActive.deviceId, toDeviceId: deviceId, reason: "takeover" },
-        });
-        return bound;
+      const device = await prisma.device.create({
+        data: { userId, deviceId: input.deviceId, ...data },
       });
-      res.json({ device, takeover: true });
+      res.status(201).json({ device: toPublicDevice(device, input.deviceId) });
     } catch (err) {
+      // Two concurrent registrations of the same device raced. The unique index
+      // let exactly one through — return it, so a retry looks like a success.
       if (isRaceError(err)) {
-        // Our own retried/concurrent takeover already won the slot → idempotent success.
-        const mine = await prisma.device.findFirst({
-          where: { userId, deviceId, status: "active" },
+        const winner = await prisma.device.findFirst({
+          where: { userId, deviceId: input.deviceId },
         });
-        if (mine) {
-          res.json({ device: mine, takeover: true });
+        if (winner) {
+          res.json({ device: toPublicDevice(winner, input.deviceId) });
           return;
         }
-        // A DIFFERENT new phone won the slot — the loser sees it as the conflict.
-        const winner = await prisma.device.findFirst({
-          where: { userId, kind: "phone", status: "active", deviceId: { not: deviceId } },
-        });
-        throw deviceConflict(winner ? activeDeviceInfo(winner) : activeDeviceInfo(otherActive));
       }
       throw err;
     }
@@ -226,62 +105,61 @@ devicesRouter.post(
 );
 
 /**
- * Deactivate (revoke) a device — reversible by a later re-bind (a future POST
- * /api/devices with this deviceId re-activates it). Only the owner may deactivate.
+ * Refresh this device's `lastSeenAt`. Without it, a desktop's last-activity is
+ * frozen at whenever it last registered — the old `requireBoundDevice` heartbeat
+ * explicitly skipped desktops, so "last seen" on a Mac or PC was a lie.
+ * Throttled server-side, so calling it often is free.
  */
 devicesRouter.post(
-  "/:id/deactivate",
+  "/heartbeat",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const { id } = req.params;
     const userId = req.user!.id;
-    const { reason } = deactivateDeviceSchema.parse(req.body ?? {});
+    const deviceId = readDeviceId(req);
+    if (!deviceId) throw notFound("No device id on this request");
 
-    const device = await prisma.device.findUnique({ where: { id } });
+    const device = await prisma.device.findFirst({ where: { userId, deviceId } });
     if (!device) throw notFound("Device not found");
-    if (device.userId !== userId) throw forbidden("Not your device");
 
-    const updated = await prisma.device.update({
-      where: { id },
-      data: { status: "revoked", supersededAt: new Date() },
-    });
-    await prisma.deviceTransfer.create({
-      data: {
-        userId,
-        fromDeviceId: device.deviceId,
-        toDeviceId: device.deviceId ?? device.id,
-        reason: "revoke",
-      },
-    });
-    res.json({ device: updated, reason: reason ?? null });
+    const stale = Date.now() - device.lastSeenAt.getTime() > HEARTBEAT_THROTTLE_MS;
+    if (stale) {
+      await prisma.device
+        .update({ where: { id: device.id }, data: { lastSeenAt: new Date() } })
+        .catch(() => undefined); // best-effort: a missed heartbeat is not an error
+    }
+    res.status(204).end();
   }),
 );
 
 /**
- * List the account's devices — used by the DESKTOP app (Devices page + the
- * Start-Focus picker). Additive/read-only: it does not touch the phone-binding
- * logic above. Excludes superseded/revoked devices so the list reflects what's
- * currently paired. `max` is a soft cap the desktop UI reads to hide "Add device".
+ * List the account's devices. Returns a projection (see lib/device.ts), not the
+ * raw row, and flags the caller's own device via the X-WeLockIn-Device-Id header
+ * so no client has to work it out for itself.
+ *
+ * The old `status notIn [superseded, revoked]` filter is gone with the binding
+ * that produced those statuses: a device the user did not delete is a device the
+ * user still owns, and hiding it was how a "missing" phone went unexplained.
  */
 devicesRouter.get(
   "/",
   requireAuth,
   asyncHandler(async (req, res) => {
     const devices = await prisma.device.findMany({
-      where: {
-        userId: req.user!.id,
-        status: { notIn: ["superseded", "revoked"] },
-      },
+      where: { userId: req.user!.id },
       orderBy: { createdAt: "asc" },
     });
-    res.json({ devices, max: 3 });
+    const current = readDeviceId(req);
+    res.json({ devices: devices.map((d) => toPublicDevice(d, current)) });
   }),
 );
 
 /**
- * Unpair (remove) a device by its client `deviceId`, scoped to the caller — the
- * DESKTOP "log out & unpair this device" action (runs while still authed). A
- * device only ever removes itself; there is no cross-device deletion.
+ * Remove a device from the account by its client `deviceId`.
+ *
+ * Any device on the account may be removed, not only the caller — that is what
+ * makes a lost or sold machine removable at all, and it is what the code always
+ * did despite a comment claiming otherwise. Scoped to the caller's userId, so
+ * one account can never reach into another.
  */
 devicesRouter.delete(
   "/:deviceId",
@@ -290,6 +168,9 @@ devicesRouter.delete(
     const result = await prisma.device.deleteMany({
       where: { userId: req.user!.id, deviceId: req.params.deviceId },
     });
+    // Silently reporting `removed: 0` made a typo indistinguishable from a
+    // success; the client now gets to tell the user something honest.
+    if (result.count === 0) throw notFound("Device not found");
     res.json({ removed: result.count });
   }),
 );

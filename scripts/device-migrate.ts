@@ -1,20 +1,17 @@
 /**
- * Device identity / anti-abuse migration (Part D). Run AFTER `prisma db push`
- * and BEFORE (or with) the deploy of the new code:
+ * Device index maintenance. Run AFTER `prisma db push`, with or before the
+ * deploy:
  *   npm run device:migrate
  *
  * Idempotent. It:
- *   1. Backfills legacy Device docs (status=active, kind by platform,
- *      boundAt=createdAt, attestCounter=0) via RAW Mongo updates — reads through
- *      the typed client are unnecessary and would be brittle pre-column.
- *   2. Collapses any user with >1 active phone down to the most-recently-seen one
- *      (supersedes the rest) so the unique index can build.
- *   3. Creates the two partial unique indexes Prisma can't express:
- *        - one active phone per user
- *        - one (userId, deviceId) row per device
- *      plus idempotency indexes for FocusEvent.clientEventId and
- *      Break.clientBreakId. Uses $type:"string" filters so null/absent legacy
- *      values are excluded (multiple nulls would otherwise break a unique index).
+ *   1. Backfills `kind` on legacy Device docs (icon hint only) and attestCounter.
+ *   2. Collapses duplicate (userId, deviceId) rows so the unique index can build.
+ *   3. DROPS `uniq_active_phone_per_user` — the one-active-phone rule it enforced
+ *      no longer exists.
+ *   4. Creates the partial unique indexes Prisma can't express: one row per
+ *      (userId, deviceId), plus idempotency indexes for FocusEvent.clientEventId
+ *      and Break.clientBreakId. `$type:"string"` filters exclude null/absent
+ *      legacy values (several nulls would otherwise break a unique index).
  */
 import { prisma } from "../src/lib/prisma";
 
@@ -24,7 +21,6 @@ async function backfill(): Promise<void> {
   const res = (await prisma.$runCommandRaw({
     update: "Device",
     updates: [
-      { q: { status: { $exists: false } }, u: { $set: { status: "active" } }, multi: true },
       // Desktop first, then everything still missing kind → phone.
       {
         q: { kind: { $exists: false }, platform: { $in: DESKTOP_PLATFORMS } },
@@ -32,37 +28,10 @@ async function backfill(): Promise<void> {
         multi: true,
       },
       { q: { kind: { $exists: false } }, u: { $set: { kind: "phone" } }, multi: true },
-      // boundAt = createdAt (pipeline update to reference another field).
-      { q: { boundAt: { $exists: false } }, u: [{ $set: { boundAt: "$createdAt" } }], multi: true },
       { q: { attestCounter: { $exists: false } }, u: { $set: { attestCounter: 0 } }, multi: true },
     ],
   })) as { n?: number; nModified?: number };
   console.log(`[backfill] Device matched ${res.n ?? 0}, modified ${res.nModified ?? 0}`);
-}
-
-async function collapseMultiActivePhones(): Promise<void> {
-  const phones = await prisma.device.findMany({
-    where: { kind: "phone", status: "active" },
-    select: { id: true, userId: true, lastSeenAt: true },
-  });
-  const byUser = new Map<string, { id: string; lastSeenAt: Date }[]>();
-  for (const d of phones) {
-    const list = byUser.get(d.userId) ?? [];
-    list.push({ id: d.id, lastSeenAt: d.lastSeenAt });
-    byUser.set(d.userId, list);
-  }
-  let superseded = 0;
-  for (const [, list] of byUser) {
-    if (list.length <= 1) continue;
-    list.sort((a, b) => b.lastSeenAt.getTime() - a.lastSeenAt.getTime());
-    const stale = list.slice(1).map((d) => d.id);
-    await prisma.device.updateMany({
-      where: { id: { in: stale } },
-      data: { status: "superseded", supersededAt: new Date() },
-    });
-    superseded += stale.length;
-  }
-  console.log(`[collapse] superseded ${superseded} extra active phone(s)`);
 }
 
 /** Remove duplicate (userId, deviceId) rows (legacy find-then-create races) so the
@@ -112,12 +81,6 @@ async function buildIndex(collection: string, index: Record<string, unknown>): P
 async function createIndexes(): Promise<void> {
   const results = await Promise.all([
     buildIndex("Device", {
-      key: { userId: 1 },
-      name: "uniq_active_phone_per_user",
-      unique: true,
-      partialFilterExpression: { status: "active", kind: "phone" },
-    }),
-    buildIndex("Device", {
       key: { userId: 1, deviceId: 1 },
       name: "uniq_user_deviceId",
       unique: true,
@@ -143,10 +106,29 @@ async function createIndexes(): Promise<void> {
   }
 }
 
+/** Retire the one-active-phone index. Absent index → "index not found", which is
+ *  a success for our purposes, so only an unexpected failure is surfaced. */
+async function dropRetiredIndexes(): Promise<void> {
+  try {
+    await prisma.$runCommandRaw({
+      dropIndexes: "Device",
+      index: "uniq_active_phone_per_user",
+    } as unknown as Parameters<typeof prisma.$runCommandRaw>[0]);
+    console.log("[indexes] dropped uniq_active_phone_per_user");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/index not found|IndexNotFound|ns not found/i.test(msg)) {
+      console.log("[indexes] uniq_active_phone_per_user already absent");
+    } else {
+      throw err;
+    }
+  }
+}
+
 async function main(): Promise<void> {
   await backfill();
-  await collapseMultiActivePhones();
   await collapseDuplicateDeviceIds();
+  await dropRetiredIndexes();
   await createIndexes();
   console.log("Device migration complete.");
 }

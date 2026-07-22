@@ -2,8 +2,8 @@ import { Router } from "express";
 import { Prisma, type Break } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/auth";
-import { requireBoundDevice } from "../middleware/bound-device";
 import { requireAttest } from "../middleware/attest";
+import { readDeviceId } from "../lib/device";
 import { asyncHandler } from "../middleware/async-handler";
 import { createBreakSchema } from "../validation/schemas";
 
@@ -34,7 +34,6 @@ function breakDto(b: Break, remainingMin?: number) {
 breaksRouter.post(
   "/",
   requireAuth,
-  requireBoundDevice,
   requireAttest,
   asyncHandler(async (req, res) => {
     const { breakLen, clientBreakId, deviceId } = createBreakSchema.parse(req.body);
@@ -64,7 +63,11 @@ breaksRouter.post(
       const created = await prisma.break.create({
         data: {
           userId,
-          deviceId: deviceId ?? req.device?.deviceId ?? undefined,
+          // Body first, then the X-WeLockIn-Device-Id header (this used to read
+          // req.device, populated by the retired binding middleware).
+          // `|| undefined`, not `??`: readDeviceId returns "" when absent, and an
+          // empty-string deviceId would be worse than none at all.
+          deviceId: deviceId ?? (readDeviceId(req) || undefined),
           clientBreakId,
           durationSeconds,
           startedAt: now,

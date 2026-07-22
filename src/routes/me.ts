@@ -51,11 +51,10 @@ meRouter.delete(
     // Feature requests authored by the user (authorId, not userId) — also cascades.
     await prisma.featureRequest.deleteMany({ where: { authorId: userId } }).catch(() => undefined);
 
-    // DeviceTransfer and Break have NO User back-relation, so nothing cascades them:
-    // their deletion must actually succeed, or a transient failure would leave rows
-    // (deviceId + timestamps) orphaned to a deleted user — a data-deletion gap. Fail
-    // loud (→ 500 → the client retries; deleteMany is idempotent).
-    await prisma.deviceTransfer.deleteMany({ where: { userId } });
+    // Break has NO User back-relation, so nothing cascades it: its deletion must
+    // actually succeed, or a transient failure would leave rows orphaned to a
+    // deleted user — a data-deletion gap. Fail loud (→ 500 → the client retries;
+    // deleteMany is idempotent).
     await prisma.break.deleteMany({ where: { userId } });
 
     // The account row itself is the deletion that MUST succeed — do NOT swallow a

@@ -55,6 +55,23 @@ export const deviceSchema = z.object({
   appVersion: z.string().trim().min(1).max(60).optional(),
 });
 
+/**
+ * Invite the account's other devices to join a focus session. Carries the
+ * INTENT only (how long, how strict) — never what to block, because iOS app
+ * selections are opaque tokens the origin device cannot resolve.
+ */
+export const focusInviteCreateSchema = z.object({
+  sessionId: z.string().trim().min(1).max(64),
+  sessionName: z.string().trim().min(1).max(120).optional(),
+  // Bounded: 1 minute to 24 hours. An unbounded value would let one device pin
+  // another into an effectively permanent block.
+  durationSeconds: z.number().int().min(60).max(24 * 60 * 60),
+  hardLock: z.boolean().optional(),
+  targetDeviceIds: z.array(z.string().trim().min(1).max(128)).min(1).max(10),
+  // Fallback when the X-WeLockIn-Device-Id header is absent.
+  fromDeviceId: z.string().trim().min(1).max(128).optional(),
+});
+
 export const createBreakSchema = z.object({
   breakLen: z.number().int().positive().max(240), // minutes
   clientBreakId: z.string().trim().min(1).max(64).optional(), // idempotency key

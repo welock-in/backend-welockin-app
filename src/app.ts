@@ -7,6 +7,7 @@ import { healthRouter } from "./routes/health";
 import { authRouter } from "./routes/auth";
 import { meRouter } from "./routes/me";
 import { devicesRouter } from "./routes/devices";
+import { focusInvitesRouter } from "./routes/focus-invites";
 import { syncRouter } from "./routes/sync";
 import { focusEventsRouter } from "./routes/focus-events";
 import { analyticsRouter } from "./routes/analytics";
@@ -44,6 +45,8 @@ export function createApp(): Express {
   app.use("/api/auth", authRouter);
   app.use("/api/me", meRouter);
   app.use("/api/devices", devicesRouter);
+  // Cross-device focus: invite the account's other devices to join a session.
+  app.use("/api/focus-invites", focusInvitesRouter);
   app.use("/api/sync", syncRouter);
   app.use("/api/focus-events", focusEventsRouter);
   app.use("/api/analytics", analyticsRouter);

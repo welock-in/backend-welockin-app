@@ -46,6 +46,7 @@ model User {
   updatedAt    DateTime  @updatedAt
 
   devices         Device[]
+  focusInvites    FocusInvite[]
   focusEvents     FocusEvent[]
   snapshot        SyncSnapshot?
   authProviders   AuthProvider[]
@@ -146,6 +147,41 @@ model Device {
   @@index([userId, name])
   @@index([userId])
   @@index([userId, deviceId])
+}
+
+// An invitation for ONE device to join a focus session started on another.
+//
+// This is the SOURCE OF TRUTH for cross-device focus, not the push notification.
+// A push is only an accelerator for phones; desktops have no push transport at
+// all (Expo is mobile-only), so every device polls this collection. One shared
+// state, two transports — otherwise the phone and the desktop paths drift apart.
+model FocusInvite {
+  id     String @id @default(auto()) @map("_id") @db.ObjectId
+  userId String @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Client session id of the ORIGIN session, so replays converge on one row.
+  sessionId      String
+  fromDeviceId   String
+  fromDeviceName String?
+  // The client deviceId this invite is addressed to.
+  toDeviceId     String
+
+  sessionName String?
+  hardLock    Boolean @default(false)
+  // Absolute end of the origin session. A device that wakes up late joins for
+  // the REMAINING time; an invite whose endsAt has passed is simply ignored.
+  endsAt      DateTime
+
+  status      String    @default("pending") // "pending" | "accepted" | "declined"
+  respondedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  // The polling query: one device asking for what is waiting for it.
+  @@index([userId, toDeviceId, status])
+  // Idempotent creation: re-posting the same session for the same target must
+  // not stack invites.
+  @@index([sessionId, toDeviceId])
 }
 
 model Break {

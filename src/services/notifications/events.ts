@@ -18,4 +18,7 @@ export interface NotificationContext {
 export const NotificationEvents = {
   /** A focus session's first heartbeat landed (fires once per session). */
   SESSION_STARTED: "session.started",
+  /** One device invited others to join its focus session. ctx carries
+   *  targetDeviceIds, so a rule can use the "specificDevices" audience. */
+  FOCUS_INVITED: "focus.invited",
 } as const;

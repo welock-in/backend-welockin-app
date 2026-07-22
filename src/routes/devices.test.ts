@@ -4,6 +4,7 @@ import request from "supertest";
 import { createApp } from "../app";
 import { signToken } from "../lib/jwt";
 import { prisma } from "../lib/prisma";
+import { Prisma } from "@prisma/client";
 
 // The devices API had no tests at all, which is part of how a Mac ended up with
 // three rows in production. These pin the contract that replaced the binding:
@@ -139,6 +140,16 @@ test("an unknown platform is rejected rather than silently stored", async (t) =>
   assert.equal(creates.length, 0);
 });
 
+test("the list is scoped to the caller's account", async (t) => {
+  // Without this, a query missing its userId filter — every account's devices in
+  // one response — would sail through the rest of the suite.
+  const finds = stubMethod(t, prisma.device as any, "findMany", async () => []);
+
+  await request(app).get("/api/devices").set(auth);
+
+  assert.equal((finds[0][0] as any).where.userId, userId);
+});
+
 test("the list is redacted and flags the calling device", async (t) => {
   stubMethod(t, prisma.device as any, "findMany", async () => [
     deviceRow(),
@@ -178,8 +189,13 @@ test("removing a real device reports what was removed", async (t) => {
 
   assert.equal(res.status, 200);
   assert.equal(res.body.removed, 1);
-  // Scoped to the caller: one account can never delete another's device.
-  assert.equal((deletes[0][0] as any).where.userId, userId);
+  const where = (deletes[0][0] as any).where;
+  // Scoped to the caller: one account can never delete another's device...
+  assert.equal(where.userId, userId);
+  // ...and to the ONE device named in the path. Asserting only the userId would
+  // let a filter that dropped :deviceId — wiping every device on the account —
+  // pass as a green test.
+  assert.equal(where.deviceId, DEVICE_ID);
 });
 
 test("a heartbeat refreshes a stale lastSeenAt and stays quiet when fresh", async (t) => {
@@ -204,4 +220,66 @@ test("a heartbeat refreshes a stale lastSeenAt and stays quiet when fresh", asyn
 
   assert.equal(second.status, 204);
   assert.equal(freshUpdates.length, 0, "throttled: no write when it was just seen");
+});
+
+test("the 50-device ceiling is actually enforced", async (t) => {
+  stubMethod(t, prisma.device as any, "findFirst", async () => null);
+  stubMethod(t, prisma.device as any, "count", async () => 50);
+  const creates = stubMethod(t, prisma.device as any, "create", async () => deviceRow());
+
+  const res = await request(app)
+    .post("/api/devices")
+    .set(auth)
+    .send({ ...validBody, deviceId: "mac-11111111-2222-3333-4444-555555555555" });
+
+  assert.equal(res.status, 409);
+  assert.equal(creates.length, 0, "deleting the guard must not keep this suite green");
+});
+
+test("a concurrent first registration resolves to the winner instead of erroring", async (t) => {
+  // Mongo has no real upsert here, so two devices registering at once both reach
+  // create() and one loses on the unique index. The loser must still see success.
+  const winner = deviceRow();
+  let findCall = 0;
+  stubMethod(t, prisma.device as any, "findFirst", async () => (findCall++ === 0 ? null : winner));
+  stubMethod(t, prisma.device as any, "count", async () => 0);
+  stubMethod(t, prisma.device as any, "create", async () => {
+    throw new Prisma.PrismaClientKnownRequestError("dup", { code: "P2002", clientVersion: "x" });
+  });
+  const credited = stubMethod(t, prisma.focusEvent as any, "updateMany", async () => ({ count: 0 }));
+
+  const res = await request(app).post("/api/devices").set(auth).send(validBody);
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.device.deviceId, DEVICE_ID);
+  assert.equal(credited.length, 1, "the race winner must still release the event backlog");
+});
+
+test("registering releases focus events reported before the device was known", async (t) => {
+  stubMethod(t, prisma.device as any, "findFirst", async () => null);
+  stubMethod(t, prisma.device as any, "count", async () => 0);
+  stubMethod(t, prisma.device as any, "create", async () => deviceRow());
+  const credited = stubMethod(t, prisma.focusEvent as any, "updateMany", async () => ({ count: 3 }));
+
+  const res = await request(app).post("/api/devices").set(auth).send(validBody);
+
+  assert.equal(res.status, 201);
+  assert.equal(credited.length, 1);
+  const args = credited[0][0] as any;
+  assert.deepEqual(args.where, { userId, deviceId: DEVICE_ID, quarantined: true });
+  assert.deepEqual(args.data, { quarantined: false });
+});
+
+test("a heartbeat without a device id is refused, and is scoped to the caller", async (t) => {
+  const finds = stubMethod(t, prisma.device as any, "findFirst", async () => null);
+
+  const noId = await request(app).post("/api/devices/heartbeat").set(auth);
+  assert.equal(noId.status, 404);
+  assert.equal(finds.length, 0, "no lookup should happen without a device id");
+
+  const unknown = await request(app)
+    .post("/api/devices/heartbeat")
+    .set({ ...auth, "x-welockin-device-id": "mac-99999999-9999-9999-9999-999999999999" });
+  assert.equal(unknown.status, 404);
+  assert.equal((finds[0][0] as any).where.userId, userId);
 });

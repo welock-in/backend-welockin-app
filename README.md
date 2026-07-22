@@ -96,7 +96,6 @@ project's environment settings.
 | Var | Default | Purpose |
 |---|---|---|
 | `APPLE_BUNDLE_ID` | `in.welock.app` | `aud` the Apple identityToken must carry (`POST /api/auth/apple`). |
-| `REBIND_COOLDOWN_HOURS` | `12` | Cooldown between phone-slot takeovers. |
 | `ATTEST_REQUIRED` | `false` | Hard-enforce App Attest on focus/break routes. Leave off until the native client ships (on = rejects all reporting). |
 | `APP_ATTEST_ENV` | `production` | `development` for TestFlight/dev, `production` for App Store. |
 | `APP_ATTEST_APP_ID` | `YF7AFPJRYH.in.welock.app` | `<AppleTeamID>.<iOSBundleID>`. |
@@ -135,7 +134,7 @@ Render / Railway / Docker) with graceful shutdown.
 - **User JWT** — `requireAuth`: `Authorization: Bearer <jwt>` → `req.user = {id, email}`.
 - **Admin JWT** — `requireAdmin`: a *separate* token from `POST /api/admin/login`, signed with `ADMIN_JWT_SECRET`, role `admin`. Independent of `User.isAdmin`.
 - **`User.isAdmin`** — a per-user DB flag gating the *feedback-board* admin actions (`/api/feedback/admin`, moderation) and the `/admin` HTML page. This is a different mechanism from the admin-console JWT above.
-- **Device binding / App Attest** — `requireBoundDevice` + `requireAttest` on counter-crediting routes (`/api/focus-events`, `/api/breaks`).
+- **App Attest** — `requireAttest` on counter-crediting routes (`/api/focus-events`, `/api/breaks`). Off by default (`ATTEST_REQUIRED`). *(The former `requireBoundDevice` device-binding layer was removed with the one-active-phone rule.)*
 
 **Error shape — every error is `{ "error": string }`** (via `src/middleware/error.ts`):
 
@@ -157,8 +156,7 @@ Collections (`@@map` name in parentheses when different from the model):
 
 - **User** — `email` (unique), `passwordHash?` (null for Apple-only), `emailVerified?`, `plan`, `trialEndsAt?`, `isAdmin?`, `status?` (`active`/`suspended`).
 - **AuthProvider** — social/password identities (`provider`, `providerUid`), `@@unique([provider, providerUid])`.
-- **Device** — registry; `deviceId?` (stable client UUID = real identity), `kind` (`desktop`/`phone`/`tablet`), phone-binding fields (`status`, `boundAt`, `supersededAt`, `lastRebindAt`, `idfv`), App Attest fields. `(userId, name)` is intentionally **non-unique**; uniqueness (one active phone, one row per `(userId, deviceId)`) is enforced by partial indexes from `device:migrate`.
-- **DeviceTransfer** — audit trail of phone handovers (drives the rebind cooldown).
+- **Device** — registry; `deviceId` (stable client id = the real identity; nullable only on pre-refactor rows), `kind` (`desktop`/`phone`/`tablet`, cosmetic), App Attest fields. `(userId, name)` is intentionally **non-unique** — every Mac used to report "Mac". Uniqueness is `(userId, deviceId)`, enforced by the `uniq_user_deviceId` partial index from `device:migrate`.
 - **Break** — server-authoritative daily break budget; idempotent on `(userId, clientBreakId)`.
 - **SyncSnapshot** — one per user: opaque `blocklists`/`sessions`/`schedules` JSON + `revision`.
 - **FocusEvent** — completed-session log; idempotent on `clientEventId` via deterministic `_id`; `quarantined?` (anti-abuse, excluded from stats).
@@ -193,29 +191,33 @@ All three return `{ token, user: PublicUser }`.
 ### Me — `/api/me` (user JWT)
 
 - **`GET /`** → `200 { user: PublicUser }` (fresh from DB). `404` if the user row is gone.
-- **`DELETE /`** → `204`. Self-serve account deletion (Play/Apple requirement). Hard-deletes the user and all data keyed to them (focus events, devices, transfers, live sessions, auth providers, snapshot, breaks, votes, authored feature requests). Idempotent.
+- **`DELETE /`** → `204`. Self-serve account deletion (Play/Apple requirement). Hard-deletes the user and all data keyed to them (focus events, devices, live sessions, auth providers, snapshot, breaks, votes, authored feature requests). Idempotent.
 
 ### Devices — `/api/devices` (user JWT)
 
-- **`POST /`** — register / heartbeat. `deviceSchema` (`name`, `platform`, optional `kind`, `deviceId`, `model`, `osVersion`, `appVersion`, `pushToken`, `idfv`, `takeover`). **Desktop:** upsert, no binding (re-registering a previously deactivated desktop re-activates it). **Phone:** one-active-slot — first phone `201`; same phone `200`; a different active phone → `409 DEVICE_CONFLICT` unless `takeover:true` or an `idfv` match (reinstall grace); a recent real transfer → `429 REBIND_COOLDOWN`.
-- **`POST /:id/deactivate`** — revoke by Mongo `_id` (reversible by a later re-bind). Owner-only. `{ device, reason }`.
-- **`GET /`** → `200 { devices, max: 3 }` (excludes superseded/revoked). `max` is a UI hint, not enforced.
-- **`DELETE /:deviceId`** — unpair by client `deviceId`, scoped to the caller. `200 { removed }` (idempotent; `removed: 0` if none).
+Devices are an **inventory, not a permission system**. There is no binding, no
+one-active-phone rule, no takeover and no cooldown — registering a device never
+returns `409`/`429`, and no device is ever hidden behind a status.
+
+- **`POST /`** — register / heartbeat; an idempotent upsert on `(userId, deviceId)`. `deviceSchema` = `name` (≤120), `platform` (enum `ios|ipados|macos|windows|android`, aliases `mac`/`darwin`/`osx`/`win`/`win32` normalised), **`deviceId` REQUIRED** (`^[A-Za-z0-9._:-]{8,128}$`), optional `kind` (`desktop|phone|tablet`, cosmetic), `model`, `osVersion`, `appVersion`. Unknown keys are stripped. → `200 { device }` when it already existed, `201` on first registration. `409` only when the account is already at **50** devices (an abuse ceiling, not a product limit). Registration also un-quarantines focus events this device reported before it was known.
+- **`POST /heartbeat`** — refresh `lastSeenAt` for the device in `X-WeLockIn-Device-Id`. Throttled to one write per 5 min. → `204`; `404` if the header is missing or the device is unknown.
+- **`GET /`** → `200 { devices: PublicDevice[] }` — an allow-listed projection: `id, deviceId, name, platform, kind, model, osVersion, appVersion, lastSeenAt, createdAt, isCurrent`. `isCurrent` is computed server-side from `X-WeLockIn-Device-Id`. No `max`, and no status filter.
+- **`DELETE /:deviceId`** — remove a device by client `deviceId`, scoped to the caller's account. Any of your devices, not just the calling one. → `200 { removed }`, or `404` when nothing matched.
 
 ### Sync — `/api/sync` (user JWT)
 
 - **`POST /push`** — last-write-wins. Replaces the snapshot only when `replaceSnapshot: true`, or the payload has no `events`, or `schedules` is present; otherwise it is **append-only** (events stored, snapshot untouched — protects a newer PC snapshot from a stale mobile pull). When replacing, `blocklists` + `sessions` are required. `events[]` are idempotent per `clientEventId`. → `200 { revision, updatedAt }`.
 - **`GET /pull`** → `200 { blocklists, sessions, schedules, revision, updatedAt }` (empty/`revision:0` if never pushed).
 
-### Focus events — `/api/focus-events` (user JWT + bound-device + attest)
+### Focus events — `/api/focus-events` (user JWT + attest)
 
-- **`POST /`** — ingest ONE focus event (mobile). Idempotent on `clientEventId` (`200 { event, deduped: true }` on replay, else `201 … deduped: false`). `403 DEVICE_*` for an unbound/revoked/superseded device; `501` if `ATTEST_REQUIRED` is on but the verifier isn't wired. *(Desktop reports events through `/api/sync` instead.)*
+- **`POST /`** — ingest ONE focus event (mobile). Idempotent on `clientEventId` (`200 { event, deduped: true }` on replay, else `201 … deduped: false`). An event citing a `deviceId` with no Device row is stored `quarantined` (excluded from stats) and released once that device registers; `501` if `ATTEST_REQUIRED` is on but the verifier isn't wired. *(Desktop reports events through `/api/sync` instead.)*
 
 ### Analytics — `/api/analytics` (user JWT)
 
 - **`GET /summary`** → `200 { focusedSecondsWeek, sessionsCount, dayStreak, totalSessions }`. Quarantined events excluded. Streak buckets by **server-local (UTC on Vercel)** calendar days.
 
-### Breaks — `/api/breaks` (user JWT + bound-device + attest)
+### Breaks — `/api/breaks` (user JWT + attest)
 
 - **`POST /`** — grant a break against a server-authoritative **120 min / rolling-24h** budget. Over-budget grants are still recorded (`quarantined: true`) and still return an authoritative `endsAt` so offline enforcement is never blocked. Idempotent on `clientBreakId`. → `201 { id, endsAt, durationSeconds, quarantined, remainingMinutes }`.
 
@@ -325,8 +327,8 @@ cloud-backend/
   src/
     index.ts               # long-running server (local/Render/Railway)
     app.ts                 # createApp(): middleware + route mounts + error handlers
-    lib/                   # env, prisma, jwt, admin-jwt, apple, attest, resend, http-error, user, deterministic-id
-    middleware/            # auth, admin-auth, bound-device, attest, async-handler, error
+    lib/                   # env, prisma, jwt, admin-jwt, apple, attest, resend, http-error, user, device, deterministic-id
+    middleware/            # auth, admin-auth, attest, async-handler, error
     routes/                # health, auth, me, devices, sync, focus-events, analytics,
                            #   feedback, attest, breaks, sessions, admin, addiction-protection,
                            #   admin-protection  (+ *.test.ts contract tests)

@@ -119,10 +119,11 @@ model Device {
   name       String
   platform   String // OS: "windows" | "macos" | "android" | "ios" | "ipados"
   kind       String? // form factor: "desktop" | "phone" | "tablet"
-  // Stable client-generated UUID = the real cross-platform identity key. Optional
-  // for backward-compat: old clients that only send `name` keep working. New
-  // identities use a deterministic Mongo _id, so concurrent heartbeats converge
-  // without requiring a nullable unique index.
+  // The real cross-platform identity key, REQUIRED at the API boundary (see
+  // validation/schemas.ts). Nullable only because pre-refactor rows exist that
+  // never carried one — they are leftovers to clean up, not a supported case.
+  // Convergence under concurrent registration comes from the `uniq_user_deviceId`
+  // partial index plus the duplicate-key retry in routes/devices.ts.
   deviceId   String?
   model      String?
   osVersion  String?

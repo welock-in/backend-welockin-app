@@ -43,6 +43,23 @@ const isRaceError = (err: unknown) =>
   (err.code === "P2002" || err.code === "P2034");
 
 /**
+ * Credit focus events this device reported BEFORE it was registered.
+ *
+ * `shouldQuarantine` (services/focus-events.ts) parks an event whose deviceId has
+ * no Device row. That used to be recoverable because requireBoundDevice answered
+ * 403 first, so the event was never stored and the client retried after
+ * registering. Without that gate the event is stored and answered 201, the client
+ * drops it from its outbox, and `quarantined` was never re-evaluated — the credit
+ * was lost for good. Registration is exactly the moment the device stops being
+ * unknown, so it is where the backlog gets released.
+ */
+async function creditPendingEvents(userId: string, deviceId: string): Promise<void> {
+  await prisma.focusEvent
+    .updateMany({ where: { userId, deviceId, quarantined: true }, data: { quarantined: false } })
+    .catch(() => undefined); // never let a backlog repair fail a registration
+}
+
+/**
  * Register or heartbeat a device. Idempotent on (userId, deviceId) — the pair a
  * unique index already enforces (scripts/device-migrate.ts). Calling it twice
  * with the same deviceId updates one row; it never creates a second.
@@ -86,6 +103,7 @@ devicesRouter.post(
       const device = await prisma.device.create({
         data: { userId, deviceId: input.deviceId, ...data },
       });
+      await creditPendingEvents(userId, input.deviceId);
       res.status(201).json({ device: toPublicDevice(device, input.deviceId) });
     } catch (err) {
       // Two concurrent registrations of the same device raced. The unique index
@@ -95,6 +113,7 @@ devicesRouter.post(
           where: { userId, deviceId: input.deviceId },
         });
         if (winner) {
+          await creditPendingEvents(userId, input.deviceId);
           res.json({ device: toPublicDevice(winner, input.deviceId) });
           return;
         }

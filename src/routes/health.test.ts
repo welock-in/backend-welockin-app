@@ -30,3 +30,9 @@ test("new mobile event route is mounted and protected", async () => {
   assert.equal(res.status, 401);
   assert.equal(typeof res.body.error, "string");
 });
+
+test("onboarding route is mounted and protected", async () => {
+  const res = await request(app).post("/api/onboarding").send({});
+  assert.equal(res.status, 401);
+  assert.equal(typeof res.body.error, "string");
+});

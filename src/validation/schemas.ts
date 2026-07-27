@@ -331,3 +331,62 @@ export const notificationRuleUpdateSchema = notificationRuleSchema.partial();
 // locally, so a full mirror of `*Input` aliases would just be dead surface.
 export type FocusEventInput = z.infer<typeof focusEventInputSchema>;
 export type SyncPushInput = z.infer<typeof syncPushSchema>;
+export type OnboardingSubmitInput = z.infer<typeof onboardingSubmitSchema>;
+// --- Onboarding funnel -------------------------------------------------------
+
+/**
+ * A stable answer slug. Shape-validated ONLY — deliberately NOT a z.enum. This
+ * POST is the single request that gates the paywall, the funnel evolves without a
+ * backend deploy, and old binaries keep POSTing; a closed server enum would 400
+ * the user into a dead end. Unknown slugs are persisted verbatim (the known lists
+ * live in src/lib/onboarding.ts, for docs and tests only).
+ */
+const answerSlug = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .regex(/^[a-z0-9][a-z0-9_]{0,39}$/, "Answer must be a lowercase slug");
+
+/** Audit echo of the numbers the client actually DISPLAYED. Never trusted, never
+ *  read for logic — the server always recomputes from selfReportedDailyHours. */
+const clientProjectionSchema = z.object({
+  hoursPerYear: z.number().int().nonnegative().max(100_000).optional(),
+  yearsLost: z.number().int().nonnegative().max(200).optional(),
+  reclaimDaysPerYear: z.number().int().nonnegative().max(400).optional(),
+});
+
+export const onboardingSubmitSchema = z.object({
+  // Idempotency key, minted once per completed funnel run (and once per later
+  // edit). REQUIRED: a nullable unique key is a MongoDB footgun, and a required
+  // key on a brand-new model is always safe.
+  clientSubmissionId: z.string().trim().min(8).max(64),
+  funnelVersion: z.string().trim().min(1).max(32), // e.g. "phone_v6"
+  displayName: z.string().trim().min(1).max(40).optional(),
+  // min(1), NOT min(MIN_AGE): the age gate must produce a branchable
+  // 403 AGE_BELOW_MINIMUM in the route, not a generic zod 400. Only the derived
+  // band is persisted — the exact integer never reaches the database.
+  //
+  // Optional HERE, required BY THE ROUTE on a first submission (400
+  // ONBOARDING_INCOMPLETE). It cannot be required at this layer: GET returns only
+  // `ageBand`, so a signed-in user who reinstalled has no legal age to re-send and
+  // would be locked out of every later edit (renaming in Settings) unless they
+  // fabricated one inside the band.
+  age: z.number().int().min(1).max(99).optional(),
+  profile: answerSlug.optional(),
+  goal: answerSlug.optional(),
+  // Tap order is preserved (screen 12 renders the first three). 32 is a raw-input
+  // bound; the normaliser dedupes and stores at most 16.
+  distractingApps: z.array(answerSlug).max(32).optional(),
+  // Self-REPORTED hours/day, 0..12. 0 is a legal, reachable gauge value. Named so
+  // it can never be mistaken for measured Screen Time data (which is never uploaded).
+  // Optional for the same reason as `age`: required by the route on a first
+  // submission only, so a later partial edit does not have to restate the funnel.
+  selfReportedDailyHours: z.number().int().min(0).max(12).optional(),
+  locale: z.string().trim().min(2).max(35).optional(), // BCP-47
+  appVersion: z.string().trim().min(1).max(32).optional(),
+  platform: z.enum(["android", "ios", "ipados", "macos", "windows"]).optional(),
+  deviceId: z.string().trim().min(1).max(128).optional(),
+  startedAt: dateInput.optional(),
+  clientProjection: clientProjectionSchema.optional(),
+});
+

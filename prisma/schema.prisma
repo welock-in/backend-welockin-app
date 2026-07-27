@@ -42,6 +42,21 @@ model User {
   // Account moderation state, set from the admin console: "active" | "suspended".
   // Optional so documents written before this field existed still read cleanly.
   status       String?   @default("active")
+  // --- Onboarding funnel (denormalized cache; OnboardingProfile is the truth) ---
+  // BOTH OPTIONAL on purpose: on MongoDB `@default` is a create-time default only
+  // and `db push` never rewrites existing docs — a REQUIRED field would make
+  // Prisma throw when reading any legacy user. Optional → legacy docs read null.
+  //
+  // The name the user asked to be called, mirrored from OnboardingProfile so
+  // GET /api/me can render it without a join (the client previously derived a
+  // name from the email local-part). Written only by POST /api/onboarding.
+  displayName           String?
+  // Cheap funnel gating on the boot path: mobile already calls GET /api/me, so
+  // "resume the funnel or not" must be answerable from that one response. null on
+  // legacy accounts means "no server-side record" — clients must OR this with the
+  // local flag / an active entitlement rather than re-running the funnel.
+  onboardingCompletedAt DateTime?
+
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 
@@ -55,6 +70,7 @@ model User {
   liveSessions    LiveSession[]
   protectionLock  ProtectionLock?
   pushTokens      PushToken[]
+  onboarding      OnboardingProfile?
 }
 
 // A focus session that is HAPPENING RIGHT NOW, reported by a client via
@@ -455,4 +471,60 @@ model NotificationRule {
 
   @@index([event, enabled])
   @@map("notification_rules")
+}
+
+model OnboardingProfile {
+  id     String @id @default(auto()) @map("_id") @db.ObjectId
+  userId String @unique @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Which funnel produced the ORIGINAL record. Immutable after the first
+  // submission — it is the audit anchor for the answers below.
+  funnelVersion String
+  // Idempotency key, minted client-side once per completed funnel run (and once
+  // per later edit). Stored for REPLAY CLASSIFICATION only, never indexed: the
+  // natural key of a 1:1 resource is userId, and Prisma creates plain non-sparse
+  // unique indexes on MongoDB, so a nullable `@unique` would E11000 on the second
+  // row that omits the value.
+  clientSubmissionId String
+  // The name the user asked to be called (screen 1). Mirrored onto User.
+  displayName        String?
+  // "16_17" | "18_24" | "25_34" | "35_44" | "45_plus". The declared age is
+  // validated then REDUCED to this band; the exact integer is never persisted
+  // (data minimisation — a non-null band is also the evidence the gate ran).
+  ageBand            String
+  // Stable answer slugs, NOT indices (option lists churn; indices silently
+  // corrupt on insertion) and NOT Prisma enums (a new option would need a
+  // `db push` on the live cluster). Unknown slugs are stored verbatim.
+  profileSlug        String? // e.g. "founder_or_freelancer"
+  goalSlug           String? // e.g. "focus_better"
+  // SELF-DECLARED distractions from a fixed list — NOT the FamilyControls
+  // selection (those tokens are opaque and never leave the device). Order is the
+  // user's tap order, because screen 12 renders the first three.
+  distractingAppSlugs    String[]  @default([])
+  // Self-REPORTED hours/day from the gauge, 0..12 (0 is a legal, reachable
+  // value). Named so it can never be mistaken for measured Screen Time data.
+  selfReportedDailyHours Int
+  // Audit echo of the derived numbers the client actually DISPLAYED. Never read
+  // for logic: hoursPerYear / yearsLost / reclaimDaysPerYear are always
+  // recomputed server-side from selfReportedDailyHours (src/lib/onboarding.ts).
+  clientProjection       Json?
+  locale                 String? // BCP-47, e.g. "fr-FR"
+  appVersion             String?
+  platform               String? // "ios" | "ipados" | "macos" | "android" | "windows"
+  // The stable client deviceId as a plain string (like Break/FocusEvent), NOT a
+  // relation: the funnel POSTs before the device is registered.
+  deviceId               String?
+  // Client-reported funnel start. Immutable after the first submission.
+  startedAt              DateTime?
+  // SERVER clock at the first successful submission. Immutable.
+  completedAt            DateTime
+  // Bumped on every merge (a new clientSubmissionId); an exact replay writes nothing.
+  revision               Int       @default(0)
+  // Soft abuse guard: rolling-hour window for MUTATING submissions, counted on
+  // the row itself so no extra collection is needed. Check-then-act race accepted.
+  writeWindowStartedAt   DateTime?
+  writeWindowCount       Int       @default(0)
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
 }

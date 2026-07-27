@@ -15,6 +15,7 @@ import { feedbackRouter } from "./routes/feedback";
 import { attestRouter } from "./routes/attest";
 import { breaksRouter } from "./routes/breaks";
 import { notificationsRouter } from "./routes/notifications";
+import { onboardingRouter } from "./routes/onboarding";
 import { adminPageHtml } from "./admin/page";
 import { sessionsRouter } from "./routes/sessions";
 import { adminRouter } from "./routes/admin";
@@ -64,6 +65,7 @@ export function createApp(): Express {
   app.use("/api/addiction-protection", addictionProtectionRouter);
   app.use("/api/admin/addiction-protection", adminProtectionRouter);
   app.use("/api/admin/notifications", adminNotificationsRouter);
+  app.use("/api/onboarding", onboardingRouter);
 
   // Same-origin admin dashboard for the feedback board (gated by admin login;
   // all data/actions require User.isAdmin). Route-scoped CSP relaxes helmet's

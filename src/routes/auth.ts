@@ -13,8 +13,8 @@ import {
   verifyAppleIdentityToken,
 } from "../lib/apple";
 import { deterministicObjectId } from "../lib/deterministic-id";
+import { TRIAL_DAYS } from "../lib/entitlement";
 
-const TRIAL_DAYS = 14;
 const BCRYPT_ROUNDS = 10;
 
 const isDuplicateKey = (err: unknown) =>

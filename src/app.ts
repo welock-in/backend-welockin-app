@@ -16,6 +16,7 @@ import { attestRouter } from "./routes/attest";
 import { breaksRouter } from "./routes/breaks";
 import { notificationsRouter } from "./routes/notifications";
 import { onboardingRouter } from "./routes/onboarding";
+import { checkoutRouter } from "./routes/checkout";
 import { lemonSqueezyWebhookRouter } from "./routes/webhooks-lemonsqueezy";
 import { entitlementRouter } from "./routes/entitlement";
 import { adminPageHtml } from "./admin/page";
@@ -82,6 +83,7 @@ export function createApp(): Express {
   app.use("/api/onboarding", onboardingRouter);
   // Authenticated by the sender's signature, not by a bearer token —
   // deliberately outside the requireAuth surface.
+  app.use("/api/checkout", checkoutRouter);
   app.use("/api/webhooks/lemonsqueezy", lemonSqueezyWebhookRouter);
   app.use("/api/entitlement", entitlementRouter);
 

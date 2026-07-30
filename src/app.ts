@@ -16,6 +16,7 @@ import { attestRouter } from "./routes/attest";
 import { breaksRouter } from "./routes/breaks";
 import { notificationsRouter } from "./routes/notifications";
 import { onboardingRouter } from "./routes/onboarding";
+import { lemonSqueezyWebhookRouter } from "./routes/webhooks-lemonsqueezy";
 import { entitlementRouter } from "./routes/entitlement";
 import { adminPageHtml } from "./admin/page";
 import { sessionsRouter } from "./routes/sessions";
@@ -37,7 +38,19 @@ export function createApp(): Express {
       allowedHeaders: ["Content-Type", "Authorization", "X-WeLockIn-Device-Id", "X-WeLockIn-Attest"],
     }),
   );
-  app.use(express.json({ limit: "5mb" }));
+  app.use(
+    express.json({
+      limit: "5mb",
+      // Keep the exact bytes received, for webhook signatures. An HMAC is over the
+      // body AS SENT, and parse -> re-serialise is not byte-identical, so verifying
+      // against the parsed object rejects every genuine delivery — and the tempting
+      // fix for that is to stop verifying, which turns a payment endpoint into an
+      // open one. Costs one retained reference per request; nothing is copied.
+      verify: (req, _res, buf) => {
+        (req as express.Request & { rawBody?: Buffer }).rawBody = buf;
+      },
+    }),
+  );
   if (env.nodeEnv !== "test") {
     app.use(morgan(env.nodeEnv === "development" ? "dev" : "combined"));
   }
@@ -67,6 +80,9 @@ export function createApp(): Express {
   app.use("/api/admin/addiction-protection", adminProtectionRouter);
   app.use("/api/admin/notifications", adminNotificationsRouter);
   app.use("/api/onboarding", onboardingRouter);
+  // Authenticated by the sender's signature, not by a bearer token —
+  // deliberately outside the requireAuth surface.
+  app.use("/api/webhooks/lemonsqueezy", lemonSqueezyWebhookRouter);
   app.use("/api/entitlement", entitlementRouter);
 
   // Same-origin admin dashboard for the feedback board (gated by admin login;

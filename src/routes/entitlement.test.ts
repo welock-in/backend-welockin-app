@@ -32,6 +32,18 @@ function stubMethod(
 
 const days = (n: number) => new Date(Date.now() + n * 24 * 60 * 60 * 1000);
 
+/**
+ * Stub the purchase lookup the route now performs.
+ *
+ * Every trial-era case below predates desktop payments and means "this account
+ * has never bought anything" — which has to be said out loud now that the route
+ * asks. Left unstubbed it is not a wrong answer but a thrown one: the real client
+ * tries to open a connection and the request 500s.
+ */
+function noPurchases(t: any) {
+  stubMethod(t, prisma.purchase as any, "findMany", async () => []);
+}
+
 test("entitlement requires a bearer token", async () => {
   const res = await request(app).get("/api/entitlement");
   assert.equal(res.status, 401);
@@ -39,6 +51,7 @@ test("entitlement requires a bearer token", async () => {
 
 test("a live trial window reports trialing + isPro, and cannot start another", async (t) => {
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ trialEndsAt: days(9) }));
+  noPurchases(t);
 
   const res = await request(app).get("/api/entitlement").set(auth);
 
@@ -53,6 +66,7 @@ test("a live trial window reports trialing + isPro, and cannot start another", a
 
 test("an elapsed trial reports expired, and stays unbuyable until StoreKit lands", async (t) => {
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ trialEndsAt: days(-1) }));
+  noPurchases(t);
 
   const res = await request(app).get("/api/entitlement").set(auth);
 
@@ -67,6 +81,7 @@ test("an elapsed trial reports expired, and stays unbuyable until StoreKit lands
 test("the countdown is anchored to the SERVER clock, not the caller's", async (t) => {
   const endsAt = days(3);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ trialEndsAt: endsAt }));
+  noPurchases(t);
 
   const before = Date.now();
   const res = await request(app).get("/api/entitlement").set(auth);
@@ -79,6 +94,7 @@ test("the countdown is anchored to the SERVER clock, not the caller's", async (t
 
 test("an account with no trial window ever stamped may start one", async (t) => {
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ trialEndsAt: null }));
+  noPurchases(t);
 
   const res = await request(app).get("/api/entitlement").set(auth);
 
@@ -89,9 +105,45 @@ test("an account with no trial window ever stamped may start one", async (t) => 
 
 test("a token whose account was deleted gets a machine-readable 404", async (t) => {
   stubMethod(t, prisma.user as any, "findUnique", async () => null);
+  noPurchases(t);
 
   const res = await request(app).get("/api/entitlement").set(auth);
 
   assert.equal(res.status, 404);
   assert.equal(res.body.code, "ACCOUNT_NOT_FOUND");
+});
+
+// --- desktop purchases (Lemon Squeezy) --------------------------------------
+
+test("a paid desktop licence outranks an elapsed trial and reports active", async (t) => {
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ trialEndsAt: days(-30) }));
+  stubMethod(t, prisma.purchase as any, "findMany", async () => [{ isRefunded: false }]);
+
+  const res = await request(app).get("/api/entitlement").set(auth);
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.status, "active");
+  assert.equal(res.body.isPro, true);
+});
+
+test("a refunded purchase does not keep access", async (t) => {
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ trialEndsAt: days(-30) }));
+  stubMethod(t, prisma.purchase as any, "findMany", async () => [{ isRefunded: true }]);
+
+  const res = await request(app).get("/api/entitlement").set(auth);
+
+  assert.equal(res.body.status, "refunded");
+  assert.equal(res.body.isPro, false);
+});
+
+// Someone who bought, was refunded, then bought again. Ranking the refund first
+// would take away a licence they are currently paying for.
+test("a live purchase beats an older refunded one", async (t) => {
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ trialEndsAt: days(-30) }));
+  stubMethod(t, prisma.purchase as any, "findMany", async () => [{ isRefunded: true }, { isRefunded: false }]);
+
+  const res = await request(app).get("/api/entitlement").set(auth);
+
+  assert.equal(res.body.status, "active");
+  assert.equal(res.body.isPro, true);
 });

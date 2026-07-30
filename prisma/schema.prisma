@@ -71,6 +71,7 @@ model User {
   protectionLock  ProtectionLock?
   pushTokens      PushToken[]
   onboarding      OnboardingProfile?
+  purchases       Purchase[]
 }
 
 // A focus session that is HAPPENING RIGHT NOW, reported by a client via
@@ -527,4 +528,56 @@ model OnboardingProfile {
   writeWindowCount       Int       @default(0)
   createdAt              DateTime  @default(now())
   updatedAt              DateTime  @updatedAt
+}
+
+// A completed payment. ONE row per storefront transaction, whatever the
+// storefront: iOS goes through Adapty because Apple requires store IAP, while the
+// macOS and Windows builds ship outside the App Store and are sold through Lemon
+// Squeezy. Both land here, told apart by `provider`, so entitlement stays one
+// rule instead of one rule per shop.
+model Purchase {
+  id       String @id @default(auto()) @map("_id") @db.ObjectId
+  userId   String @db.ObjectId
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider String // "lemonsqueezy" | "adapty"
+  store    String // "lemonsqueezy" | "app_store" | "play_store"
+  productId String
+  /// The storefront's own id for this transaction, stable across replay and
+  /// refund. Unique WITH the provider, never alone: two shops number their orders
+  /// independently, so an Adapty transaction id and a Lemon Squeezy order id can
+  /// collide — and a collision would hand one customer's licence to another.
+  externalId  String
+  priceUsd    Float?
+  purchasedAt DateTime
+  isRefunded  Boolean   @default(false)
+  refundedAt  DateTime?
+  /// Kept for support and for replaying a delivery we mishandled.
+  rawEvent  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([provider, externalId])
+  @@index([userId])
+}
+
+// Every webhook delivery we accepted, recorded before it is acted on so a payload
+// we mishandle is still on disk to be replayed once the handling is fixed.
+model WebhookEvent {
+  id       String @id @default(auto()) @map("_id") @db.ObjectId
+  provider String
+  /// Dedupe key. Unique per provider so two shops cannot shadow each other.
+  eventId String
+  type    String
+  payload Json
+  /// "processing" while the work is in flight, then "processed" | "skipped" |
+  /// "failed". A retry that finds a row still "processing" or "failed" re-runs the
+  /// work: treating mere existence as done loses the purchase of anyone whose
+  /// first delivery died halfway.
+  status      String    @default("processing")
+  error       String?
+  attempts    Int       @default(1)
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+
+  @@unique([provider, eventId])
 }

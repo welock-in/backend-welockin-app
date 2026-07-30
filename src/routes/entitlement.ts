@@ -55,10 +55,22 @@ entitlementRouter.get(
     // A valid JWT for a deleted account reaches here (stateless verification).
     if (!user) throw accountGone();
 
+    // One query settles both flags. Separate counts would read the same
+    // collection twice on what is the app's hottest boot-path call, and a user
+    // has at most a handful of rows here — this is a lifetime licence, not a
+    // subscription ledger.
+    const purchases = await prisma.purchase.findMany({
+      where: { userId: req.user!.id },
+      select: { isRefunded: true },
+    });
+
     const view = computeEntitlement({
       now: new Date(),
-      hasActivePurchase: false,
-      hasRefundedPurchase: false,
+      hasActivePurchase: purchases.some((p) => !p.isRefunded),
+      // Only decides anything when nothing is live: computeEntitlement ranks an
+      // active purchase above a refunded one, so someone who bought twice and was
+      // refunded once keeps their access.
+      hasRefundedPurchase: purchases.some((p) => p.isRefunded),
       compActive: false,
       accessRevoked: false,
       trialEndsAt: user.trialEndsAt,

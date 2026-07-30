@@ -85,4 +85,22 @@ export const env = {
   // Optional Expo access token (recommended for enhanced security + higher rate
   // limits). Sends still work without it via the open Expo Push API.
   expoAccessToken: process.env.EXPO_ACCESS_TOKEN ?? "",
+  // Lemon Squeezy — the DESKTOP purchase path (macOS + Windows, shipped outside
+  // the App Store, so no store IAP is imposed and none is possible). iOS keeps
+  // going through Adapty because Apple requires it there. Both land in the same
+  // Purchase table, told apart by `provider`.
+  lemonSqueezyApiKey: process.env.LEMONSQUEEZY_API_KEY ?? "",
+  lemonSqueezyWebhookSecret: process.env.LEMONSQUEEZY_WEBHOOK_SECRET ?? "",
+  lemonSqueezyStoreId: process.env.LEMONSQUEEZY_STORE_ID ?? "",
+  /** The one variant we sell. Unset means SELL NOTHING, never sell everything. */
+  lemonSqueezyVariantId: process.env.LEMONSQUEEZY_VARIANT_ID ?? "",
+  lemonSqueezyApiBase: process.env.LEMONSQUEEZY_API_BASE ?? "https://api.lemonsqueezy.com",
+  /**
+   * May a TEST-mode order grant a real lifetime licence?
+   *
+   * Requires the literal string "true" — deliberately NOT inferred from NODE_ENV,
+   * which is unset on more machines than anyone expects, and every one of those
+   * would have failed OPEN into a free-licence tap.
+   */
+  lemonSqueezyAllowTestMode: process.env.LEMONSQUEEZY_ALLOW_TEST_MODE === "true",
 };

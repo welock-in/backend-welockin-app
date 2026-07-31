@@ -15,7 +15,6 @@ import {
 import {
   APP_STORE,
   LIFETIME_PRODUCT_ID,
-  PLAN,
   TRIAL_DAYS,
   TRIAL_PRODUCT_ID,
   purchaseEffect,
@@ -214,12 +213,39 @@ async function claimTrial(
     if (!isDuplicateKey(err)) throw err;
   }
 
-  // Mirror for the desktop/legacy readers. Written only when absent, so it can
-  // never widen a window the ledger already governs.
+  // ── materialize the governing window onto the account ────────────────────
+  //
+  // This is not bookkeeping, it is the Apple leg's ONLY route into the resolver.
+  //
+  // `GET /api/entitlement` knows a userId and a deviceId; it never sees an Apple
+  // ID, because the phone only hands one over when a transaction is posted. So a
+  // claim found here by `appleOriginalTxHash` would be written and then never
+  // read again — and a fresh account on a NEW phone with the SAME Apple ID would
+  // fall through to the signup stamp and collect another 14 days. Which is the
+  // farm, one hop further out.
+  //
+  // Stamping the account closes it: the account carries the ledger's answer, and
+  // the resolver's legacy fallback now returns the truth instead of a fiction.
+  const governing = await prisma.trialClaim.findFirst({
+    where: { OR: [{ appleOriginalTxHash }, { deviceIdHash }, { firstUserId: userId }] },
+    orderBy: { createdAt: "asc" }, // oldest wins — a later row must never rewind it
+    select: { endsAt: true },
+  });
+  if (!governing) return;
+
+  // NARROWING ONLY: write when the account has no window, or one that ends LATER
+  // than the ledger allows. The `gt` is what makes this safe to run on every
+  // replayed transaction — it can pull a window in, never push it out.
   await prisma.user
     .updateMany({
-      where: { id: userId, trialEndsAt: null },
-      data: { trialEndsAt: window.endsAt, plan: PLAN.trial },
+      where: {
+        id: userId,
+        OR: [{ trialEndsAt: null }, { trialEndsAt: { gt: governing.endsAt } }],
+      },
+      // Deliberately not touching `plan`: a user who already owns the lifetime
+      // unlock can replay a trial transaction, and demoting their mirror to
+      // "trial" would misreport them to the desktop clients and /api/me.
+      data: { trialEndsAt: governing.endsAt },
     })
     .catch(() => {});
 }

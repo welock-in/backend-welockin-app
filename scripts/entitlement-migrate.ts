@@ -60,6 +60,23 @@ async function ensureIndexes(): Promise<void> {
     );
   }
 
+  // `prisma db push` creates the same constraint under its OWN name
+  // (`TrialClaim_deviceIdHash_key`), and MongoDB rejects a second index with the
+  // same key spec under a different name — so a repo that followed the README
+  // and ran `db push` first would hit a hard failure here. What matters is that
+  // SOMETHING enforces uniqueness on deviceIdHash, not what it is called.
+  const existing = (await prisma
+    .$runCommandRaw({ listIndexes: "TrialClaim" } as never)
+    .catch(() => null)) as { cursor?: { firstBatch?: { name?: string; key?: Record<string, number>; unique?: boolean }[] } } | null;
+
+  const already = existing?.cursor?.firstBatch?.find(
+    (i) => i.unique === true && i.key?.deviceIdHash === 1 && Object.keys(i.key).length === 1,
+  );
+  if (already) {
+    console.log(`[indexes] TrialClaim.${already.name} already enforces uniqueness on deviceIdHash`);
+    return;
+  }
+
   if (dryRun) {
     // A dry run that writes is a trap, even when the write is idempotent: the
     // whole point of the flag is that someone can point it at production to find

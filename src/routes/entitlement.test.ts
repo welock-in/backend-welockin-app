@@ -593,7 +593,19 @@ test("a revocation outranks everything, including a paid licence", async (t) => 
 
 /* ── the rollout switch ───────────────────────────────────────────────── */
 
-test("enforcement is OFF by default, so no existing account is locked out by a deploy", async (t) => {
+/*
+ * Pinned explicitly rather than read from the ambient environment. This test used
+ * to assert the DEFAULT by simply not setting anything, which passed only for as
+ * long as no `.env` existed in the repo — the day a local dev file turned
+ * enforcement on, a green suite went red for a reason that had nothing to do with
+ * the code.
+ */
+test("enforcement OFF is reported as false, never as an absent field", async (t) => {
+  const before = env.entitlementEnforced;
+  (env as any).entitlementEnforced = false;
+  t.after(() => {
+    (env as any).entitlementEnforced = before;
+  });
   account(t);
   noPurchases(t);
   fakeLedger(t, []);
@@ -603,6 +615,7 @@ test("enforcement is OFF by default, so no existing account is locked out by a d
   assert.equal(res.body.enforced, false);
   assert.notEqual(res.body.enforced, undefined, "absent must be false on the wire");
 });
+
 
 test("ENTITLEMENT_ENFORCED reaches the client and never changes the status", async (t) => {
   const before = env.entitlementEnforced;

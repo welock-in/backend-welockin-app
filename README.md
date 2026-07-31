@@ -74,6 +74,71 @@ npm run dev                     # tsx watch, hot reload → http://localhost:878
 | `npm run entitlement:migrate` | Creates the `TrialClaim` unique index, then grandfathers the pre-paywall cohort with a reversible 30-day comp. `-- --dry-run` counts, `-- --revert` undoes. **Run BEFORE deploying the ledger** (see below) and before flipping `ENTITLEMENT_ENFORCED`. |
 | `npm run feedback:set-admin` | Grant `User.isAdmin` to an email (feedback-board moderator). |
 | `npm run reconcile:feedback` | Recompute denormalized `voteCount`/`reportCount`. |
+| `npm run dev:scenario` | Put one account into any entitlement state (`expired`, `paid`, `fresh`, …). Refuses non-disposable databases. |
+
+---
+
+## Local development environment
+
+The paywall, the trial-expiry copy and the post-purchase unlock are the screens
+money passes through, and every one of them is normally reachable only by waiting
+fourteen days, paying, or hand-editing Mongo — which is why they are the
+least-looked-at screens in the product. This setup makes each of them one command
+away.
+
+**1. A disposable database.** Same Atlas cluster, different database name — free,
+instant, and nothing in it can touch the real data:
+
+```bash
+cp .env.example .env    # then set DATABASE_URL to .../welockin-dev
+npx prisma db push
+npm run dev             # http://localhost:8787
+```
+
+Set `ENTITLEMENT_ENFORCED="true"` in that `.env`. Without it the client never
+hard-gates and the paywall stays invisible however expired the account is.
+
+You also need a **storefront that looks configured**, or enforcement is forced
+back off (a paywall nobody can pay through would lock out every expired account).
+Fake values are enough to reach the paywall; clicking Buy fails at Lemon Squeezy
+until you drop real *test* keys in:
+
+```
+LEMONSQUEEZY_API_KEY="dev-fake-key"
+LEMONSQUEEZY_WEBHOOK_SECRET="dev-fake-webhook-secret"
+LEMONSQUEEZY_STORE_ID="000000"
+LEMONSQUEEZY_VARIANT_ID="000000"
+```
+
+**2. Point the desktop app at it.** In the macOS repo, `.env.local`:
+
+```
+VITE_API_URL=http://localhost:8787
+```
+
+`VITE_API_URL` is baked in at build time and defaults to the deployed backend, so
+this file must never be committed — a release built with it would ship a customer
+an app that talks to your laptop.
+
+**3. Jump to any state.**
+
+```bash
+npm run dev:scenario -- me@test.dev expired    # THE PAYWALL
+npm run dev:scenario -- me@test.dev fresh      # a true first run: onboarding + a new window
+npm run dev:scenario -- me@test.dev ending     # 20 minutes left
+npm run dev:scenario -- me@test.dev paid       # lifetime licence, unlocked
+npm run dev:scenario -- me@test.dev refunded   # paywall, refunded wording
+npm run dev:scenario -- me@test.dev comped     # admin grant, no purchase
+npm run dev:scenario -- me@test.dev revoked    # outranks even a live purchase
+```
+
+Accounts are created with the password `devdevdev`, and the script prints what the
+resolver **actually** returns rather than what was intended — the two disagreeing
+is precisely the bug it exists to surface.
+
+It **refuses to run** against a database whose name does not contain
+`dev`/`test`/`local`/`staging`/`sandbox`. It deletes accounts and rewrites who has
+paid; pointed at production by a stale shell it would be a very bad afternoon.
 
 ---
 

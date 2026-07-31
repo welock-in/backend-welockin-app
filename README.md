@@ -134,10 +134,17 @@ Both land in the same `Purchase` table, told apart by `provider`.
 
 > **All-or-nothing.** The four required vars are validated together at boot
 > (`checkPaymentConfig`, `src/lib/env.ts`). Setting **none** is fine — the deploy
-> simply cannot sell, and `POST /api/checkout` answers 400. Setting **some** is
-> fatal, because it fails toward lost money: with an API key but no webhook
-> secret the payment page mints fine and every delivery back is rejected as
-> unsigned, so the customer is charged and no licence is ever granted.
+> simply cannot sell, and `POST /api/checkout` answers 400. Setting **some**
+> switches purchasing **off** and logs a loud `[env]` error, because a partial
+> config fails toward lost money: with an API key but no webhook secret the
+> payment page mints fine and every delivery back is rejected as unsigned, so the
+> customer is charged and no licence is ever granted. An unusable storefront that
+> refuses to open a checkout takes no money, so switching it off loses nothing.
+>
+> Outside production the same problem **throws** instead, where a failed boot
+> costs a restart rather than an outage — the storefront is one feature among
+> many, and it must never be able to take focus sessions, notifications and
+> blocking down with it.
 
 ### Entitlement rollout
 
@@ -150,9 +157,11 @@ may act on it. It exists because the day the paywall ships, every account whose
 trial quietly elapsed months ago turns `expired` at once — gating on status alone
 would lock all of them out in a single update, with no way to stage it.
 
-Turning it on also requires a configured storefront: boot fails if it is `true`
-while Lemon Squeezy is unconfigured, because a paywall nobody can pay through is
-worse than no paywall.
+Turning it on also requires a usable storefront. Set to `true` while Lemon
+Squeezy is unconfigured, it is **forced back off** with a loud `[env]` error:
+a paywall nobody can pay through would lock out every expired account with no way
+out, which is worse than no paywall. Check the boot logs after flipping it —
+`enforced` silently staying `false` is the symptom.
 
 ---
 
@@ -366,7 +375,7 @@ on install; run `npx prisma db push` once against the production `DATABASE_URL`
 
 1. [ ] In the Lemon Squeezy dashboard: create the store, the **Lifetime licence** product with a single variant, and note `store_id` + `variant_id`. They **differ between test and live** — copying a product to live mode assigns it a new id.
 2. [ ] Create the webhook → `https://<domain>/api/webhooks/lemonsqueezy`, events `order_created` and `order_refunded`. Keep **test and live as separate webhooks** pointing at separate deployments with separate databases; that is cleaner than `LEMONSQUEEZY_ALLOW_TEST_MODE`, which risks being left on in production.
-3. [ ] Set **all four** required vars *before* the store can take an order. A half-configured deploy refuses to boot; an unconfigured one accepts nothing and records the order as `failed` (retryable) rather than dropping it — but the safe path is simply to configure first.
+3. [ ] Set **all four** required vars *before* the store can take an order. A half-configured deploy switches purchasing off and says so in the boot log; an order that still arrives is recorded as `failed` (retryable) rather than dropped — but the safe path is simply to configure first, in one go.
 4. [ ] Confirm `npx prisma db push` created the `Purchase` and `WebhookEvent` unique indexes (see the data-model note).
 5. [ ] Send a **test-mode order** end to end and confirm a `Purchase` row appears and `GET /api/entitlement` flips to `active`. This is also the check that the raw body survives the platform: `verifyWebhookSignature` fails closed on an empty `rawBody`, so a silent regression there looks exactly like a wrong secret — and the tempting fix is to stop verifying.
 6. [ ] Only then, and only after grandfathering the existing cohort, set `ENTITLEMENT_ENFORCED=true`. Boot refuses this while the storefront is unconfigured.

@@ -120,25 +120,38 @@ export const env = {
   entitlementEnforced: (process.env.ENTITLEMENT_ENFORCED ?? "false") === "true",
 };
 
+export type PaymentConfigVerdict = {
+  /** Half-configured: the storefront is unusable and must be treated as OFF. */
+  degraded: boolean;
+  /** Enforcement was asked for with nothing to buy, and has been forced off. */
+  enforcementSuppressed: boolean;
+  /** Human-readable, in the order an operator should fix them. */
+  problems: string[];
+};
+
 /**
- * Storefront configuration is ALL-OR-NOTHING, and enforcement implies it.
+ * Decide whether this deploy may sell anything, and say so out loud.
  *
  * Payments are optional on purpose: a deploy with none of these set simply cannot
- * sell, and refusing to boot over that would take focus sessions, notifications
- * and blocking down with it. So an empty config is a legitimate state.
+ * sell, and that is a legitimate state — a self-hosted or pre-launch instance.
  *
- * A PARTIAL config is the state worth dying over, because it fails in the
- * direction of lost money rather than lost function: with an API key but no
- * webhook secret, `POST /api/checkout` mints a real payment page and every
- * delivery that comes back is rejected as unsigned. The customer is charged and
- * no licence is ever granted. Nothing downstream can recover that, so it is
- * caught at boot, on the machine that is misconfigured — not weeks later in a
- * support thread.
+ * The dangerous state is a PARTIAL config, because it fails toward lost money
+ * rather than lost function: with an api key but no webhook secret, `POST
+ * /api/checkout` mints a real payment page and every delivery that comes back is
+ * rejected as unsigned, so the customer is charged and no licence is ever
+ * granted. Nothing downstream can recover that.
  *
- * Exported and pure so the rule can be tested without spawning a process to
- * observe a module-load throw.
+ * The answer is to DEGRADE, not to die. An earlier version of this threw at boot,
+ * which was the wrong shape of safe: the storefront is one feature among many,
+ * and taking focus sessions, notifications and blocking down to protect a sale
+ * that has not happened yet trades a real outage for a hypothetical refund. Off
+ * is already safe — an unusable storefront that refuses to open a checkout takes
+ * no money, so there is nothing to lose. So a half-configured storefront is
+ * switched off and shouted about, and only a dev/test run throws, where the
+ * throw costs nothing and is seen immediately.
  *
- * @returns a warning to log, or null. Throws when the config cannot be shipped.
+ * Pure, so the rule can be tested without spawning a process to watch a
+ * module-load throw.
  */
 export function checkPaymentConfig(input: {
   lemonSqueezyApiKey: string;
@@ -146,7 +159,7 @@ export function checkPaymentConfig(input: {
   lemonSqueezyStoreId: string;
   lemonSqueezyVariantId: string;
   entitlementEnforced: boolean;
-}): string | null {
+}): PaymentConfigVerdict {
   const required = {
     LEMONSQUEEZY_API_KEY: input.lemonSqueezyApiKey,
     LEMONSQUEEZY_WEBHOOK_SECRET: input.lemonSqueezyWebhookSecret,
@@ -155,28 +168,49 @@ export function checkPaymentConfig(input: {
   };
   const names = Object.keys(required) as (keyof typeof required)[];
   const missing = names.filter((n) => !required[n]);
+  const configured = missing.length === 0;
+  const degraded = missing.length > 0 && missing.length < names.length;
 
-  if (missing.length > 0 && missing.length < names.length) {
-    throw new Error(
-      `Lemon Squeezy is half-configured — set all of it or none of it. Missing: ${missing.join(", ")}`,
+  const problems: string[] = [];
+  if (degraded) {
+    problems.push(
+      `Lemon Squeezy is half-configured, so purchasing is DISABLED — set all of it or none of it. Missing: ${missing.join(", ")}`,
     );
   }
 
   // A paywall nobody can pay through is worse than no paywall: it locks out every
-  // expired account with no way out. Enforcement without a storefront is refused
-  // rather than shipped.
-  if (input.entitlementEnforced && missing.length > 0) {
-    throw new Error(
-      "ENTITLEMENT_ENFORCED is on but Lemon Squeezy is not configured — the paywall would have no way to buy",
+  // expired account with no way out. So enforcement is dropped rather than the
+  // storefront being pretended into existence.
+  const enforcementSuppressed = input.entitlementEnforced && !configured;
+  if (enforcementSuppressed) {
+    problems.push(
+      "ENTITLEMENT_ENFORCED is on with no usable storefront, so it has been forced OFF — a paywall with no way to buy would lock out every expired account",
     );
   }
 
-  // Loud, not fatal: selling nothing is legitimate, but it must never be the
-  // thing an operator first hears about from a customer.
-  return missing.length > 0
-    ? "[env] Lemon Squeezy is not configured — POST /api/checkout will refuse every purchase"
-    : null;
+  return { degraded, enforcementSuppressed, problems };
 }
 
-const paymentWarning = checkPaymentConfig(env);
-if (paymentWarning && isProduction) console.warn(paymentWarning);
+const paymentConfig = checkPaymentConfig(env);
+
+// A half-configured storefront is not a storefront. Blanking the keys is how that
+// is said to the rest of the process: `POST /api/checkout` already refuses
+// without them (400, logged), and `verifyWebhookSignature` already fails closed.
+// One decision here beats four `if configured` checks scattered downstream.
+if (paymentConfig.degraded) {
+  env.lemonSqueezyApiKey = "";
+  env.lemonSqueezyWebhookSecret = "";
+  env.lemonSqueezyStoreId = "";
+  env.lemonSqueezyVariantId = "";
+}
+if (paymentConfig.enforcementSuppressed) {
+  env.entitlementEnforced = false;
+}
+
+for (const problem of paymentConfig.problems) console.error(`[env] ${problem}`);
+
+// In dev and CI a misconfiguration should stop the run, because there it costs a
+// restart rather than an outage — and being told at boot is the entire point.
+if (paymentConfig.problems.length > 0 && !isProduction) {
+  throw new Error(paymentConfig.problems.join(" / "));
+}

@@ -8,6 +8,11 @@ import { checkPaymentConfig } from "./env";
  * happens whenever the checkout half of the storefront is configured and the
  * webhook half is not: the payment page mints fine, and every delivery that comes
  * back is rejected as unsigned.
+ *
+ * The fix is to switch the storefront OFF, not to refuse to boot. An unusable
+ * storefront that will not open a checkout takes no money, so there is nothing
+ * left to lose — whereas dying at boot would take focus sessions, notifications
+ * and blocking down with it, trading a real outage for a hypothetical refund.
  */
 
 const FULL = {
@@ -26,54 +31,70 @@ const NONE = {
   entitlementEnforced: false,
 };
 
-test("a fully configured storefront boots silently", () => {
-  assert.equal(checkPaymentConfig(FULL), null);
+test("a fully configured storefront has nothing to say", () => {
+  const v = checkPaymentConfig(FULL);
+  assert.equal(v.degraded, false);
+  assert.equal(v.enforcementSuppressed, false);
+  assert.deepEqual(v.problems, []);
 });
 
 /*
  * Selling nothing is a legitimate state — a self-hosted or pre-launch deploy.
- * Refusing to boot over it would take focus sessions, notifications and blocking
- * down with it, none of which have anything to do with payments.
+ * It is not a problem to report, because nothing about it is wrong.
  */
-test("a deploy that sells nothing still boots, with a warning", () => {
-  const warning = checkPaymentConfig(NONE);
-  assert.match(String(warning), /not configured/);
+test("a deploy that sells nothing is silent, not degraded", () => {
+  const v = checkPaymentConfig(NONE);
+  assert.equal(v.degraded, false);
+  assert.deepEqual(v.problems, []);
 });
 
-test("a half-configured storefront refuses to boot, and names what is missing", () => {
+test("any single missing variable degrades the whole storefront", () => {
   for (const missing of [
     "lemonSqueezyApiKey",
     "lemonSqueezyWebhookSecret",
     "lemonSqueezyStoreId",
     "lemonSqueezyVariantId",
   ] as const) {
-    assert.throws(
-      () => checkPaymentConfig({ ...FULL, [missing]: "" }),
-      /half-configured/,
-      `omitting ${missing} must be fatal`,
-    );
+    const v = checkPaymentConfig({ ...FULL, [missing]: "" });
+    assert.equal(v.degraded, true, `omitting ${missing} must disable purchasing`);
   }
 });
 
-test("the error names the missing variable, so the fix does not need a code read", () => {
-  assert.throws(
-    () => checkPaymentConfig({ ...FULL, lemonSqueezyWebhookSecret: "" }),
-    /LEMONSQUEEZY_WEBHOOK_SECRET/,
-  );
+test("the report names the missing variable, so the fix needs no code read", () => {
+  const v = checkPaymentConfig({ ...FULL, lemonSqueezyWebhookSecret: "" });
+  assert.match(v.problems.join(" "), /LEMONSQUEEZY_WEBHOOK_SECRET/);
+  assert.match(v.problems.join(" "), /DISABLED/);
+});
+
+/*
+ * The exact shape that loses money: everything needed to TAKE a payment, and
+ * nothing needed to HEAR about it.
+ */
+test("checkout-capable but webhook-deaf is the case this exists for", () => {
+  const v = checkPaymentConfig({ ...FULL, lemonSqueezyWebhookSecret: "" });
+  assert.equal(v.degraded, true, "purchasing must be off before it can charge anyone");
 });
 
 /*
  * Enforcement turns `expired` into a locked app. Shipping that without a
  * storefront gives every expired account a dead end: a paywall, a Buy button, and
- * a backend that answers 400 to every attempt to use it.
+ * a backend that answers 400 to every attempt to use it. Dropping the enforcement
+ * is the only failure mode here that harms nobody.
  */
-test("enforcement without a storefront is refused — a paywall with no way to pay", () => {
-  assert.throws(
-    () => checkPaymentConfig({ ...NONE, entitlementEnforced: true }),
-    /no way to buy/,
-  );
+test("enforcement without a storefront is forced off, never shipped", () => {
+  const v = checkPaymentConfig({ ...NONE, entitlementEnforced: true });
+  assert.equal(v.enforcementSuppressed, true);
+  assert.match(v.problems.join(" "), /forced OFF/);
 });
 
-test("enforcement with a storefront is exactly what shipping looks like", () => {
-  assert.equal(checkPaymentConfig({ ...FULL, entitlementEnforced: true }), null);
+test("enforcement on a half-configured storefront is forced off too", () => {
+  const v = checkPaymentConfig({ ...FULL, lemonSqueezyStoreId: "", entitlementEnforced: true });
+  assert.equal(v.degraded, true);
+  assert.equal(v.enforcementSuppressed, true);
+});
+
+test("enforcement with a working storefront is exactly what shipping looks like", () => {
+  const v = checkPaymentConfig({ ...FULL, entitlementEnforced: true });
+  assert.equal(v.enforcementSuppressed, false);
+  assert.deepEqual(v.problems, []);
 });

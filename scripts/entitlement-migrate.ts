@@ -25,6 +25,58 @@
  */
 import { prisma } from "../src/lib/prisma";
 
+/**
+ * Create the indexes the ledger's guarantees rest on, before anything else.
+ *
+ * This is not belt-and-braces, it is the ordering trap. MongoDB creates a
+ * collection implicitly on first insert — WITHOUT any index — so a deploy that
+ * lands before `prisma db push` gets a `TrialClaim` collection with no unique
+ * constraint on `deviceIdHash`. Every claim then succeeds, the anti-farm
+ * protection is silently absent, and by the time anyone notices there are
+ * duplicate rows that make the index impossible to build.
+ *
+ * Doing it here means the operational step is one command that is safe to run
+ * repeatedly, rather than a `db push` someone has to remember to run first.
+ */
+async function ensureIndexes(): Promise<void> {
+  const duplicates = (await prisma.$runCommandRaw({
+    aggregate: "TrialClaim",
+    pipeline: [
+      { $group: { _id: "$deviceIdHash", n: { $sum: 1 } } },
+      { $match: { n: { $gt: 1 } } },
+      { $count: "dupes" },
+    ],
+    cursor: {},
+  })) as { cursor?: { firstBatch?: { dupes?: number }[] } };
+
+  const dupes = duplicates.cursor?.firstBatch?.[0]?.dupes ?? 0;
+  if (dupes > 0) {
+    // Refuse rather than pick a survivor: each duplicate is a machine that got
+    // more than one trial, and which row to keep is a judgement about a real
+    // person's access that a migration script should not make silently.
+    throw new Error(
+      `${dupes} deviceIdHash values already have more than one TrialClaim — the unique index cannot build. ` +
+        `Resolve them by hand (keep the OLDEST claim per machine) and re-run.`,
+    );
+  }
+
+  try {
+    await prisma.$runCommandRaw({
+      createIndexes: "TrialClaim",
+      indexes: [{ key: { deviceIdHash: 1 }, name: "uniq_trialclaim_deviceIdHash", unique: true }],
+    } as unknown as Parameters<typeof prisma.$runCommandRaw>[0]);
+    console.log("[indexes] TrialClaim.uniq_trialclaim_deviceIdHash ready");
+  } catch (err) {
+    // The index IS the anti-farm mechanism. Without it every claim succeeds and
+    // the ledger is decoration, so this failure must stop the run.
+    throw new Error(
+      `could not create the unique index on TrialClaim.deviceIdHash — the trial ledger would enforce NOTHING: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+}
+
 const GRANDFATHER_DAYS = Number.parseInt(process.env.GRANDFATHER_DAYS ?? "30", 10);
 const REASON = "beta-grandfather";
 /** A migration has no human actor. A valid 24-hex ObjectId, deliberately zero. */
@@ -123,6 +175,10 @@ async function main(): Promise<void> {
   if (!Number.isFinite(GRANDFATHER_DAYS) || GRANDFATHER_DAYS <= 0) {
     throw new Error(`GRANDFATHER_DAYS must be a positive number, got ${process.env.GRANDFATHER_DAYS}`);
   }
+  // Always, and first — including on `--revert` and `--dry-run`. The index is
+  // what makes the ledger mean anything, and this script is the one command an
+  // operator is told to run.
+  await ensureIndexes();
   await (revert ? undo() : grandfather());
 }
 

@@ -71,7 +71,7 @@ npm run dev                     # tsx watch, hot reload → http://localhost:878
 | `npm run prisma:push` | `prisma db push` (needs a live DB). |
 | `npm run protection:seed` | Seed the `protection` collection from `data/protection-blocklist.json` (idempotent; never clobbers admin edits). |
 | `npm run device:migrate` | One-off: backfill device columns + create the partial unique indexes for phone binding. |
-| `npm run entitlement:migrate` | Grandfather the pre-paywall cohort with a reversible 30-day comp. `-- --dry-run` counts, `-- --revert` undoes. **Run before flipping `ENTITLEMENT_ENFORCED`.** |
+| `npm run entitlement:migrate` | Creates the `TrialClaim` unique index, then grandfathers the pre-paywall cohort with a reversible 30-day comp. `-- --dry-run` counts, `-- --revert` undoes. **Run BEFORE deploying the ledger** (see below) and before flipping `ENTITLEMENT_ENFORCED`. |
 | `npm run feedback:set-admin` | Grant `User.isAdmin` to an email (feedback-board moderator). |
 | `npm run reconcile:feedback` | Recompute denormalized `voteCount`/`reportCount`. |
 
@@ -396,6 +396,22 @@ on install; run `npx prisma db push` once against the production `DATABASE_URL`
 - [ ] `RESEND_API_KEY` + `RESEND_FROM` — for the addiction-protection partner OTP email.
 - [ ] `CORS_ORIGIN` — the web/admin origins (not `*`) if browser clients call the API. ⚠️ The desktop app is a Tauri webview on the `tauri://localhost` origin — narrow this only after checking it still passes.
 - [ ] Run `npx prisma db push` and `npm run device:migrate` once, and `npm run protection:seed` to load the curated blocklist.
+
+**Deploying the trial ledger — run the migration BEFORE the code:**
+
+MongoDB creates a collection implicitly on first insert, **without any index**.
+A deploy that lands before the migration therefore gets a `TrialClaim` collection
+with no unique constraint on `deviceIdHash`: every claim succeeds, the anti-farm
+protection is silently absent, and by the time anyone notices there are duplicate
+rows that make the index impossible to build.
+
+```bash
+DATABASE_URL="<prod>" npm run entitlement:migrate -- --dry-run   # index + a count, no writes
+DATABASE_URL="<prod>" npm run entitlement:migrate                # index + grandfather
+```
+
+The script refuses to continue if the index cannot be built, because without it
+the ledger enforces nothing.
 
 **Going live with payments — order matters, because the first mistake is unrecoverable:**
 

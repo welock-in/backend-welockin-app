@@ -20,6 +20,7 @@ import { onboardingRouter } from "./routes/onboarding";
 import { checkoutRouter } from "./routes/checkout";
 import { lemonSqueezyWebhookRouter } from "./routes/webhooks-lemonsqueezy";
 import { entitlementRouter } from "./routes/entitlement";
+import { purchasesRouter } from "./routes/purchases";
 import { adminPageHtml } from "./admin/page";
 import { sessionsRouter } from "./routes/sessions";
 import { adminRouter } from "./routes/admin";
@@ -92,6 +93,7 @@ export function createApp(): Express {
   app.use("/api/checkout", checkoutRouter);
   app.use("/api/webhooks/lemonsqueezy", lemonSqueezyWebhookRouter);
   app.use("/api/entitlement", entitlementRouter);
+  app.use("/api/purchases", purchasesRouter);
 
   // Same-origin admin dashboard for the feedback board (gated by admin login;
   // all data/actions require User.isAdmin). Route-scoped CSP relaxes helmet's

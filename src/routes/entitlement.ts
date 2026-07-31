@@ -5,7 +5,6 @@ import { asyncHandler } from "../middleware/async-handler";
 import { accountGone } from "../lib/http-error";
 import {
   LIFETIME_PRODUCT_ID,
-  PLAN,
   TRIAL_DAYS,
   computeEntitlement,
 } from "../lib/entitlement";
@@ -29,16 +28,18 @@ import {
      and `/api/auth/apple` already stamp `User.trialEndsAt` at account
      creation (auth.ts), so every account starts its trial the moment
      it exists. Nothing to claim.
-   · `hasActivePurchase` / `hasRefundedPurchase` are read from
-     `User.plan`, which POST /api/purchases writes after verifying
-     Apple's signature. No Purchase table yet — a String column that
-     main already had is what keeps this migration-free.
+   · `hasActivePurchase` / `hasRefundedPurchase` are hard `false`:
+     StoreKit is not wired and NOTHING writes a Purchase row yet, so
+     the `active` and `refunded` statuses are unreachable today. When
+     StoreKit lands it brings the `Purchase` model and flips these two
+     lines — the resolver's precedence already handles them.
    · `compActive` / `accessRevoked` are hard `false`: the admin
      comp/revoke columns live on the unmerged branch too.
 
-   A user whose trial has elapsed and who has not bought resolves to
-   `expired`. That is now actionable: POST /api/purchases exists, so the
-   paywall has something to sell.
+   The consequence, stated plainly because it decides a rollout: with
+   no purchase path, a user whose trial has elapsed resolves to
+   `expired` forever. That is correct and intended — but it means the
+   client must not hard-gate on this until there is something to buy.
    ───────────────────────────────────────────────────────────── */
 
 export const entitlementRouter = Router();
@@ -49,7 +50,7 @@ entitlementRouter.get(
   asyncHandler(async (req, res) => {
     const user = await prisma.user.findUnique({
       where: { id: req.user!.id },
-      select: { trialEndsAt: true, plan: true },
+      select: { trialEndsAt: true },
     });
     // A valid JWT for a deleted account reaches here (stateless verification).
     if (!user) throw accountGone();

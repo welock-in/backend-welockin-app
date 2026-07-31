@@ -60,6 +60,14 @@ async function ensureIndexes(): Promise<void> {
     );
   }
 
+  if (dryRun) {
+    // A dry run that writes is a trap, even when the write is idempotent: the
+    // whole point of the flag is that someone can point it at production to find
+    // out what WOULD happen.
+    console.log("[indexes] DRY RUN — would create TrialClaim.uniq_trialclaim_deviceIdHash (unique)");
+    return;
+  }
+
   try {
     await prisma.$runCommandRaw({
       createIndexes: "TrialClaim",
@@ -99,22 +107,39 @@ async function audit(action: string, meta: Record<string, unknown>): Promise<voi
     .catch((e) => console.error("[migrate] audit row failed:", e));
 }
 
+/**
+ * Every filter here is RAW MongoDB, and that is not a style choice.
+ *
+ * The accounts this script exists for are precisely the ones that predate the
+ * comp columns, so their documents have no `compActive` field AT ALL — `@default`
+ * on MongoDB is create-time only, and `db push` never rewrites existing
+ * documents. Prisma's `{ not: true }` requires the field to be present, so a
+ * Prisma-native filter matches ZERO of them: the migration would report success,
+ * change nothing, and the operator would flip `ENTITLEMENT_ENFORCED` believing
+ * the cohort was safe. Mongo's `$ne: true` matches missing, null and false, which
+ * is the population actually meant.
+ */
+const CANDIDATES = { compActive: { $ne: true }, accessRevoked: { $ne: true } } as const;
+
+async function countRaw(filter: Record<string, unknown>): Promise<number> {
+  const res = (await prisma.$runCommandRaw({ count: "User", query: filter } as never)) as { n?: number };
+  return res.n ?? 0;
+}
+
+async function updateRaw(filter: Record<string, unknown>, set: Record<string, unknown>) {
+  return (await prisma.$runCommandRaw({
+    update: "User",
+    updates: [{ q: filter, u: { $set: set }, multi: true }],
+  } as never)) as { n?: number; nModified?: number };
+}
+
 async function grandfather(): Promise<void> {
   const now = new Date();
   const compedUntil = new Date(now.getTime() + GRANDFATHER_DAYS * 24 * 60 * 60 * 1000);
 
-  // Everyone who exists NOW and is not already comped. Guarded on compReason so
-  // re-running is a no-op rather than a 30-day extension — a migration that
-  // silently renews itself every time someone runs it is worse than none.
-  const where = {
-    createdAt: { lt: now },
-    compActive: { not: true },
-    accessRevoked: { not: true },
-  } as const;
-
-  const count = await prisma.user.count({ where });
+  const count = await countRaw(CANDIDATES);
   if (count === 0) {
-    console.log("[grandfather] nothing to do — no un-comped accounts.");
+    console.log("[grandfather] nothing to do — every account is already comped or revoked.");
     return;
   }
   if (dryRun) {
@@ -122,19 +147,23 @@ async function grandfather(): Promise<void> {
     return;
   }
 
-  const res = await prisma.user.updateMany({
-    where,
-    data: {
-      compActive: true,
-      compReason: REASON,
-      compedUntil,
-      compedAt: now,
-      compedByAdminId: SYSTEM_ACTOR,
-    },
+  const res = await updateRaw(CANDIDATES, {
+    compActive: true,
+    compReason: REASON,
+    compedUntil: { $date: compedUntil.toISOString() },
+    compedAt: { $date: now.toISOString() },
+    compedByAdminId: SYSTEM_ACTOR,
   });
 
-  await audit("grandfather", { count: res.count, compedUntil: compedUntil.toISOString(), days: GRANDFATHER_DAYS });
-  console.log(`[grandfather] comped ${res.count} accounts until ${compedUntil.toISOString()}`);
+  const modified = res.nModified ?? 0;
+  // Never report success on a no-op. A migration that quietly matches nothing is
+  // the failure this whole script is guarding against — see CANDIDATES.
+  if (modified !== count) {
+    console.error(`⚠️  expected to comp ${count} accounts but modified ${modified}. DO NOT enable enforcement.`);
+  }
+
+  await audit("grandfather", { count: modified, compedUntil: compedUntil.toISOString(), days: GRANDFATHER_DAYS });
+  console.log(`[grandfather] comped ${modified} accounts until ${compedUntil.toISOString()}`);
   console.log(
     `⚠️  Every one of them expires on that date. Schedule the follow-up BEFORE it, ` +
       `or the cliff simply moved ${GRANDFATHER_DAYS} days.`,
@@ -144,9 +173,9 @@ async function grandfather(): Promise<void> {
 async function undo(): Promise<void> {
   // ONLY rows this script wrote. A comp granted by support for a real reason must
   // survive a revert — that is what makes the reason field load-bearing.
-  const where = { compActive: true, compReason: REASON } as const;
+  const mine = { compActive: true, compReason: REASON } as const;
 
-  const count = await prisma.user.count({ where });
+  const count = await countRaw(mine);
   if (count === 0) {
     console.log("[revert] nothing to do — no grandfathered accounts.");
     return;
@@ -156,19 +185,19 @@ async function undo(): Promise<void> {
     return;
   }
 
-  const res = await prisma.user.updateMany({
-    where,
-    data: {
-      compActive: false,
-      compReason: null,
-      compedUntil: null,
-      compedAt: null,
-      compedByAdminId: null,
-    },
+  // Set rather than unset, so the fields now EXIST as false/null — which is what
+  // makes a second grandfather run able to find them again. A revert that left
+  // the documents un-matchable would be a one-way door wearing a two-way sign.
+  const res = await updateRaw(mine, {
+    compActive: false,
+    compReason: null,
+    compedUntil: null,
+    compedAt: null,
+    compedByAdminId: null,
   });
 
-  await audit("grandfather_revert", { count: res.count });
-  console.log(`[revert] cleared the grandfather comp on ${res.count} accounts`);
+  await audit("grandfather_revert", { count: res.nModified ?? 0 });
+  console.log(`[revert] cleared the grandfather comp on ${res.nModified ?? 0} accounts`);
 }
 
 async function main(): Promise<void> {

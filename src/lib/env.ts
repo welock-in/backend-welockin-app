@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -36,6 +37,33 @@ function requiredSecret(name: string, devFallback: string): string {
 }
 
 const jwtSecret = requiredSecret("JWT_SECRET", "change-me");
+
+/**
+ * The server-only key behind the TrialClaim ledger's device hashes.
+ *
+ * Deliberately NOT `required()`. Every claim in the ledger is keyed with this
+ * value, so a deploy that boots without it would be bad — but a deploy that
+ * refuses to boot at all is worse, and this key is needed by exactly one feature
+ * on a backend that also runs focus sessions, notifications and blocking. So an
+ * unset pepper is DERIVED from the JWT secret rather than fatal: domain-separated
+ * so it is never literally the signing key, and always present because
+ * `JWT_SECRET` already fails the boot closed in production.
+ *
+ * Set an explicit one anyway. The derived value is tied to `JWT_SECRET`, so
+ * rotating that — a thing you would otherwise do freely — silently orphans every
+ * claim and re-opens the trial farm. An explicit pepper decouples the two.
+ */
+function resolveTrialPepper(): string {
+  const explicit = process.env.TRIAL_LEDGER_PEPPER;
+  if (explicit) return explicit;
+  if (isProduction) {
+    console.warn(
+      "[env] TRIAL_LEDGER_PEPPER is not set — deriving one from JWT_SECRET. " +
+        "Rotating JWT_SECRET will orphan every TrialClaim and re-open the trial farm.",
+    );
+  }
+  return createHmac("sha256", jwtSecret).update("welockin/trial-ledger-pepper/v1").digest("hex");
+}
 
 export const env = {
   port: Number.parseInt(process.env.PORT ?? "8787", 10),
@@ -118,6 +146,21 @@ export const env = {
    * the resolver computes, only what the client is allowed to do about it.
    */
   entitlementEnforced: (process.env.ENTITLEMENT_ENFORCED ?? "false") === "true",
+
+  // --- The trial ledger (one free trial per machine) -------------------------
+  /** Server-only HMAC key for `TrialClaim.deviceIdHash`. See resolveTrialPepper. */
+  trialLedgerPepper: resolveTrialPepper(),
+  /**
+   * How long a full trial lasts. Snapshotted onto each claim, so changing this
+   * never moves the end date of a window someone is already inside.
+   */
+  trialDays: Number.parseInt(process.env.TRIAL_DAYS ?? "14", 10),
+  /**
+   * The shorter window given to a machine whose identity is resettable — a Mac
+   * whose `IOPlatformUUID` could not be read, so the client fell back to a file
+   * the user can delete. Without this, "make ioreg unreadable" is the bypass.
+   */
+  trialDaysUnverified: Number.parseInt(process.env.TRIAL_DAYS_UNVERIFIED ?? "3", 10),
 };
 
 export type PaymentConfigVerdict = {

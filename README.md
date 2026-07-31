@@ -14,7 +14,8 @@ auth (bcryptjs + jsonwebtoken) · zod validation · helmet + cors · Resend (ema
 
 | Area | Summary |
 |---|---|
-| **Accounts & auth** | Email/password + **Sign in with Apple**, JWT sessions, `plan` (`trial`/`pro`) with a 14-day trial. |
+| **Accounts & auth** | Email/password + **Sign in with Apple**, JWT sessions. |
+| **Entitlement** | Server-authoritative access: a 14-day trial claimed **per machine** (not per account, which would be free), a Lemon Squeezy lifetime licence, admin comps and revocations — resolved by one pure function on the server clock. |
 | **Multi-device sync** | The desktop pushes/pulls its local state (blocklists, focus-session cards, weekly schedules) as one last-write-wins snapshot, plus an idempotent log of completed focus events. |
 | **Devices** | Device registry with a **one-active-phone-per-account** binding (takeover + rebind cooldown), and a desktop device list. |
 | **Analytics** | Weekly focus stats + a consecutive-day streak, per user and (aggregated) for admins. |
@@ -70,6 +71,7 @@ npm run dev                     # tsx watch, hot reload → http://localhost:878
 | `npm run prisma:push` | `prisma db push` (needs a live DB). |
 | `npm run protection:seed` | Seed the `protection` collection from `data/protection-blocklist.json` (idempotent; never clobbers admin edits). |
 | `npm run device:migrate` | One-off: backfill device columns + create the partial unique indexes for phone binding. |
+| `npm run entitlement:migrate` | Grandfather the pre-paywall cohort with a reversible 30-day comp. `-- --dry-run` counts, `-- --revert` undoes. **Run before flipping `ENTITLEMENT_ENFORCED`.** |
 | `npm run feedback:set-admin` | Grant `User.isAdmin` to an email (feedback-board moderator). |
 | `npm run reconcile:feedback` | Recompute denormalized `voteCount`/`reportCount`. |
 
@@ -146,6 +148,24 @@ Both land in the same `Purchase` table, told apart by `provider`.
 > many, and it must never be able to take focus sessions, notifications and
 > blocking down with it.
 
+### The trial ledger (one free trial per machine)
+
+| Var | Default | Purpose |
+|---|---|---|
+| `TRIAL_LEDGER_PEPPER` | *(derived from `JWT_SECRET`)* | Server-only HMAC key for `TrialClaim.deviceIdHash`. **Set it explicitly.** With the derived fallback, rotating `JWT_SECRET` silently orphans every claim and re-opens the trial farm. Rotating this value does the same — treat it as permanent. |
+| `TRIAL_DAYS` | `14` | Trial length. Snapshotted onto each claim, so changing it never moves a window someone is already inside. |
+| `TRIAL_DAYS_UNVERIFIED` | `3` | The window for a machine whose id is **resettable** (a Mac whose `IOPlatformUUID` could not be read, so the client fell back to a deletable file). Without it, breaking the hardware lookup is the bypass. |
+
+A trial belongs to a **machine**, not to an account. Registration used to stamp
+`User.trialEndsAt`, which made a trial exactly as cheap as an email address — and
+`DELETE /api/me` frees the address again, so even the same one could go round
+forever. `TrialClaim.deviceIdHash` is globally unique and the row **outlives the
+account**: deletion nulls `firstUserId` and keeps the claim, so starting over on
+the same Mac lands on the same expired window.
+
+`User.trialEndsAt` is now read-only, honoured for every account created before
+the ledger so none of them loses the window it is inside.
+
 ### Entitlement rollout
 
 | Var | Default | Purpose |
@@ -212,6 +232,8 @@ Collections (`@@map` name in parentheses when different from the model):
 - **ProtectionLock** (`protection_locks`) — per-user lock (`method` `partner`/`date`, `categories`, `otp?`, `otpAttempts?`, `lockedUntil?`).
 - **OnboardingProfile** — one per user; the funnel answers, idempotent on `clientSubmissionId`. `ageBand` (never the exact age), `selfReportedDailyHours`, answer **slugs** (not indices), `revision`, and a rolling-hour write guard. `displayName`/`completedAt` are mirrored onto `User`.
 - **Purchase** — one row per storefront transaction. `@@unique([provider, externalId])` — unique *with* the provider, never alone: two shops number their orders independently, and a collision would hand one customer's licence to another. `isRefunded` is what revokes access.
+- **TrialClaim** — the anti-abuse ledger: one free window per MACHINE. `deviceIdHash` is `@unique` **globally** (not per user, which would be no constraint at all) and is `HMAC-SHA256(TRIAL_LEDGER_PEPPER, deviceId)` — keyed, so a database copy alone cannot be walked back to the machines it names. The row **outlives the account**: `DELETE /api/me` nulls `firstUserId` and keeps the claim. `endsAt` is stamped once and never moves.
+- **AdminAuditLog** — every override that changes what someone may do, with a reason and before/after. Comps and revocations are the two ways a human can outrank the resolver, and an override nobody can explain later is indistinguishable from a mistake.
 - **WebhookEvent** — at-least-once delivery ledger. `@@unique([provider, eventId])`, where `eventId` is `"<event_name>:<order_id>"`. `status` is `processing` → `processed` | `skipped` | `failed`; only the last two are **terminal**. A redelivery finding `processing` or `failed` re-runs the work, because treating mere existence as "done" loses the purchase of anyone whose first delivery died halfway.
 
 > ⚠️ **Both `@@unique` above must exist in the production database before the
@@ -260,11 +282,15 @@ returns `409`/`429`, and no device is ever hidden behind a status.
 
 ### Entitlement — `/api/entitlement` (user JWT)
 
-- **`GET /`** → `200 EntitlementView`. The single authority on "may this user use the app right now, and until when". Read-only.
+- **`POST /trial`** → `200 EntitlementView`. Claim the free trial **for this machine**, from `X-WeLockIn-Device-Id`. Body (all optional): `idfv` (iOS secondary key), `hardwareBacked` (did the client read the id from hardware, or fall back to a deletable file — self-reported, so it can only ever make a claim *weaker*), `clientTime` (recorded as an abuse signal, never used for timing).
+  **Create-only and idempotent**: a caller that already has a claim gets it back, elapsed or not — never a fresh window. The check-then-act gap is closed by the global unique index, not by the read. `400` without a device id. There is deliberately no reset here; that belongs behind the admin surface, with a reason and an audit row.
+  `POST /api/auth/register` and the new-account branch of `/api/auth/apple` also claim, best-effort, so clients that predate this endpoint keep working.
+
+- **`GET /`** → `200 EntitlementView`. The single authority on "may this user use the app right now, and until when". Read-only, and it **never creates a claim** — seeing your status must not be the thing that consumes your trial.
   `{ status, isPro, trialEndsAt, serverTime, trialDurationDays, productId, canStartTrial, enforced }`.
   `status` is one of `trialing` | `active` | `expired` | `refunded` | `comped` | `revoked`, resolved by a pure function (`src/lib/entitlement.ts`) with the precedence **revoked > active purchase > comp > active trial > refunded > expired**.
   The client **must** anchor its countdown to `serverTime`, never to the local clock — a Mac set to 1990 must not extend a trial. `enforced` echoes `ENTITLEMENT_ENFORCED` and is the only field a client may gate on. `404 ACCOUNT_NOT_FOUND` for a valid token whose account is gone.
-  *Not yet reachable:* `comped` and `revoked` need the admin comp/revoke columns, which live on the unmerged branch.
+  The computed status is mirrored onto `User.entitlementStatus` / `isProCached` / `plan` for the admin console — a **cache**, never read back for gating.
 
 ### Checkout — `/api/checkout` (user JWT)
 
@@ -396,9 +422,10 @@ Honest posture (some are intentional product decisions, some are open work):
 - **Partner OTP is stored in plaintext and shown to admins** — *intentional*: it's a friction code (with a 5-try cap), not a credential.
 - **Day-streak analytics use the server timezone (UTC on Vercel)**, so a streak can flip at a different local time than a non-UTC user expects.
 - **App Attest is scaffolded but fail-closed** — `/api/attest/register` always returns `501` and `ATTEST_REQUIRED` must stay `false` until the native verifier is wired. Focus/break counters are binding-protected but forgeable by the account owner until then.
-- **The trial belongs to an ACCOUNT, not a machine — and accounts are free.** `POST /api/auth/register` stamps `trialEndsAt = now + 14d` with no email verification, no device check and no rate limit, so a new address is a new fortnight. `DELETE /api/me` hard-deletes the row, so even the *same* address can re-register. Closing this needs the `TrialClaim` ledger (a globally unique keyed hash of the machine id, surviving account deletion) from the unmerged device work — until it lands, `ENTITLEMENT_ENFORCED` buys a paywall that a re-signup walks around.
+- **`deviceId` is client-supplied, so the trial ledger has a ceiling.** The macOS app derives it from `IOPlatformUUID` (`src-tauri/src/device.rs`), which survives reinstall and disk erase — but it travels in a header, and a patched build can send whatever it likes. The ledger's job is to stop "make another account" from being a bypass, not to be unforgeable. Raising the ceiling further means attestation, which does not exist for Developer-ID macOS apps today.
 - **Nothing server-side is gated on entitlement.** `computeEntitlement` is read by its own route and nothing else: no endpoint refuses service to a non-pro user. Enforcement is entirely the client's decision, which means it is only as strong as the client.
-- **`comped` and `revoked` are unreachable**, so `POST /api/admin/users/:id/suspend` and `.../plan` currently change a column nothing reads — they do **not** take access away.
+- **No admin comp/revoke routes yet.** The columns and the resolver support both, and `npm run entitlement:migrate` writes comps, but `POST /api/admin/users/:id/suspend` and `.../plan` still change columns the resolver does not read — they do **not** take access away.
+- **No trial-claim reset endpoint.** A replaced logic board or a resold Mac currently has no self-service path; it needs a hand-edit until the admin surface lands.
 - **The refund path is all-or-nothing.** Any `order_refunded` revokes the licence, including what Lemon Squeezy classes as a partial refund.
 
 ---

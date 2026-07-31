@@ -1,89 +1,163 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
+import { ledgerHash } from "../lib/hash";
+import { readDeviceId } from "../lib/device";
+import { claimTrial, findClaim } from "../lib/trial-claim";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
-import { accountGone } from "../lib/http-error";
+import { accountGone, badRequest } from "../lib/http-error";
+import { startTrialSchema } from "../validation/schemas";
 import {
   LIFETIME_PRODUCT_ID,
-  TRIAL_DAYS,
   computeEntitlement,
+  type EntitlementView,
 } from "../lib/entitlement";
 
 /* ─────────────────────────────────────────────────────────────
-   GET /api/entitlement — the server's answer to "may this user
-   use the app right now, and until when".
+   The server's answer to "may this user use the app right now,
+   and until when".
 
-   The client caches this offline-first and anchors its countdown to
-   `serverTime`, never to the phone's clock (a phone set to 1990 must
-   not extend a trial). This route is therefore the ONLY authority on
-   when a trial ends; the mobile app mirrors TRIAL_DAYS for paywall
-   copy alone.
+   A trial belongs to a MACHINE, not to an account. That is the
+   whole design, and it is a correction: `POST /api/auth/register`
+   used to stamp `User.trialEndsAt`, which made the trial as cheap
+   as an email address. A new address was a new fortnight, and
+   `DELETE /api/me` freed the old address so even the same one
+   could go round again. The ledger (`TrialClaim`) moves the anchor
+   to something that costs money to duplicate, and OUTLIVES the
+   account so deleting it changes nothing.
 
-   READ-ONLY BY DESIGN, and deliberately narrower than the fuller
-   entitlement service drafted on the `mobile-integration` branch:
+   `User.trialEndsAt` is still read, and only read: every account
+   that existed before the ledger keeps the window it is inside.
 
-   · No `POST /trial`. That endpoint claims a DEVICE-bound trial and
-     needs the `TrialClaim` ledger, which lives in the unmerged device
-     work. Until it lands, `POST /api/auth/register` and `/api/auth/apple`
-     stamp `User.trialEndsAt` at account creation (auth.ts), so a trial
-     belongs to an ACCOUNT rather than to a machine — and accounts are
-     free. That is the known hole, and it is what the ledger closes.
-   · `hasActivePurchase` / `hasRefundedPurchase` are real: the Lemon
-     Squeezy order webhook writes `Purchase` rows, so `active` and
-     `refunded` are reachable statuses.
-   · `compActive` / `accessRevoked` are hard `false`: the admin
-     comp/revoke columns live on the unmerged branch too, so `comped`
-     and `revoked` are the two statuses this route cannot yet produce.
-
-   `enforced` is echoed from ENTITLEMENT_ENFORCED and is the ONLY thing
-   here the client is allowed to gate on. It never changes what is
-   computed below — the status reported is always the true one.
+   The client MUST anchor its countdown to `serverTime`, never to
+   its own clock — a Mac set to 1990 must not extend a trial. This
+   route is the only authority on when a trial ends.
    ───────────────────────────────────────────────────────────── */
 
 export const entitlementRouter = Router();
 
+/**
+ * Resolve effective access on the SERVER clock, and mirror it onto the user row.
+ *
+ * The mirror is a CACHE and never an input: `GET /api/me` and the admin console
+ * read it so they do not each have to re-derive the status, but every gating
+ * decision goes through `computeEntitlement` against the live rows. A cache that
+ * decides access is a bug that only ever shows up in production.
+ */
+export async function resolveAndCache(userId: string, deviceId: string): Promise<EntitlementView> {
+  const now = new Date();
+  const deviceIdHash = deviceId ? ledgerHash(deviceId) : null;
+
+  const [user, purchases, claim] = await Promise.all([
+    prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        trialEndsAt: true,
+        compActive: true,
+        compedUntil: true,
+        accessRevoked: true,
+      },
+    }),
+    prisma.purchase.findMany({ where: { userId }, select: { isRefunded: true } }),
+    // This machine's claim OR this account's, oldest first so a later row can
+    // never rewind the window. Both legs matter, in opposite directions: the
+    // device leg is what stops a second account on one Mac, and the account leg
+    // is what lets someone's SECOND Mac see the trial they are already inside
+    // rather than being handed a fresh one.
+    findClaim(deviceIdHash, userId),
+  ]);
+
+  // A valid JWT for a deleted account reaches here (stateless verification).
+  if (!user) throw accountGone();
+
+  const compActive =
+    user.compActive === true &&
+    (user.compedUntil == null || user.compedUntil.getTime() > now.getTime());
+
+  const view = computeEntitlement({
+    now,
+    hasActivePurchase: purchases.some((p) => !p.isRefunded),
+    // Only decides anything when nothing is live: an active purchase outranks a
+    // refunded one, so someone who bought twice and was refunded once keeps access.
+    hasRefundedPurchase: purchases.some((p) => p.isRefunded),
+    compActive,
+    accessRevoked: user.accessRevoked === true,
+    // The ledger first; the legacy column only for accounts that predate it.
+    trialEndsAt: claim?.endsAt ?? user.trialEndsAt,
+    hasTrialClaim: claim != null || user.trialEndsAt != null,
+    trialDurationDays: claim?.trialDays ?? env.trialDays,
+    productId: LIFETIME_PRODUCT_ID,
+    // Echo-only: the resolver never gates on this, the client does.
+    enforced: env.entitlementEnforced,
+  });
+
+  await cacheOnUser(userId, view, now);
+  return view;
+}
+
+/**
+ * Best-effort denormalisation. Deliberately swallowing failures: this is the one
+ * write on the app's hottest boot-path call, and a cache that could not be
+ * written must never turn a correct answer into a 500.
+ */
+async function cacheOnUser(userId: string, view: EntitlementView, now: Date): Promise<void> {
+  await prisma.user
+    .update({
+      where: { id: userId },
+      data: {
+        entitlementStatus: view.status,
+        isProCached: view.isPro,
+        entitlementUpdatedAt: now,
+        // The legacy column the admin console still renders. It used to be
+        // written once at registration and then go permanently stale — showing
+        // "trial" next to a customer who had paid months ago.
+        plan: view.status,
+      },
+    })
+    .catch(() => undefined);
+}
+
+/**
+ * GET /api/entitlement — read the caller's effective access.
+ *
+ * Reads `X-WeLockIn-Device-Id`. Side-effect free apart from the cache write, and
+ * in particular it NEVER creates a claim: seeing your status must not be the
+ * thing that consumes your trial.
+ */
 entitlementRouter.get(
   "/",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const user = await prisma.user.findUnique({
-      where: { id: req.user!.id },
-      select: { trialEndsAt: true },
-    });
-    // A valid JWT for a deleted account reaches here (stateless verification).
-    if (!user) throw accountGone();
+    res.json(await resolveAndCache(req.user!.id, readDeviceId(req)));
+  }),
+);
 
-    // One query settles both flags. Separate counts would read the same
-    // collection twice on what is the app's hottest boot-path call, and a user
-    // has at most a handful of rows here — this is a lifetime licence, not a
-    // subscription ledger.
-    const purchases = await prisma.purchase.findMany({
-      where: { userId: req.user!.id },
-      select: { isRefunded: true },
-    });
+/**
+ * POST /api/entitlement/trial — claim the free trial for this machine.
+ *
+ * CREATE-ONLY and idempotent. A caller that already has a claim gets the existing
+ * one back, elapsed or not — never a fresh window. There is deliberately no way
+ * to reset a claim from here; that lives behind the admin surface, because the
+ * legitimate cases (a replaced logic board, a resold Mac) need a human and an
+ * audit row, and the illegitimate ones are exactly what this endpoint is for.
+ *
+ * The check-then-act window between "is there a prior claim" and "create one" is
+ * closed by the GLOBAL unique index on `deviceIdHash`, not by the read: two
+ * simultaneous claims for one machine collide in the database rather than both
+ * proceeding.
+ */
+entitlementRouter.post(
+  "/trial",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const userId = req.user!.id;
+    const deviceId = readDeviceId(req);
+    if (!deviceId) throw badRequest("A device id is required to start a trial");
 
-    const view = computeEntitlement({
-      now: new Date(),
-      hasActivePurchase: purchases.some((p) => !p.isRefunded),
-      // Only decides anything when nothing is live: computeEntitlement ranks an
-      // active purchase above a refunded one, so someone who bought twice and was
-      // refunded once keeps their access.
-      hasRefundedPurchase: purchases.some((p) => p.isRefunded),
-      compActive: false,
-      accessRevoked: false,
-      trialEndsAt: user.trialEndsAt,
-      // The account HAS a trial window iff one was ever stamped. Keeping this
-      // honest matters: `canStartTrial` is derived from it, and reporting
-      // "you may start a trial" to a user who is mid-trial would be a lie.
-      hasTrialClaim: user.trialEndsAt != null,
-      trialDurationDays: TRIAL_DAYS,
-      productId: LIFETIME_PRODUCT_ID,
-      // The rollout switch, echoed verbatim. Read here rather than baked into
-      // the resolver so the resolver stays a pure function of the rows.
-      enforced: env.entitlementEnforced,
-    });
+    const opts = startTrialSchema.parse(req.body ?? {});
+    await claimTrial(userId, deviceId, opts);
 
-    res.json(view);
+    res.json(await resolveAndCache(userId, deviceId));
   }),
 );

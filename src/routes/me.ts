@@ -51,6 +51,15 @@ meRouter.delete(
     // Feature requests authored by the user (authorId, not userId) — also cascades.
     await prisma.featureRequest.deleteMany({ where: { authorId: userId } }).catch(() => undefined);
 
+    // The trial claim is UNLINKED, never deleted, and that asymmetry is the whole
+    // anti-abuse story: deleting it would make "delete your account" the reset
+    // button, which is exactly the loop the ledger was built to close. What must
+    // go is the link to a person who asked to be forgotten — the row that stays
+    // behind is a keyed hash of a machine and a date, naming nobody.
+    await prisma.trialClaim
+      .updateMany({ where: { firstUserId: userId }, data: { firstUserId: null } })
+      .catch(() => undefined);
+
     // Break has NO User back-relation, so nothing cascades it: its deletion must
     // actually succeed, or a transient failure would leave rows orphaned to a
     // deleted user — a data-deletion gap. Fail loud (→ 500 → the client retries;

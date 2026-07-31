@@ -214,6 +214,25 @@ export const sessionEndSchema = z.object({
 
 // ── admin console ────────────────────────────────────────────────────────────
 
+/**
+ * `POST /api/entitlement/trial`. Everything is optional: the identity that
+ * matters is the `X-WeLockIn-Device-Id` header, and a client that sends nothing
+ * else still gets a correct answer.
+ */
+export const startTrialSchema = z.object({
+  /** iOS `identifierForVendor`, a secondary correlation key. Absent on macOS. */
+  idfv: z.string().trim().min(1).optional(),
+  /**
+   * Whether the client's device id came from the hardware or from a file it can
+   * delete. Self-reported and therefore not trusted as a grant — only ever used
+   * to make a claim WEAKER (shorter window, flagged), never stronger. Defaults to
+   * false so an old client that omits it is treated as the cautious case.
+   */
+  hardwareBacked: z.boolean().optional(),
+  /** The client's own clock, recorded as an abuse signal. Never used for timing. */
+  clientTime: dateInput.optional(),
+});
+
 export const adminLoginSchema = z.object({
   username: z.string().min(1, "username is required"),
   password: z.string().min(1, "password is required"),

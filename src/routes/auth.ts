@@ -13,7 +13,8 @@ import {
   verifyAppleIdentityToken,
 } from "../lib/apple";
 import { deterministicObjectId } from "../lib/deterministic-id";
-import { TRIAL_DAYS } from "../lib/entitlement";
+import { readDeviceId } from "../lib/device";
+import { claimTrialOnSignup } from "../lib/trial-claim";
 
 const BCRYPT_ROUNDS = 10;
 
@@ -33,16 +34,26 @@ authRouter.post(
     }
 
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    const trialEndsAt = new Date(Date.now() + TRIAL_DAYS * 24 * 60 * 60 * 1000);
 
+    // NO trial is stamped on the ACCOUNT any more. Registration used to hand out
+    // fourteen days, which made a trial exactly as cheap as an email address —
+    // and `DELETE /api/me` frees the address again, so even the same one could go
+    // round forever. The window is claimed per MACHINE now, against a ledger that
+    // outlives the account.
     const user = await prisma.user.create({
       data: {
         email,
         passwordHash,
         plan: "trial",
-        trialEndsAt,
       },
     });
+
+    // Claimed HERE as well as from `POST /api/entitlement/trial`, because no
+    // shipped client knows about that endpoint yet: leaving the claim to it alone
+    // would mean every account created by a current build resolved `expired` from
+    // its first second. Best-effort — a ledger write must never cost someone the
+    // account they just made.
+    await claimTrialOnSignup(user.id, readDeviceId(req));
 
     const token = signToken({ sub: user.id, email: user.email });
     res.status(201).json({ token, user: toPublicUser(user) });
@@ -123,13 +134,12 @@ authRouter.post(
           });
           user = existing;
         } else {
-          const trialEndsAt = new Date(Date.now() + TRIAL_DAYS * 24 * 60 * 60 * 1000);
+          // Same as /register: no trial is stamped on the account. See the note there.
           user = await prisma.user.create({
             data: {
               email,
               emailVerified: true,
               plan: "trial",
-              trialEndsAt,
               authProviders: {
                 create: {
                   id: providerId,
@@ -178,6 +188,11 @@ authRouter.post(
         }
       }
     }
+
+    // Only a genuinely new account claims: signing in again, or linking Apple to
+    // an existing account, must not look like a first run. `claimTrial` would
+    // return the existing claim anyway — this just avoids the write.
+    if (created) await claimTrialOnSignup(user.id, readDeviceId(req));
 
     const token = signToken({ sub: user.id, email: user.email });
     res.status(created ? 201 : 200).json({ token, user: toPublicUser(user) });

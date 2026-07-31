@@ -13,13 +13,15 @@
  * stays unit-testable.
  */
 
-/**
- * Trial length, in days. THE source of truth: `POST /api/auth/*` stamps
- * `User.trialEndsAt` with it at account creation, and `GET /api/entitlement`
- * reports it. The mobile client mirrors it in `src/lib/onboarding.ts` for the
- * paywall copy ONLY — a client never computes when a trial ends, it asks.
+/*
+ * Trial length used to live here as `TRIAL_DAYS`, read by `POST /api/auth/*` to
+ * stamp `User.trialEndsAt` at account creation. It moved to `env.trialDays`
+ * along with the thing it measures: a trial is now claimed by a MACHINE, and its
+ * length is snapshotted onto the `TrialClaim` at claim time so that changing the
+ * product's offer never moves the end date of a window someone is inside.
+ *
+ * A client never computes when a trial ends. It asks.
  */
-export const TRIAL_DAYS = 14;
 
 /** The App Store product the paywall sells. Not yet wired to StoreKit. */
 export const LIFETIME_PRODUCT_ID = "in.welock.app.lifetime";

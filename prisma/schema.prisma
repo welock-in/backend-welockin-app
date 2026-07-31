@@ -6,7 +6,7 @@
 // replica set.
 
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
   // "native" for local dev. The rhel targets cover the Vercel/AWS Lambda
   // runtime: Node 20+ (Amazon Linux 2023) uses openssl-3.0.x, Node 18
   // (Amazon Linux 2) uses openssl-1.0.x. Bundling both means the client works
@@ -20,17 +20,50 @@ datasource db {
 }
 
 model User {
-  id           String    @id @default(auto()) @map("_id") @db.ObjectId
+  id            String    @id @default(auto()) @map("_id") @db.ObjectId
   // Apple supplies a verified real or private-relay email on first consent.
   // Keeping this required preserves the existing PC contract and avoids the
   // single-null limitation of a MongoDB unique index.
-  email        String    @unique
-  passwordHash String?
+  email         String    @unique
+  passwordHash  String?
   // Password registrations are unverified until an email-verification flow is
   // completed. Apple users are created with a verified token email.
-  emailVerified Boolean? @default(false)
-  plan         String    @default("trial")
-  trialEndsAt  DateTime?
+  emailVerified Boolean?  @default(false)
+  plan          String    @default("trial")
+  /// LEGACY, read-only. Every account created before the TrialClaim ledger
+  /// carries the 14-day window that `POST /api/auth/register` used to stamp.
+  /// Nothing writes it any more: a trial now belongs to a MACHINE, not to an
+  /// account, because an account costs nothing to make and a machine does not.
+  /// The resolver still reads it, so no existing user loses the window they are
+  /// inside — but a new account never gets one from here.
+  trialEndsAt   DateTime?
+
+  // --- Entitlement overrides & cache -----------------------------------------
+  // ALL OPTIONAL, like every column added after launch: on MongoDB `@default` is
+  // a create-time default only and `db push` never rewrites existing documents,
+  // so a REQUIRED field would make Prisma throw on every legacy user.
+  //
+  // The comp/revoke pair are AUTHORITATIVE INPUTS to the resolver. The three
+  // cache columns are a mirror of what it computed, for the admin console and
+  // for `GET /api/me` — never read back for gating, because a stale cache that
+  // decides access is a bug that only shows up in production.
+  entitlementStatus    String? // "trialing"|"active"|"expired"|"refunded"|"comped"|"revoked"
+  isProCached          Boolean?  @default(false)
+  entitlementUpdatedAt DateTime?
+
+  /// Admin comp: a lifetime grant (`compedUntil` null) or a time-boxed one —
+  /// also how support extends a trial, and how the whole existing cohort is
+  /// grandfathered before the paywall is switched on.
+  compActive            Boolean?  @default(false)
+  compReason            String?
+  compedUntil           DateTime?
+  compedByAdminId       String?   @db.ObjectId
+  compedAt              DateTime?
+  /// Admin hard revoke (ToS breach, chargeback). Outranks everything, including
+  /// a live purchase — see the resolver's precedence.
+  accessRevoked         Boolean?  @default(false)
+  revokedReason         String?
+  revokedAt             DateTime?
   // Admin gate for the feedback board (moderation, status changes). We gate on
   // this column, NOT an email allowlist: Sign in with Apple + Private Relay puts
   // an @privaterelay.appleid.com email in the JWT, so an email allowlist would
@@ -38,10 +71,10 @@ model User {
   // default only and `db push` never rewrites existing docs — a REQUIRED field
   // would make Prisma throw when reading any legacy user (locking out login).
   // Optional → legacy docs read back as null, and every check is `!user?.isAdmin`.
-  isAdmin      Boolean?  @default(false)
+  isAdmin               Boolean?  @default(false)
   // Account moderation state, set from the admin console: "active" | "suspended".
   // Optional so documents written before this field existed still read cleanly.
-  status       String?   @default("active")
+  status                String?   @default("active")
   // --- Onboarding funnel (denormalized cache; OnboardingProfile is the truth) ---
   // BOTH OPTIONAL on purpose: on MongoDB `@default` is a create-time default only
   // and `db push` never rewrites existing docs — a REQUIRED field would make
@@ -57,16 +90,16 @@ model User {
   // local flag / an active entitlement rather than re-running the funnel.
   onboardingCompletedAt DateTime?
 
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   devices         Device[]
   focusInvites    FocusInvite[]
   focusEvents     FocusEvent[]
   snapshot        SyncSnapshot?
   authProviders   AuthProvider[]
-  featureRequests FeatureRequest[] @relation("UserFeatureRequests")
-  votes           Vote[]           @relation("UserVotes")
+  featureRequests FeatureRequest[]   @relation("UserFeatureRequests")
+  votes           Vote[]             @relation("UserVotes")
   liveSessions    LiveSession[]
   protectionLock  ProtectionLock?
   pushTokens      PushToken[]
@@ -82,35 +115,35 @@ model User {
 // `lastHeartbeatAt` is older than the staleness window is treated as ended
 // (the client crashed / went offline without a clean stop).
 model LiveSession {
-  id            String   @id @default(auto()) @map("_id") @db.ObjectId
-  userId        String   @db.ObjectId
-  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id              String    @id @default(auto()) @map("_id") @db.ObjectId
+  userId          String    @db.ObjectId
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   // Stable client device id (e.g. "win-<MachineGuid>").
-  deviceId      String
+  deviceId        String
   // Client session id (the desktop's per-session id). A device runs UP TO TWO
   // sessions at once (a manual "Start Focus" + a scheduled one), so a device has
   // one LiveSession row PER session, not per device. Optional so rows written by
   // the earlier one-per-device version still read back (they expire quickly). The
   // row `id` is deterministic from (user, device, session).
-  sessionId     String?
-  deviceName    String?
-  platform      String? // "windows" | "macos" | "android" | "ios" | "ipados"
-  name          String // session title
-  phase         String   @default("running") // "running" | "break"
-  hardLock      Boolean  @default(false)
-  totalSeconds  Int      @default(0)
-  remainSeconds Int      @default(0)
-  killedTotal   Int      @default(0)
-  appsCount     Int      @default(0)
-  sitesCount    Int      @default(0)
-  originEventId String? // schedule block id that auto-started it, if any
-  startedAt     DateTime
-  endsAt        DateTime? // predicted end (now + remaining)
+  sessionId       String?
+  deviceName      String?
+  platform        String? // "windows" | "macos" | "android" | "ios" | "ipados"
+  name            String // session title
+  phase           String    @default("running") // "running" | "break"
+  hardLock        Boolean   @default(false)
+  totalSeconds    Int       @default(0)
+  remainSeconds   Int       @default(0)
+  killedTotal     Int       @default(0)
+  appsCount       Int       @default(0)
+  sitesCount      Int       @default(0)
+  originEventId   String? // schedule block id that auto-started it, if any
+  startedAt       DateTime
+  endsAt          DateTime? // predicted end (now + remaining)
   // Admin "force end" signal: set true from the console; the client stops the
   // session (overriding a hard lock) on its next heartbeat and deletes the row.
-  forceEnd      Boolean  @default(false)
-  lastHeartbeatAt DateTime @default(now())
-  createdAt     DateTime @default(now())
+  forceEnd        Boolean   @default(false)
+  lastHeartbeatAt DateTime  @default(now())
+  createdAt       DateTime  @default(now())
 
   @@index([userId, deviceId])
   @@index([lastHeartbeatAt])
@@ -131,31 +164,31 @@ model AuthProvider {
 }
 
 model Device {
-  id         String   @id @default(auto()) @map("_id") @db.ObjectId
-  userId     String   @db.ObjectId
-  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  name       String
-  platform   String // OS: "windows" | "macos" | "android" | "ios" | "ipados"
-  kind       String? // form factor: "desktop" | "phone" | "tablet"
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId        String   @db.ObjectId
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name          String
+  platform      String // OS: "windows" | "macos" | "android" | "ios" | "ipados"
+  kind          String? // form factor: "desktop" | "phone" | "tablet"
   // The real cross-platform identity key, REQUIRED at the API boundary (see
   // validation/schemas.ts). Nullable only because pre-refactor rows exist that
   // never carried one — they are leftovers to clean up, not a supported case.
   // Convergence under concurrent registration comes from the `uniq_user_deviceId`
   // partial index plus the duplicate-key retry in routes/devices.ts.
-  deviceId   String?
-  model      String?
-  osVersion  String?
-  appVersion String?
-  pushToken  String? // APNs token (mobile push)
+  deviceId      String?
+  model         String?
+  osVersion     String?
+  appVersion    String?
+  pushToken     String? // APNs token (mobile push)
   // The one-active-phone binding (status / boundAt / supersededAt / lastRebindAt
   // / idfv) was removed: changing devices is not something WeLockIn polices, and
   // the cooldown it powered was bypassable with a DELETE + POST anyway. Existing
   // documents may still carry those keys; Prisma simply ignores them.
   attestKeyId   String? // App Attest key id (base64)
   attestPubKey  Bytes? //  App Attest public key (raw/DER), set at key registration
-  attestCounter Int?      @default(0) // strictly-increasing App Attest assertion counter (anti-replay)
-  lastSeenAt DateTime @default(now())
-  createdAt  DateTime @default(now())
+  attestCounter Int?     @default(0) // strictly-increasing App Attest assertion counter (anti-replay)
+  lastSeenAt    DateTime @default(now())
+  createdAt     DateTime @default(now())
 
   // NOTE: (userId, name) is intentionally NON-unique — two iPhones both report
   // "iPhone" to unentitled apps, and every Mac used to report "Mac". Uniqueness is
@@ -185,7 +218,7 @@ model FocusInvite {
   toDeviceId     String
 
   sessionName String?
-  hardLock    Boolean @default(false)
+  hardLock    Boolean  @default(false)
   // Absolute end of the origin session. A device that wakes up late joins for
   // the REMAINING time; an invite whose endsAt has passed is simply ignored.
   endsAt      DateTime
@@ -275,23 +308,23 @@ enum FeatureRequestStatus {
 }
 
 model FeatureRequest {
-  id           String               @id @default(auto()) @map("_id") @db.ObjectId
-  authorId     String               @db.ObjectId
-  author       User                 @relation("UserFeatureRequests", fields: [authorId], references: [id], onDelete: Cascade)
-  title        String
-  body         String               @default("")
-  status       FeatureRequestStatus @default(open)
-  voteCount    Int                  @default(0) // denormalized; recomputed as count(votes) on every vote write
-  commentCount Int                  @default(0) // reserved — comment routes are out of MVP scope
-  hidden       Boolean              @default(false) // moderation: hidden rows never appear in GET /
-  reportCount  Int                  @default(0)
+  id              String               @id @default(auto()) @map("_id") @db.ObjectId
+  authorId        String               @db.ObjectId
+  author          User                 @relation("UserFeatureRequests", fields: [authorId], references: [id], onDelete: Cascade)
+  title           String
+  body            String               @default("")
+  status          FeatureRequestStatus @default(open)
+  voteCount       Int                  @default(0) // denormalized; recomputed as count(votes) on every vote write
+  commentCount    Int                  @default(0) // reserved — comment routes are out of MVP scope
+  hidden          Boolean              @default(false) // moderation: hidden rows never appear in GET /
+  reportCount     Int                  @default(0)
   // Idempotency key for create retries (offline replay of the same POST). Every
   // FeatureRequest is created with one; the compound unique below makes a retried
   // POST return the existing row instead of inserting a duplicate. This is a NEW
   // model so every row has a non-null value — the @@unique is safe on `db push`.
   clientRequestId String
-  createdAt    DateTime             @default(now())
-  updatedAt    DateTime             @updatedAt
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
 
   votes   Vote[]
   reports FeatureReport[]
@@ -481,24 +514,24 @@ model OnboardingProfile {
 
   // Which funnel produced the ORIGINAL record. Immutable after the first
   // submission — it is the audit anchor for the answers below.
-  funnelVersion String
+  funnelVersion          String
   // Idempotency key, minted client-side once per completed funnel run (and once
   // per later edit). Stored for REPLAY CLASSIFICATION only, never indexed: the
   // natural key of a 1:1 resource is userId, and Prisma creates plain non-sparse
   // unique indexes on MongoDB, so a nullable `@unique` would E11000 on the second
   // row that omits the value.
-  clientSubmissionId String
+  clientSubmissionId     String
   // The name the user asked to be called (screen 1). Mirrored onto User.
-  displayName        String?
+  displayName            String?
   // "16_17" | "18_24" | "25_34" | "35_44" | "45_plus". The declared age is
   // validated then REDUCED to this band; the exact integer is never persisted
   // (data minimisation — a non-null band is also the evidence the gate ran).
-  ageBand            String
+  ageBand                String
   // Stable answer slugs, NOT indices (option lists churn; indices silently
   // corrupt on insertion) and NOT Prisma enums (a new option would need a
   // `db push` on the live cluster). Unknown slugs are stored verbatim.
-  profileSlug        String? // e.g. "founder_or_freelancer"
-  goalSlug           String? // e.g. "focus_better"
+  profileSlug            String? // e.g. "founder_or_freelancer"
+  goalSlug               String? // e.g. "focus_better"
   // SELF-DECLARED distractions from a fixed list — NOT the FamilyControls
   // selection (those tokens are opaque and never leave the device). Order is the
   // user's tap order, because screen 12 renders the first three.
@@ -536,12 +569,12 @@ model OnboardingProfile {
 // Squeezy. Both land here, told apart by `provider`, so entitlement stays one
 // rule instead of one rule per shop.
 model Purchase {
-  id       String @id @default(auto()) @map("_id") @db.ObjectId
-  userId   String @db.ObjectId
-  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  provider String // "lemonsqueezy" | "adapty"
-  store    String // "lemonsqueezy" | "app_store" | "play_store"
-  productId String
+  id          String    @id @default(auto()) @map("_id") @db.ObjectId
+  userId      String    @db.ObjectId
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider    String // "lemonsqueezy" | "adapty"
+  store       String // "lemonsqueezy" | "app_store" | "play_store"
+  productId   String
   /// The storefront's own id for this transaction, stable across replay and
   /// refund. Unique WITH the provider, never alone: two shops number their orders
   /// independently, so an Adapty transaction id and a Lemon Squeezy order id can
@@ -552,9 +585,9 @@ model Purchase {
   isRefunded  Boolean   @default(false)
   refundedAt  DateTime?
   /// Kept for support and for replaying a delivery we mishandled.
-  rawEvent  Json?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  rawEvent    Json?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
   @@unique([provider, externalId])
   @@index([userId])
@@ -563,12 +596,12 @@ model Purchase {
 // Every webhook delivery we accepted, recorded before it is acted on so a payload
 // we mishandle is still on disk to be replayed once the handling is fixed.
 model WebhookEvent {
-  id       String @id @default(auto()) @map("_id") @db.ObjectId
-  provider String
+  id          String    @id @default(auto()) @map("_id") @db.ObjectId
+  provider    String
   /// Dedupe key. Unique per provider so two shops cannot shadow each other.
-  eventId String
-  type    String
-  payload Json
+  eventId     String
+  type        String
+  payload     Json
   /// "processing" while the work is in flight, then "processed" | "skipped" |
   /// "failed". A retry that finds a row still "processing" or "failed" re-runs the
   /// work: treating mere existence as done loses the purchase of anyone whose
@@ -580,4 +613,85 @@ model WebhookEvent {
   processedAt DateTime?
 
   @@unique([provider, eventId])
+}
+
+/// The anti-abuse ledger: one free trial per MACHINE, forever.
+///
+/// This model exists because the previous answer — stamping `User.trialEndsAt`
+/// at registration — tied the trial to an account, and an account is free,
+/// unverified and unlimited. A new email was a new fortnight, and `DELETE
+/// /api/me` freed the old email so even the SAME address could go round again.
+///
+/// So the natural key is the machine, and the row deliberately OUTLIVES the
+/// account: `firstUserId` is nulled when a user is deleted, the claim is not.
+/// Deleting your account and starting over lands on the same expired window.
+///
+/// `deviceIdHash` is `HMAC-SHA256(TRIAL_LEDGER_PEPPER, deviceId)` — keyed, not a
+/// plain digest, and the raw device id is never stored here. The pepper lives in
+/// the environment and never in Mongo, so a database copy alone cannot be walked
+/// back to the machines it describes. Rotating the pepper orphans every claim
+/// and re-opens the farm; treat it as permanent.
+model TrialClaim {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  /// THE key, and GLOBALLY unique — not unique per user, which would be no
+  /// constraint at all. It is also the concurrency lock: two simultaneous claims
+  /// for one machine collide here rather than racing check-then-act.
+  deviceIdHash String  @unique
+  /// Secondary correlation for iOS (`identifierForVendor`), where the client
+  /// device id is resettable. Null on macOS, whose id is hardware-derived.
+  idfvHash     String?
+
+  /// Who claimed it first. NULLED on account deletion — the claim survives, the
+  /// link to a deleted person does not.
+  firstUserId String?   @db.ObjectId
+  /// Snapshot of TRIAL_DAYS when the claim was made, so changing the product's
+  /// trial length never retroactively lengthens or shortens someone's window.
+  trialDays   Int?
+  startedAt   DateTime?
+  /// Server wall clock, stamped ONCE. Immutable: nothing in the system may move
+  /// a trial's end, which is the entire point of writing it down.
+  endsAt      DateTime?
+  status      String?   @default("active") // "active"|"expired"|"converted"
+
+  /// Abuse signals, recorded but never acted on automatically — they exist so a
+  /// human reviewing a suspicious account has something to look at.
+  ///
+  /// `hardwareBacked: false` means the Mac could not read IOPlatformUUID and the
+  /// client fell back to a file it can delete. That is a resettable identity, so
+  /// such a claim is flagged and given a short window rather than the full one.
+  hardwareBacked Boolean? @default(true)
+  flagged        Boolean? @default(false)
+  /// Difference between the client's clock and ours at claim time. A machine set
+  /// years into the future is not evidence of anything on its own, since the
+  /// server owns the countdown — but a pattern of it is.
+  clockSkewMs    Int?
+  skewStrikes    Int?     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([idfvHash])
+  @@index([firstUserId])
+}
+
+/// Every admin action that changes what someone may do, with a reason.
+///
+/// Comps and revocations are the two ways a human can override the resolver, and
+/// an override nobody can explain later is indistinguishable from a mistake — so
+/// the reason is required at the route and the before/after are kept.
+model AdminAuditLog {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  actorId      String   @db.ObjectId
+  actorEmail   String?
+  action       String // "comp"|"revoke"|"extend_trial"|"reset_trial"|"grandfather"
+  targetUserId String?  @db.ObjectId
+  reason       String?
+  before       Json?
+  after        Json?
+  meta         Json?
+  createdAt    DateTime @default(now())
+
+  @@index([targetUserId, createdAt])
+  @@index([actorId, createdAt])
 }

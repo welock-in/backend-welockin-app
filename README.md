@@ -117,6 +117,43 @@ project's environment settings.
 | `RESEND_API_KEY` | *(empty)* | Resend key. Email is a logged **no-op** while empty. |
 | `RESEND_FROM` | `WeLockin <protection@welock.in>` | Verified sender (domain must be verified in Resend). |
 
+### Payments — Lemon Squeezy (desktop lifetime licence)
+
+macOS and Windows ship outside the App Store, so no store IAP is imposed and
+none is possible; iOS keeps going through Adapty because Apple requires it.
+Both land in the same `Purchase` table, told apart by `provider`.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `LEMONSQUEEZY_API_KEY` | *(empty)* | Used by `POST /api/checkout` to mint a checkout. **Test vs live is decided by which key this is** — a test key can only ever create test checkouts. |
+| `LEMONSQUEEZY_WEBHOOK_SECRET` | *(empty)* | Signing secret of the webhook, set when you create it in the dashboard. Verification **fails closed** while empty: every delivery is rejected. |
+| `LEMONSQUEEZY_STORE_ID` | *(empty)* | Your store. An order from any other store is refused. |
+| `LEMONSQUEEZY_VARIANT_ID` | *(empty)* | **The one variant we sell.** Unset means *sell nothing*, never *sell everything* — a signature only proves the delivery is ours, not that the buyer bought the licence. |
+| `LEMONSQUEEZY_API_BASE` | `https://api.lemonsqueezy.com` | Override for tests. |
+| `LEMONSQUEEZY_ALLOW_TEST_MODE` | `false` | May a **test-mode** order grant a real lifetime licence? Requires the literal `"true"`, and is deliberately *not* inferred from `NODE_ENV` — which is unset on more machines than anyone expects, and every one of those would have failed open into a free-licence tap. |
+
+> **All-or-nothing.** The four required vars are validated together at boot
+> (`checkPaymentConfig`, `src/lib/env.ts`). Setting **none** is fine — the deploy
+> simply cannot sell, and `POST /api/checkout` answers 400. Setting **some** is
+> fatal, because it fails toward lost money: with an API key but no webhook
+> secret the payment page mints fine and every delivery back is rejected as
+> unsigned, so the customer is charged and no licence is ever granted.
+
+### Entitlement rollout
+
+| Var | Default | Purpose |
+|---|---|---|
+| `ENTITLEMENT_ENFORCED` | `false` | Whether clients may **hard-gate** on the entitlement they are told. Echoed by `GET /api/entitlement` as `enforced` and used nowhere else server-side. |
+
+The server *always* reports the true status; this only says whether the client
+may act on it. It exists because the day the paywall ships, every account whose
+trial quietly elapsed months ago turns `expired` at once — gating on status alone
+would lock all of them out in a single update, with no way to stage it.
+
+Turning it on also requires a configured storefront: boot fails if it is `true`
+while Lemon Squeezy is unconfigured, because a paywall nobody can pay through is
+worse than no paywall.
+
 ---
 
 ## Architecture
@@ -164,6 +201,14 @@ Collections (`@@map` name in parentheses when different from the model):
 - **FeatureRequest / Vote / FeatureReport** — feedback board (idempotency keys, denormalized counts, auto-hide at 3 reports).
 - **ProtectionEntry** (`protection`) — one curated blocklist entry (`category`, `kind` `site`/`app`, normalized `value`, `active`), `@@unique([kind, value])`.
 - **ProtectionLock** (`protection_locks`) — per-user lock (`method` `partner`/`date`, `categories`, `otp?`, `otpAttempts?`, `lockedUntil?`).
+- **OnboardingProfile** — one per user; the funnel answers, idempotent on `clientSubmissionId`. `ageBand` (never the exact age), `selfReportedDailyHours`, answer **slugs** (not indices), `revision`, and a rolling-hour write guard. `displayName`/`completedAt` are mirrored onto `User`.
+- **Purchase** — one row per storefront transaction. `@@unique([provider, externalId])` — unique *with* the provider, never alone: two shops number their orders independently, and a collision would hand one customer's licence to another. `isRefunded` is what revokes access.
+- **WebhookEvent** — at-least-once delivery ledger. `@@unique([provider, eventId])`, where `eventId` is `"<event_name>:<order_id>"`. `status` is `processing` → `processed` | `skipped` | `failed`; only the last two are **terminal**. A redelivery finding `processing` or `failed` re-runs the work, because treating mere existence as "done" loses the purchase of anyone whose first delivery died halfway.
+
+> ⚠️ **Both `@@unique` above must exist in the production database before the
+> first real order.** They are not decoration — they *are* the idempotency and the
+> concurrency lock. `npx prisma db push` creates them; verify with
+> `db.purchases.getIndexes()` / `db.webhookevents.getIndexes()`.
 
 ---
 
@@ -203,6 +248,27 @@ returns `409`/`429`, and no device is ever hidden behind a status.
 - **`POST /heartbeat`** — refresh `lastSeenAt` for the device in `X-WeLockIn-Device-Id`. Throttled to one write per 5 min. → `204`; `404` if the header is missing or the device is unknown.
 - **`GET /`** → `200 { devices: PublicDevice[] }` — an allow-listed projection: `id, deviceId, name, platform, kind, model, osVersion, appVersion, lastSeenAt, createdAt, isCurrent`. `isCurrent` is computed server-side from `X-WeLockIn-Device-Id`. No `max`, and no status filter.
 - **`DELETE /:deviceId`** — remove a device by client `deviceId`, scoped to the caller's account. Any of your devices, not just the calling one. → `200 { removed }`, or `404` when nothing matched.
+
+### Entitlement — `/api/entitlement` (user JWT)
+
+- **`GET /`** → `200 EntitlementView`. The single authority on "may this user use the app right now, and until when". Read-only.
+  `{ status, isPro, trialEndsAt, serverTime, trialDurationDays, productId, canStartTrial, enforced }`.
+  `status` is one of `trialing` | `active` | `expired` | `refunded` | `comped` | `revoked`, resolved by a pure function (`src/lib/entitlement.ts`) with the precedence **revoked > active purchase > comp > active trial > refunded > expired**.
+  The client **must** anchor its countdown to `serverTime`, never to the local clock — a Mac set to 1990 must not extend a trial. `enforced` echoes `ENTITLEMENT_ENFORCED` and is the only field a client may gate on. `404 ACCOUNT_NOT_FOUND` for a valid token whose account is gone.
+  *Not yet reachable:* `comped` and `revoked` need the admin comp/revoke columns, which live on the unmerged branch.
+
+### Checkout — `/api/checkout` (user JWT)
+
+- **`POST /`** → `201 { url }`. Mints a Lemon Squeezy checkout **server-side** and returns its URL for the desktop app to open in the real browser.
+  Minting it here is the whole point: the webhook credits whoever `meta.custom_data.user_id` names, so if the app built that URL the *buyer* would be choosing which account gets the licence. The id comes from the caller's own token, before the payment page exists.
+  `409` when the account already owns a live licence (a lifetime SKU bought twice costs us the fee and them the goodwill). `400` when the storefront is unconfigured or the provider is unreachable — never echoing the upstream error, which can quote the API key back.
+
+### Lemon Squeezy webhook — `/api/webhooks/lemonsqueezy` (signature, **no** bearer token)
+
+- **`POST /`** — the receiving half of the purchase flow. Handles `order_created` and `order_refunded`; anything else is recorded and skipped, never guessed at.
+  Four rules shape every branch: **(1)** verify the HMAC before reading the body, logging it, or touching the DB; **(2)** claim → work → mark done, in that order, with the unique index as the lock; **(3)** status codes are instructions — an event we deliberately ignored gets `200` or it is redelivered forever, a failure on *our* side gets `500` precisely so it *is* retried; **(4)** a signature is not an entitlement — that the order was **paid** and **for our variant** are both checked explicitly.
+  `401 INVALID_SIGNATURE` · `503 WRITE_CONFLICT` (claim did not land — please redeliver) · `200` otherwise.
+  Covered by `src/routes/webhooks-lemonsqueezy.test.ts`.
 
 ### Sync — `/api/sync` (user JWT)
 
@@ -293,8 +359,17 @@ on install; run `npx prisma db push` once against the production `DATABASE_URL`
 - [ ] `ADMIN_USERNAME` + `ADMIN_PASSWORD` — a strong password (admin login is disabled while the password is empty).
 - [ ] `APPLE_BUNDLE_ID` = `in.welock.app` (if Sign in with Apple is used).
 - [ ] `RESEND_API_KEY` + `RESEND_FROM` — for the addiction-protection partner OTP email.
-- [ ] `CORS_ORIGIN` — the web/admin origins (not `*`) if browser clients call the API.
+- [ ] `CORS_ORIGIN` — the web/admin origins (not `*`) if browser clients call the API. ⚠️ The desktop app is a Tauri webview on the `tauri://localhost` origin — narrow this only after checking it still passes.
 - [ ] Run `npx prisma db push` and `npm run device:migrate` once, and `npm run protection:seed` to load the curated blocklist.
+
+**Going live with payments — order matters, because the first mistake is unrecoverable:**
+
+1. [ ] In the Lemon Squeezy dashboard: create the store, the **Lifetime licence** product with a single variant, and note `store_id` + `variant_id`. They **differ between test and live** — copying a product to live mode assigns it a new id.
+2. [ ] Create the webhook → `https://<domain>/api/webhooks/lemonsqueezy`, events `order_created` and `order_refunded`. Keep **test and live as separate webhooks** pointing at separate deployments with separate databases; that is cleaner than `LEMONSQUEEZY_ALLOW_TEST_MODE`, which risks being left on in production.
+3. [ ] Set **all four** required vars *before* the store can take an order. A half-configured deploy refuses to boot; an unconfigured one accepts nothing and records the order as `failed` (retryable) rather than dropping it — but the safe path is simply to configure first.
+4. [ ] Confirm `npx prisma db push` created the `Purchase` and `WebhookEvent` unique indexes (see the data-model note).
+5. [ ] Send a **test-mode order** end to end and confirm a `Purchase` row appears and `GET /api/entitlement` flips to `active`. This is also the check that the raw body survives the platform: `verifyWebhookSignature` fails closed on an empty `rawBody`, so a silent regression there looks exactly like a wrong secret — and the tempting fix is to stop verifying.
+6. [ ] Only then, and only after grandfathering the existing cohort, set `ENTITLEMENT_ENFORCED=true`. Boot refuses this while the storefront is unconfigured.
 
 ### Generic Node host (Render / Railway / Docker)
 
@@ -312,6 +387,10 @@ Honest posture (some are intentional product decisions, some are open work):
 - **Partner OTP is stored in plaintext and shown to admins** — *intentional*: it's a friction code (with a 5-try cap), not a credential.
 - **Day-streak analytics use the server timezone (UTC on Vercel)**, so a streak can flip at a different local time than a non-UTC user expects.
 - **App Attest is scaffolded but fail-closed** — `/api/attest/register` always returns `501` and `ATTEST_REQUIRED` must stay `false` until the native verifier is wired. Focus/break counters are binding-protected but forgeable by the account owner until then.
+- **The trial belongs to an ACCOUNT, not a machine — and accounts are free.** `POST /api/auth/register` stamps `trialEndsAt = now + 14d` with no email verification, no device check and no rate limit, so a new address is a new fortnight. `DELETE /api/me` hard-deletes the row, so even the *same* address can re-register. Closing this needs the `TrialClaim` ledger (a globally unique keyed hash of the machine id, surviving account deletion) from the unmerged device work — until it lands, `ENTITLEMENT_ENFORCED` buys a paywall that a re-signup walks around.
+- **Nothing server-side is gated on entitlement.** `computeEntitlement` is read by its own route and nothing else: no endpoint refuses service to a non-pro user. Enforcement is entirely the client's decision, which means it is only as strong as the client.
+- **`comped` and `revoked` are unreachable**, so `POST /api/admin/users/:id/suspend` and `.../plan` currently change a column nothing reads — they do **not** take access away.
+- **The refund path is all-or-nothing.** Any `order_refunded` revokes the licence, including what Lemon Squeezy classes as a partial refund.
 
 ---
 

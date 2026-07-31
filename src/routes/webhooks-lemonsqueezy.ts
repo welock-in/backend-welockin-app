@@ -113,7 +113,13 @@ async function handle(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
 
   const sellable = isSellableOrder(order);
   if (!sellable.ok) {
-    return { status: "skipped", reason: sellable.reason };
+    // `skipped` is TERMINAL (see DONE) — a redelivery finding one short-circuits
+    // and the work never runs again. That is right for an order that was never
+    // ours, and catastrophic for one we merely were not configured to recognise:
+    // the customer paid, the config gets fixed an hour later, and the dashboard
+    // redelivery is answered "already handled". So our own misconfiguration is
+    // recorded as `failed`, which stays claimable.
+    return { status: sellable.retryable ? "failed" : "skipped", reason: sellable.reason };
   }
 
   // REVOKING is never gated. The test-mode guard below protects against handing

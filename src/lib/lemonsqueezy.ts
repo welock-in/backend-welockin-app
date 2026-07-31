@@ -94,6 +94,32 @@ export type ParsedOrder = {
 };
 
 /**
+ * `custom_data` is untyped by contract — it is whatever the checkout put there,
+ * echoed back by someone else's server.
+ *
+ * Deliberately string-only, even though Lemon Squeezy's docs are ambiguous about
+ * whether numeric custom values round-trip as numbers: a WeLockIn user id is a
+ * 24-hex ObjectId, which is never a JSON number, so coercing one would produce a
+ * value `isObjectId` rejects a moment later. Same outcome, more code.
+ */
+function coerceCustomId(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+/**
+ * A timestamp we cannot parse must become `null`, never an Invalid Date.
+ *
+ * Prisma throws on an Invalid Date, the throw leaves the route as a 500, and a
+ * 500 is an instruction to redeliver — so one malformed field would turn a single
+ * order into a retry loop that never converges and never grants anything.
+ */
+function parseDate(value: unknown): Date | null {
+  if (typeof value !== "string" || !value) return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+/**
  * Pull out what we need, or null when the payload is not something we can act on.
  *
  * Strict about the order id in particular: it is what the whole idempotency story
@@ -107,7 +133,6 @@ export function parseOrderEvent(body: LemonSqueezyWebhook): ParsedOrder | null {
   if (!event || !orderId || !attrs) return null;
 
   const custom = body.meta?.custom_data ?? {};
-  const rawUserId = custom.user_id ?? custom.userId;
 
   return {
     event,
@@ -115,17 +140,32 @@ export function parseOrderEvent(body: LemonSqueezyWebhook): ParsedOrder | null {
     eventKey: `${event}:${orderId}`,
     status: typeof attrs.status === "string" ? attrs.status : null,
     email: typeof attrs.user_email === "string" ? attrs.user_email.trim().toLowerCase() : null,
-    customUserId: typeof rawUserId === "string" && rawUserId.trim() ? rawUserId.trim() : null,
+    customUserId: coerceCustomId(custom.user_id) ?? coerceCustomId(custom.userId),
     refunded: attrs.refunded === true || attrs.status === "refunded",
-    refundedAt: attrs.refunded_at ? new Date(attrs.refunded_at) : null,
-    purchasedAt: attrs.created_at ? new Date(attrs.created_at) : new Date(),
+    refundedAt: parseDate(attrs.refunded_at),
+    // Falling back to "now" is right for a missing field and wrong for a broken
+    // one, but both are better than storing a date arithmetic cannot use.
+    purchasedAt: parseDate(attrs.created_at) ?? new Date(),
     // Lemon Squeezy reports money in cents.
     priceUsd: typeof attrs.total_usd === "number" ? attrs.total_usd / 100 : null,
     storeId: attrs.store_id != null ? String(attrs.store_id) : null,
     variantId: attrs.first_order_item?.variant_id != null ? String(attrs.first_order_item.variant_id) : null,
-    testMode: body.meta?.test_mode === true || attrs.test_mode === true,
+    // `data.attributes.test_mode` is the field the official example payloads
+    // actually carry; `meta.test_mode` is undocumented, so it is the fallback
+    // rather than the primary — but either one saying "test" is enough.
+    testMode: attrs.test_mode === true || body.meta?.test_mode === true,
   };
 }
+
+export type SellableVerdict =
+  | { ok: true }
+  /**
+   * `retryable` separates "this order is not for us" from "we were not ready for
+   * it". The first is a permanent, correct refusal; the second is our own
+   * misconfiguration, and recording it as permanent is how a paid order becomes
+   * unrecoverable — see the route's `skipped` handling.
+   */
+  | { ok: false; reason: string; retryable: boolean };
 
 /**
  * Is this an order for the thing we actually sell?
@@ -135,15 +175,22 @@ export function parseOrderEvent(body: LemonSqueezyWebhook): ParsedOrder | null {
  * at any price, would mint one. Configuration is required rather than assumed:
  * an unset variant id means "sell nothing", not "sell everything".
  */
-export function isSellableOrder(order: ParsedOrder): { ok: true } | { ok: false; reason: string } {
+export function isSellableOrder(order: ParsedOrder): SellableVerdict {
   if (!env.lemonSqueezyStoreId || !env.lemonSqueezyVariantId) {
-    return { ok: false, reason: "store or variant id not configured" };
+    // OUR fault, not the order's — and the customer has already been charged.
+    // Retryable, so that fixing the config and redelivering from the dashboard
+    // still grants the licence.
+    return { ok: false, reason: "store or variant id not configured", retryable: true };
   }
   if (order.storeId && order.storeId !== env.lemonSqueezyStoreId) {
-    return { ok: false, reason: `store ${order.storeId} is not ours` };
+    return { ok: false, reason: `store ${order.storeId} is not ours`, retryable: false };
   }
   if (order.variantId !== env.lemonSqueezyVariantId) {
-    return { ok: false, reason: `variant ${order.variantId ?? "?"} is not the lifetime licence` };
+    return {
+      ok: false,
+      reason: `variant ${order.variantId ?? "?"} is not the lifetime licence`,
+      retryable: false,
+    };
   }
   return { ok: true };
 }

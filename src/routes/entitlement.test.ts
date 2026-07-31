@@ -4,6 +4,7 @@ import request from "supertest";
 import { createApp } from "../app";
 import { signToken } from "../lib/jwt";
 import { prisma } from "../lib/prisma";
+import { env } from "../lib/env";
 import { TRIAL_DAYS } from "../lib/entitlement";
 
 const app = createApp();
@@ -64,7 +65,7 @@ test("a live trial window reports trialing + isPro, and cannot start another", a
   assert.equal(res.body.canStartTrial, false);
 });
 
-test("an elapsed trial reports expired, and stays unbuyable until StoreKit lands", async (t) => {
+test("an elapsed trial reports expired", async (t) => {
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ trialEndsAt: days(-1) }));
   noPurchases(t);
 
@@ -72,9 +73,9 @@ test("an elapsed trial reports expired, and stays unbuyable until StoreKit lands
 
   assert.equal(res.body.status, "expired");
   assert.equal(res.body.isPro, false);
-  // No Purchase row can exist yet, so `active` is unreachable — asserted so the
-  // day someone wires StoreKit, this test fails and forces the route's two
-  // hard-coded `false`s to be revisited.
+  // An account that already had its window cannot be handed a fresh one, even
+  // once the window is behind it. This is the invariant the (unmerged) TrialClaim
+  // ledger extends from the account to the machine.
   assert.equal(res.body.canStartTrial, false);
 });
 
@@ -145,5 +146,42 @@ test("a live purchase beats an older refunded one", async (t) => {
   const res = await request(app).get("/api/entitlement").set(auth);
 
   assert.equal(res.body.status, "active");
+  assert.equal(res.body.isPro, true);
+});
+
+// --- the rollout switch ------------------------------------------------------
+
+/*
+ * `enforced` is the desktop client's ONLY gate: AuthGate locks on
+ * `enforced === true && !isPro`. While the server could not emit it, the paywall
+ * was unreachable code in every production build and no customer could pay even
+ * if they wanted to — so these two tests are the difference between having a
+ * business model and describing one.
+ */
+test("enforcement is OFF by default, so no existing account is locked out by a deploy", async (t) => {
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ trialEndsAt: days(-1) }));
+  noPurchases(t);
+
+  const res = await request(app).get("/api/entitlement").set(auth);
+
+  assert.equal(res.body.enforced, false);
+  assert.notEqual(res.body.enforced, undefined, "absent must be false on the wire, never undefined");
+});
+
+test("ENTITLEMENT_ENFORCED reaches the client, and never changes the status it reports", async (t) => {
+  const before = env.entitlementEnforced;
+  (env as any).entitlementEnforced = true;
+  t.after(() => {
+    (env as any).entitlementEnforced = before;
+  });
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ trialEndsAt: days(9) }));
+  noPurchases(t);
+
+  const res = await request(app).get("/api/entitlement").set(auth);
+
+  assert.equal(res.body.enforced, true);
+  // The switch says what the CLIENT may do, not what is true. A user mid-trial
+  // stays `trialing` and pro whether or not enforcement is on.
+  assert.equal(res.body.status, "trialing");
   assert.equal(res.body.isPro, true);
 });

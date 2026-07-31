@@ -103,4 +103,80 @@ export const env = {
    * would have failed OPEN into a free-licence tap.
    */
   lemonSqueezyAllowTestMode: process.env.LEMONSQUEEZY_ALLOW_TEST_MODE === "true",
+
+  /**
+   * May the client HARD-GATE on the entitlement status it is told?
+   *
+   * The server ALWAYS reports the true status; this only says whether the client
+   * may act on it yet. It exists because the day the paywall ships, every account
+   * whose trial quietly elapsed months ago turns `expired` at once — gating on
+   * status alone would lock all of them out in a single update, with no way to
+   * stage it. Flip this only after `npm run entitlement:migrate` has given the
+   * existing cohort a comp runway.
+   *
+   * Echoed by GET /api/entitlement and by nothing else: it must never change what
+   * the resolver computes, only what the client is allowed to do about it.
+   */
+  entitlementEnforced: (process.env.ENTITLEMENT_ENFORCED ?? "false") === "true",
 };
+
+/**
+ * Storefront configuration is ALL-OR-NOTHING, and enforcement implies it.
+ *
+ * Payments are optional on purpose: a deploy with none of these set simply cannot
+ * sell, and refusing to boot over that would take focus sessions, notifications
+ * and blocking down with it. So an empty config is a legitimate state.
+ *
+ * A PARTIAL config is the state worth dying over, because it fails in the
+ * direction of lost money rather than lost function: with an API key but no
+ * webhook secret, `POST /api/checkout` mints a real payment page and every
+ * delivery that comes back is rejected as unsigned. The customer is charged and
+ * no licence is ever granted. Nothing downstream can recover that, so it is
+ * caught at boot, on the machine that is misconfigured — not weeks later in a
+ * support thread.
+ *
+ * Exported and pure so the rule can be tested without spawning a process to
+ * observe a module-load throw.
+ *
+ * @returns a warning to log, or null. Throws when the config cannot be shipped.
+ */
+export function checkPaymentConfig(input: {
+  lemonSqueezyApiKey: string;
+  lemonSqueezyWebhookSecret: string;
+  lemonSqueezyStoreId: string;
+  lemonSqueezyVariantId: string;
+  entitlementEnforced: boolean;
+}): string | null {
+  const required = {
+    LEMONSQUEEZY_API_KEY: input.lemonSqueezyApiKey,
+    LEMONSQUEEZY_WEBHOOK_SECRET: input.lemonSqueezyWebhookSecret,
+    LEMONSQUEEZY_STORE_ID: input.lemonSqueezyStoreId,
+    LEMONSQUEEZY_VARIANT_ID: input.lemonSqueezyVariantId,
+  };
+  const names = Object.keys(required) as (keyof typeof required)[];
+  const missing = names.filter((n) => !required[n]);
+
+  if (missing.length > 0 && missing.length < names.length) {
+    throw new Error(
+      `Lemon Squeezy is half-configured — set all of it or none of it. Missing: ${missing.join(", ")}`,
+    );
+  }
+
+  // A paywall nobody can pay through is worse than no paywall: it locks out every
+  // expired account with no way out. Enforcement without a storefront is refused
+  // rather than shipped.
+  if (input.entitlementEnforced && missing.length > 0) {
+    throw new Error(
+      "ENTITLEMENT_ENFORCED is on but Lemon Squeezy is not configured — the paywall would have no way to buy",
+    );
+  }
+
+  // Loud, not fatal: selling nothing is legitimate, but it must never be the
+  // thing an operator first hears about from a customer.
+  return missing.length > 0
+    ? "[env] Lemon Squeezy is not configured — POST /api/checkout will refuse every purchase"
+    : null;
+}
+
+const paymentWarning = checkPaymentConfig(env);
+if (paymentWarning && isProduction) console.warn(paymentWarning);

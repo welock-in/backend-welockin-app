@@ -111,20 +111,25 @@ async function handle(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
     return { status: "skipped", reason: `unhandled event ${order.event}` };
   }
 
-  // A test order costs nothing and is trivial to produce. Honouring one on a
-  // live backend is a free-licence tap, so it takes an explicit opt-in — not an
-  // inference from NODE_ENV, which is unset on more machines than people expect.
-  if (order.testMode && !env.lemonSqueezyAllowTestMode) {
-    return { status: "skipped", reason: "test-mode order ignored here" };
-  }
-
   const sellable = isSellableOrder(order);
   if (!sellable.ok) {
     return { status: "skipped", reason: sellable.reason };
   }
 
+  // REVOKING is never gated. The test-mode guard below protects against handing
+  // out licences nobody paid for; taking one away has no such downside, and
+  // guarding it is actively harmful — a test order created while the door was
+  // open could never be undone once it closed, leaving the licence live and the
+  // order frozen as "paid" for good. That is not hypothetical: it happened here.
   if (order.event === "order_refunded") {
     return refund(order, body);
+  }
+
+  // A test order costs nothing and is trivial to produce. Honouring one on a
+  // live backend is a free-licence tap, so it takes an explicit opt-in — not an
+  // inference from NODE_ENV, which is unset on more machines than people expect.
+  if (order.testMode && !env.lemonSqueezyAllowTestMode) {
+    return { status: "skipped", reason: "test-mode order ignored here" };
   }
 
   // An order row exists from the moment checkout begins. Only "paid" owes anyone

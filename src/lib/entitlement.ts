@@ -21,8 +21,24 @@
  */
 export const TRIAL_DAYS = 14;
 
-/** The App Store product the paywall sells. Not yet wired to StoreKit. */
+/** The App Store products, mirrored in the app's src/services/purchase.ts.
+ *  IMMUTABLE — Apple never lets a Product ID change after creation. */
 export const LIFETIME_PRODUCT_ID = "in.welock.app.lifetime";
+export const TRIAL_PRODUCT_ID = "in.welock.app.trial14";
+
+/**
+ * How a verified purchase is recorded, WITHOUT a schema change.
+ *
+ * `User.plan` is a free-form String that main has always had, so lifetime
+ * ownership rides in it and needs no migration and no `prisma db push` against
+ * the live cluster. A dedicated Purchase table with the full transaction history
+ * is better eventually; this is what makes payments work today at zero risk.
+ */
+export const PLAN = {
+  trial: "trial",
+  lifetime: "lifetime",
+  refunded: "refunded",
+} as const;
 
 export type EntitlementStatus =
   | "trialing"
@@ -109,4 +125,36 @@ export function computeEntitlement(input: EntitlementInputs): EntitlementView {
     canStartTrial,
     enforced: input.enforced === true,
   };
+}
+
+/* ── what a verified purchase changes ────────────────────────── */
+
+export type PurchaseFacts = {
+  productId: string;
+  /** Apple's clock, ms epoch. Never the phone's. */
+  purchaseDate: number;
+  revoked: boolean;
+};
+
+/**
+ * The ONLY place that decides what a verified transaction does to an account.
+ * Pure, so the two rules that protect revenue are testable without forging an
+ * Apple signature:
+ *
+ *   · a trial is CREATE-ONLY — `trialEndsAt` is written only when absent, so
+ *     replaying a transaction (StoreKit re-delivers unfinished ones on every
+ *     launch) can never buy extra days;
+ *   · a revoked transaction takes access away instead of leaving it standing.
+ */
+export function purchaseEffect(
+  facts: PurchaseFacts,
+  current: { plan: string | null; trialEndsAt: Date | null },
+  trialDays: number,
+): { plan?: string; trialEndsAt?: Date } {
+  if (facts.productId === LIFETIME_PRODUCT_ID) {
+    return { plan: facts.revoked ? PLAN.refunded : PLAN.lifetime };
+  }
+  if (facts.productId !== TRIAL_PRODUCT_ID) return {};
+  if (facts.revoked || current.trialEndsAt != null) return {};
+  return { trialEndsAt: new Date(facts.purchaseDate + trialDays * 24 * 60 * 60 * 1000) };
 }

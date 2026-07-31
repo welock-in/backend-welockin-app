@@ -44,6 +44,16 @@ export const deviceConflict = (
 export const rebindCooldown = (msg = "You changed devices recently — try again later") =>
   new HttpError(429, msg, { code: "REBIND_COOLDOWN" });
 
+// --- Purchases --------------------------------------------------------------
+// The client branches on these `code` values: a rejected transaction must never
+// be retried in a loop, while a transport failure must be.
+export const transactionInvalid = (msg: string) =>
+  new HttpError(400, msg, { code: "TRANSACTION_INVALID" });
+export const transactionForeign = (msg = "This transaction belongs to another app") =>
+  new HttpError(400, msg, { code: "TRANSACTION_FOREIGN" });
+export const transactionUnknownProduct = (msg = "Unknown product") =>
+  new HttpError(400, msg, { code: "TRANSACTION_UNKNOWN_PRODUCT" });
+
 // --- Onboarding funnel ------------------------------------------------------
 // The mobile funnel branches on these `code` values.
 export const ageBelowMinimum = (minimumAge: number) =>

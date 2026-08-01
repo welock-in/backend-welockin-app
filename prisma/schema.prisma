@@ -695,3 +695,46 @@ model AdminAuditLog {
   @@index([targetUserId, createdAt])
   @@index([actorId, createdAt])
 }
+
+/// A published desktop installer. The public manifest endpoint
+/// (GET /api/updates/...) reads exactly one of these; the admin console writes
+/// them. Rows are never edited in place once live — a burned version number
+/// stays burned, which is what makes rollback safe.
+model Release {
+  id      String @id @default(auto()) @map("_id") @db.ObjectId
+  channel String @default("stable")
+  target  String @default("windows") // Tauri {{target}}
+  arch    String @default("x86_64") // Tauri {{arch}}
+  version String // "0.2.0" — semver, no leading v
+  /// Zero-padded form of `version` so Mongo can order releases without semver
+  /// logic. See lib/semver.ts `toSortKey`.
+  versionKey String
+  notes      String  @default("")
+  pubDate    DateTime
+  /// Absolute URL of the installer (R2). Immutable per version.
+  url String
+  /// Verbatim contents of the .sig Tauri emits next to the installer. The client
+  /// verifies the download against the pubkey compiled into it, so this value
+  /// being wrong means "no client will install", never "an unsigned install".
+  sha256    String?
+  signature String
+  sizeBytes Int?
+
+  /// draft → live → (paused | rolled_back | superseded)
+  status String @default("draft")
+  /// 0..100. `stable` clients are only offered a release at 100.
+  rolloutPercent Int @default(0)
+  /// 0..99, rotates which buckets go first so the same slice of the population
+  /// isn't the guinea pig for every single release.
+  rolloutOffset Int @default(0)
+
+  publishedAt DateTime?
+  pausedAt    DateTime?
+  createdBy   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([channel, target, arch, version])
+  @@index([channel, target, arch, status, versionKey])
+  @@map("releases")
+}

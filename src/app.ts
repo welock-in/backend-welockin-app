@@ -4,6 +4,7 @@ import helmet from "helmet";
 import morgan from "morgan";
 import { env } from "./lib/env";
 import { healthRouter } from "./routes/health";
+import { updatesRouter } from "./routes/updates";
 import { authRouter } from "./routes/auth";
 import { meRouter } from "./routes/me";
 import { devicesRouter } from "./routes/devices";
@@ -24,6 +25,7 @@ import { sessionsRouter } from "./routes/sessions";
 import { adminRouter } from "./routes/admin";
 import { addictionProtectionRouter } from "./routes/addiction-protection";
 import { adminProtectionRouter } from "./routes/admin-protection";
+import { adminReleasesRouter } from "./routes/admin-releases";
 import { adminNotificationsRouter } from "./routes/admin-notifications";
 import { errorHandler, notFoundHandler } from "./middleware/error";
 
@@ -58,6 +60,9 @@ export function createApp(): Express {
 
   // Routes — everything under /api.
   app.use("/api/health", healthRouter);
+  // Desktop auto-update manifest. PUBLIC like /api/health: a signed-out machine
+  // must still be able to receive a fix.
+  app.use("/api/updates", updatesRouter);
   app.use("/api/auth", authRouter);
   app.use("/api/me", meRouter);
   app.use("/api/devices", devicesRouter);
@@ -79,6 +84,7 @@ export function createApp(): Express {
   // and the admin CRUD + active-protection panel.
   app.use("/api/addiction-protection", addictionProtectionRouter);
   app.use("/api/admin/addiction-protection", adminProtectionRouter);
+  app.use("/api/admin/releases", adminReleasesRouter);
   app.use("/api/admin/notifications", adminNotificationsRouter);
   app.use("/api/onboarding", onboardingRouter);
   // Authenticated by the sender's signature, not by a bearer token —

@@ -641,6 +641,18 @@ model TrialClaim {
   /// Secondary correlation for iOS (`identifierForVendor`), where the client
   /// device id is resettable. Null on macOS, whose id is hardware-derived.
   idfvHash     String?
+  /// The iOS leg: HMAC of the App Store `originalTransactionId` of the Tier-0
+  /// trial IAP. A non-consumable stays in the Apple ID's purchase history and
+  /// Apple replays the ORIGINAL transaction on every restore, so this is the one
+  /// anchor here that survives a factory reset — which the Keychain device id
+  /// does not. Null on macOS and on any claim made before a purchase was posted.
+  ///
+  /// INDEXED, NOT `@unique`, on purpose. A MongoDB unique index treats a missing
+  /// field as null and admits only ONE such document, so making this unique
+  /// would reject the second macOS claim ever written. The hard concurrency lock
+  /// stays on `deviceIdHash`; the Apple leg is enforced by an explicit lookup in
+  /// POST /api/purchases before the create.
+  appleOriginalTxHash String?
 
   /// Who claimed it first. NULLED on account deletion — the claim survives, the
   /// link to a deleted person does not.
@@ -673,6 +685,7 @@ model TrialClaim {
 
   @@index([idfvHash])
   @@index([firstUserId])
+  @@index([appleOriginalTxHash])
 }
 
 /// Every admin action that changes what someone may do, with a reason.

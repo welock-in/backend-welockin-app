@@ -15,7 +15,6 @@ import {
 import {
   APP_STORE,
   LIFETIME_PRODUCT_ID,
-  TRIAL_DAYS,
   TRIAL_PRODUCT_ID,
   purchaseEffect,
 } from "../lib/entitlement";
@@ -51,8 +50,9 @@ import { resolveAndCache } from "./entitlement";
    transactions on every launch and the app POSTs each one, so this route
    is called repeatedly with the same payload by design. The lifetime
    path upserts on `@@unique([provider, externalId])`; the trial path
-   leans on the two unique indexes and treats a duplicate key as success.
-   Neither can grant a second window.
+   looks the Apple leg up first and lets the unique `deviceIdHash` catch
+   the rest, treating a duplicate key as success. Neither can grant a
+   second window.
    ───────────────────────────────────────────────────────────── */
 
 export const purchasesRouter = Router();
@@ -110,7 +110,7 @@ purchasesRouter.post(
         purchaseDate: tx.purchaseDate,
         revoked: tx.revocationDate != null,
       },
-      TRIAL_DAYS,
+      env.trialDays,
     );
 
     if (effect.kind === "lifetime") {
@@ -169,14 +169,24 @@ async function recordLifetime(
 /**
  * Claim the free trial, bound to the Apple ID, the phone and the account.
  *
- * CREATE-ONLY, enforced by the database rather than by a read-then-write. Two
- * unique indexes carry it:
- *   · `appleOriginalTxHash` — one trial per Apple ID, surviving a factory reset;
- *   · `deviceIdHash`        — one trial per phone, so a second account on the
- *                             same handset collides here.
- * A duplicate key on either is the SUCCESS path: it means this Apple ID or this
- * phone already had its window, and the resolver will now hand back that window —
- * elapsed or not — instead of a fresh one.
+ * CREATE-ONLY. Two legs carry it, and they are enforced differently:
+ *   · `deviceIdHash`        — one trial per phone, a UNIQUE index, so a second
+ *                             account on the same handset collides in the
+ *                             database rather than racing check-then-act. A
+ *                             duplicate key is the SUCCESS path.
+ *   · `appleOriginalTxHash` — one trial per Apple ID, surviving a factory reset.
+ *                             Enforced by the lookup below rather than by a
+ *                             unique index: the column is null for every macOS
+ *                             claim, and a MongoDB unique index admits only ONE
+ *                             document with a missing field, so making it unique
+ *                             would reject the second desktop claim ever
+ *                             written. The residual race is two SIMULTANEOUS
+ *                             first-claims from one Apple ID on two different
+ *                             phones; the device leg still bounds each of them
+ *                             to one window per handset.
+ *
+ * Either way the outcome is the same: an Apple ID or a phone that already had a
+ * window gets that window back — elapsed or not — never a fresh one.
  *
  * Every identifier is stored peppered-hashed, never in the clear.
  */
@@ -194,23 +204,35 @@ async function claimTrial(
   // unique without pretending to be a device.
   const deviceIdHash = deviceId ? ledgerHash(deviceId) : appleOriginalTxHash;
 
-  try {
-    await prisma.trialClaim.create({
-      data: {
-        appleOriginalTxHash,
-        deviceIdHash,
-        idfvHash: idfv ? ledgerHash(idfv) : null,
-        firstUserId: userId,
-        trialDays: TRIAL_DAYS,
-        startedAt: window.startedAt,
-        endsAt: window.endsAt,
-        status: "active",
-      },
-    });
-  } catch (err) {
-    // Already claimed by this Apple ID or on this phone — exactly what the indexes
-    // are for. Never rewrite the existing row: rewriting it IS the farm.
-    if (!isDuplicateKey(err)) throw err;
+  // The Apple leg, checked before the insert because it carries no unique index
+  // (see the note above). Finding a row here means this Apple ID has already had
+  // its window on some phone: leave it alone and fall through to the stamp, which
+  // is what carries that window onto this account.
+  const claimedByAppleId = await prisma.trialClaim.findFirst({
+    where: { appleOriginalTxHash },
+    select: { id: true },
+  });
+
+  if (!claimedByAppleId) {
+    try {
+      await prisma.trialClaim.create({
+        data: {
+          appleOriginalTxHash,
+          deviceIdHash,
+          idfvHash: idfv ? ledgerHash(idfv) : null,
+          firstUserId: userId,
+          trialDays: env.trialDays,
+          startedAt: window.startedAt,
+          endsAt: window.endsAt,
+          status: "active",
+        },
+      });
+    } catch (err) {
+      // Already claimed on this phone — exactly what the unique index is for, and
+      // also how the residual Apple-leg race lands. Never rewrite the existing
+      // row: rewriting it IS the farm.
+      if (!isDuplicateKey(err)) throw err;
+    }
   }
 
   // ── materialize the governing window onto the account ────────────────────
@@ -231,7 +253,10 @@ async function claimTrial(
     orderBy: { createdAt: "asc" }, // oldest wins — a later row must never rewind it
     select: { endsAt: true },
   });
-  if (!governing) return;
+  // `endsAt` is optional in the schema (a claim can exist before its window is
+  // stamped), and a null one governs nothing — there is no date to narrow to.
+  if (!governing?.endsAt) return;
+  const governingEndsAt = governing.endsAt;
 
   // NARROWING ONLY: write when the account has no window, or one that ends LATER
   // than the ledger allows. The `gt` is what makes this safe to run on every
@@ -240,12 +265,12 @@ async function claimTrial(
     .updateMany({
       where: {
         id: userId,
-        OR: [{ trialEndsAt: null }, { trialEndsAt: { gt: governing.endsAt } }],
+        OR: [{ trialEndsAt: null }, { trialEndsAt: { gt: governingEndsAt } }],
       },
       // Deliberately not touching `plan`: a user who already owns the lifetime
       // unlock can replay a trial transaction, and demoting their mirror to
       // "trial" would misreport them to the desktop clients and /api/me.
-      data: { trialEndsAt: governing.endsAt },
+      data: { trialEndsAt: governingEndsAt },
     })
     .catch(() => {});
 }

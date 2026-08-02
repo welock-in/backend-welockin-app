@@ -12,7 +12,16 @@ export interface SendResult {
   skipped?: boolean;
 }
 
-async function send(to: string, subject: string, html: string, text: string): Promise<SendResult> {
+async function send(
+  to: string,
+  subject: string,
+  html: string,
+  text: string,
+  // `replyTo` becomes Resend's `reply_to` (their REST payload is snake_case).
+  // An options object rather than a fifth positional string, so the next field
+  // this needs does not turn the call sites into a row of unlabelled arguments.
+  opts?: { replyTo?: string },
+): Promise<SendResult> {
   if (!env.resendApiKey) {
     console.warn(`[resend] RESEND_API_KEY not set — skipping email to ${to} ("${subject}")`);
     return { ok: false, skipped: true };
@@ -24,7 +33,14 @@ async function send(to: string, subject: string, html: string, text: string): Pr
         authorization: `Bearer ${env.resendApiKey}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ from: env.resendFrom, to: [to], subject, html, text }),
+      body: JSON.stringify({
+        from: env.resendFrom,
+        to: [to],
+        subject,
+        html,
+        text,
+        ...(opts?.replyTo ? { reply_to: opts.replyTo } : {}),
+      }),
     });
     const data = (await res.json().catch(() => ({}))) as { id?: string; message?: string };
     if (!res.ok) {
@@ -148,4 +164,55 @@ export function sendPasswordResetLink(
         for this, ignore this email — your password stays as it is.
       </p>`);
   return send(to, subject, html, text);
+}
+
+/**
+ * Escape user text for interpolation into an email's HTML body. The other
+ * emails in this file interpolate only server-generated values (codes, URLs we
+ * built ourselves); the contact form is the first whose content is AUTHORED BY
+ * THE SUBMITTER, so without this anyone could inject markup into the mail the
+ * support inbox renders.
+ */
+const escapeHtml = (s: string) =>
+  s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
+/** Where the contact form delivers. One constant, shared with the route's 502. */
+export const CONTACT_INBOX = "hello@welock.in";
+
+/**
+ * Forward a contact-form submission to the support inbox.
+ *
+ * `reply_to` is set to the SUBMITTER's address, so answering is just pressing
+ * reply — without it every response would start by copying an email address out
+ * of the body, which is the step that gets skipped on a busy day.
+ */
+export function sendContactEmail(
+  fromUser: { name?: string; email: string; topic: string },
+  message: string,
+): Promise<SendResult> {
+  const { name, email, topic } = fromUser;
+  const who = name ? `${name} <${email}>` : `<${email}>`;
+  const subject = `[${topic}] Contact form — ${who}`;
+  const text =
+    `From: ${who}\n` +
+    `Topic: ${topic}\n\n` +
+    `${message}\n\n` +
+    `Reply to this email to answer them directly.`;
+  const html = shell(`
+      <h2 style="font-size:18px;margin:0 0 8px">Contact form</h2>
+      <p style="font-size:14px;line-height:1.5;color:#5b5448;margin:0 0 20px">
+        <strong>${escapeHtml(who)}</strong> — ${escapeHtml(topic)}
+      </p>
+      <div style="background:#faf7f1;border:1px solid #eae4d5;border-radius:14px;padding:18px;margin:0 0 20px">
+        <div style="font-size:14px;line-height:1.6;color:#1a1714;white-space:pre-wrap">${escapeHtml(message)}</div>
+      </div>
+      <p style="font-size:13px;line-height:1.5;color:#8a8175;margin:0">
+        Reply to this email to answer them directly.
+      </p>`);
+  return send(CONTACT_INBOX, subject, html, text, { replyTo: email });
 }

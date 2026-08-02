@@ -7,6 +7,7 @@ import { healthRouter } from "./routes/health";
 import { updatesRouter } from "./routes/updates";
 import { authRouter } from "./routes/auth";
 import { authEmailRouter } from "./routes/auth-email";
+import { contactRouter } from "./routes/contact";
 import { meRouter } from "./routes/me";
 import { devicesRouter } from "./routes/devices";
 import { focusInvitesRouter } from "./routes/focus-invites";
@@ -78,6 +79,11 @@ export function createApp(): Express {
   // are the routes an UNVERIFIED account must still be able to reach, so they
   // can never sit behind the gate they exist to open.
   app.use("/api/auth", authEmailRouter);
+  // The site's contact form. PUBLIC like the reset routes above it: the people
+  // most likely to write in are locked out or have no account, so a bearer
+  // token is the one thing they cannot supply. Abuse is handled by rate limits
+  // inside the route, not by auth.
+  app.use("/api/contact", contactRouter);
   // Every router below is authenticated on EVERY route, so the guard can be
   // mounted here rather than threaded through each one. `requireAuth` runs again
   // inside them; that is a signature check with no database read, and paying it

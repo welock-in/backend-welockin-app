@@ -38,6 +38,23 @@ export const passwordResetSchema = z.object({
   password: passwordRule,
 });
 
+// --- Contact form ------------------------------------------------------------
+/**
+ * The marketing site's contact form. `email` shares `emailRule` so the address
+ * support replies to is normalised the same way as everywhere else, and the
+ * `message` floor keeps single-character junk from ever costing an email send.
+ */
+export const contactSchema = z.object({
+  name: z.string().trim().max(80).optional(),
+  email: emailRule,
+  topic: z.enum(["support", "billing", "privacy", "press", "other"]).optional().default("other"),
+  message: z
+    .string()
+    .trim()
+    .min(10, "Message must be at least 10 characters")
+    .max(4000, "Message is too long"),
+});
+
 /** Spellings seen in the wild, normalised so `platform` can be a real enum. */
 const PLATFORM_ALIASES: Record<string, string> = {
   mac: "macos",

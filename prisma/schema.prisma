@@ -90,21 +90,37 @@ model User {
   // local flag / an active entitlement rather than re-running the funnel.
   onboardingCompletedAt DateTime?
 
+  /// When the address was proved. `emailVerified` is the boolean the code
+  /// branches on; this is for support and audit — "verified, but when?" is the
+  /// first question asked about a suspicious account.
+  emailVerifiedAt       DateTime?
+  /// Stamped on every password change, and compared against a JWT's `iat` in
+  /// requireAuth so a reset actually ENDS other sessions.
+  ///
+  /// Tokens here are stateless with a 30-day life and no revocation list, so
+  /// without this a password reset does not log an attacker out — which is the
+  /// single thing a person resetting a password is trying to do. Null on every
+  /// account that predates this column, and the comparison must treat null as
+  /// "no cutoff", or the deploy signs the entire user base out at once.
+  passwordChangedAt     DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  devices         Device[]
-  focusInvites    FocusInvite[]
-  focusEvents     FocusEvent[]
-  snapshot        SyncSnapshot?
-  authProviders   AuthProvider[]
-  featureRequests FeatureRequest[]   @relation("UserFeatureRequests")
-  votes           Vote[]             @relation("UserVotes")
-  liveSessions    LiveSession[]
-  protectionLock  ProtectionLock?
-  pushTokens      PushToken[]
-  onboarding      OnboardingProfile?
-  purchases       Purchase[]
+  devices            Device[]
+  focusInvites       FocusInvite[]
+  focusEvents        FocusEvent[]
+  snapshot           SyncSnapshot?
+  authProviders      AuthProvider[]
+  featureRequests    FeatureRequest[]   @relation("UserFeatureRequests")
+  votes              Vote[]             @relation("UserVotes")
+  liveSessions       LiveSession[]
+  protectionLock     ProtectionLock?
+  pushTokens         PushToken[]
+  onboarding         OnboardingProfile?
+  purchases          Purchase[]
+  emailVerifications EmailVerification[]
+  passwordResets     PasswordReset[]
 }
 
 // A focus session that is HAPPENING RIGHT NOW, reported by a client via
@@ -683,9 +699,131 @@ model TrialClaim {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  signals DeviceSignal[]
+
   @@index([idfvHash])
   @@index([firstUserId])
   @@index([appleOriginalTxHash])
+}
+
+/// One hardware signal seen on a trial claim: a MachineGuid, a volume serial or
+/// a MAC address, each keyed-hashed like `deviceIdHash`.
+///
+/// Rows ACCUMULATE, and that is the design. The owner asked to key the "one
+/// account per machine" rule on the MAC address; a MAC alone cannot carry that
+/// weight — Windows randomises Wi-Fi MACs by default, every VPN and hypervisor
+/// invents more, and a USB dock's MAC walks between laptops. Keyed on it alone,
+/// a legitimate user who unplugs a dock looks like a new machine while a
+/// fraudster spoofing one looks like an old one, which is exactly backwards.
+///
+/// So identity is a COMPOSITE, and matching needs either the MachineGuid (which
+/// survives a dock, a Wi-Fi toggle and a reboot) or the volume serial together
+/// with at least one MAC (which survives a registry reset). A MAC on its own is
+/// recorded and never decides. Because rows accumulate rather than replace,
+/// plugging the dock back in ADDS a signal instead of losing one.
+model DeviceSignal {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  claimId String     @db.ObjectId
+  claim   TrialClaim @relation(fields: [claimId], references: [id], onDelete: Cascade)
+
+  /// "mguid" | "vol" | "mac" — never mixed, so a MAC can never be compared
+  /// against a volume serial that happens to hash to the same value.
+  kind String
+  /// HMAC-SHA256(TRIAL_LEDGER_PEPPER, "fp:v1:<kind>:<raw>"). Same pepper as the
+  /// ledger on purpose: these hashes describe the same machines and live in the
+  /// same trust boundary, so a second key would add ceremony and no security.
+  hash String
+
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+
+  /// The upsert key, so re-seeing a signal touches `lastSeenAt` instead of
+  /// growing the table on every request.
+  @@unique([claimId, kind, hash])
+  /// The lookup: "which claim, if any, has ever shown this signal?"
+  @@index([kind, hash])
+}
+
+/// A 6-digit code proving someone can read the address they signed up with.
+///
+/// HASHED at rest, unlike the addiction-protection partner OTP, which is stored
+/// in plaintext and shown to admins on purpose. That one is social friction;
+/// this one decides whether an account may be used at all, so it is a
+/// credential. See lib/tokens.ts.
+model EmailVerification {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  userId String @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// The address the code was SENT TO, frozen at issue time. Without this, a
+  /// code minted for the old address would still verify the new one after an
+  /// email change — proving the user can read an inbox they no longer claim.
+  email  String
+
+  codeHash String
+  /// Enforced in application code on every read, NOT by this column alone:
+  /// Prisma cannot declare a MongoDB TTL index, and Mongo's TTL monitor is
+  /// best-effort and roughly once a minute anyway. The TTL index built by
+  /// `scripts/auth-migrate.ts` is housekeeping; the query is the guarantee.
+  expiresAt DateTime
+  /// Incremented ATOMICALLY ({ increment: 1 }). A read-modify-write lets N
+  /// parallel guesses share one count, which is the whole budget in one shot.
+  attempts   Int       @default(0)
+  consumedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
+}
+
+/// A single-use, short-lived password-reset token, hashed at rest.
+///
+/// Only the hash is stored, so a database copy cannot be replayed into anyone's
+/// account. The raw token exists in exactly one place: the link in the email.
+model PasswordReset {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  userId String @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  email  String
+
+  /// REQUIRED and unique — never nullable. On MongoDB, Prisma builds
+  /// non-sparse unique indexes, so a second null row would collide (see the
+  /// note on SyncSnapshot). It is also the concurrency lock that makes
+  /// single-use real: two simultaneous consumptions of one token contend here
+  /// instead of both passing a check-then-act.
+  tokenHash String @unique
+
+  expiresAt  DateTime
+  consumedAt DateTime?
+  /// For abuse review only. Never shown to the user, never used to decide.
+  requestIp  String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
+}
+
+/// A rolling-window counter for auth rate limits.
+///
+/// Backed by the database rather than process memory because this API runs on
+/// Vercel: every instance would hold its own counter, so an in-memory limiter
+/// caps nothing and merely looks like it does.
+model AuthThrottle {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  /// "<action>:<subject>", e.g. "reset-request:ip:1.2.3.4". Unique because it
+  /// is the upsert key.
+  key             String   @unique
+  windowStartedAt DateTime
+  count           Int      @default(1)
+
+  updatedAt DateTime @updatedAt
+
+  @@index([windowStartedAt])
 }
 
 /// Every admin action that changes what someone may do, with a reason.

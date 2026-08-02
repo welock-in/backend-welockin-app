@@ -1,12 +1,16 @@
 import { Router } from "express";
-import bcrypt from "bcryptjs";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { signToken } from "../lib/jwt";
 import { toPublicUser } from "../lib/user";
-import { badRequest, conflict, unauthorized } from "../lib/http-error";
+import { badRequest, conflict, deviceAlreadyClaimed, unauthorized } from "../lib/http-error";
 import { asyncHandler } from "../middleware/async-handler";
 import { appleAuthSchema, loginSchema, registerSchema } from "../validation/schemas";
+import { env } from "../lib/env";
+import { hashPassword, verifyPassword } from "../lib/password";
+import { clientIp, consumeRateLimit } from "../lib/rate-limit";
+import { findBlockingClaimOwner, parseFingerprint } from "../lib/fingerprint";
+import { sendVerificationCode } from "./auth-email";
 import {
   canAutoLinkAppleAccount,
   getVerifiedAppleEmail,
@@ -15,8 +19,6 @@ import {
 import { deterministicObjectId } from "../lib/deterministic-id";
 import { readDeviceId } from "../lib/device";
 import { claimTrialOnSignup } from "../lib/trial-claim";
-
-const BCRYPT_ROUNDS = 10;
 
 const isDuplicateKey = (err: unknown) =>
   err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
@@ -28,12 +30,30 @@ authRouter.post(
   asyncHandler(async (req, res) => {
     const { email, password } = registerSchema.parse(req.body);
 
+    // Keyed on the address as well as the IP: a per-IP limit alone is defeated
+    // by any proxy pool, and a per-address one is what stops the same target
+    // being hammered from many of them.
+    await consumeRateLimit(`register:ip:${clientIp(req)}`, 10, 60 * 60 * 1000);
+    await consumeRateLimit(`register:email:${email}`, 5, 60 * 60 * 1000);
+
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {
       throw conflict("An account with this email already exists");
     }
 
-    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    // One account per machine, when asked for. Note what this is NOT: the
+    // anti-farm guarantee does not live here and needs no flag — a second
+    // account on a claimed machine SHARES the existing claim below and so gets
+    // no second trial whatever this is set to. This only decides whether to
+    // refuse outright, and it is behind a switch because its false positives
+    // are real people on shared or resold computers.
+    const fingerprint = parseFingerprint(req);
+    if (env.deviceBindingEnforced && fingerprint.signals.length > 0) {
+      const owner = await findBlockingClaimOwner(fingerprint.signals);
+      if (owner) throw deviceAlreadyClaimed();
+    }
+
+    const passwordHash = await hashPassword(password);
 
     // NO trial is stamped on the ACCOUNT any more. Registration used to hand out
     // fourteen days, which made a trial exactly as cheap as an email address —
@@ -53,7 +73,16 @@ authRouter.post(
     // would mean every account created by a current build resolved `expired` from
     // its first second. Best-effort — a ledger write must never cost someone the
     // account they just made.
-    await claimTrialOnSignup(user.id, readDeviceId(req));
+    await claimTrialOnSignup(user.id, readDeviceId(req), {
+      signals: fingerprint.signals,
+      // Only ever passed as an explicit false by a client that LOOKED for its
+      // hardware id and failed — see ClaimOptions. Absent stays absent.
+      ...(fingerprint.signals.length > 0 ? { hardwareBacked: fingerprint.hardwareBacked } : {}),
+    });
+
+    // Send the verification code inline, so the client does not need a second
+    // round trip before it can show the code screen. Never throws.
+    await sendVerificationCode(user.id, user.email);
 
     const token = signToken({ sub: user.id, email: user.email });
     res.status(201).json({ token, user: toPublicUser(user) });
@@ -65,13 +94,19 @@ authRouter.post(
   asyncHandler(async (req, res) => {
     const { email, password } = loginSchema.parse(req.body);
 
+    // Both keys, for opposite attacks: per-address stops a single account being
+    // ground through a password list, per-IP stops one host spraying one common
+    // password across many addresses. Either alone leaves the other wide open.
+    await consumeRateLimit(`login:email:${email}`, 10, 15 * 60 * 1000);
+    await consumeRateLimit(`login:ip:${clientIp(req)}`, 50, 15 * 60 * 1000);
+
     const user = await prisma.user.findUnique({ where: { email } });
     // A social-only account has no passwordHash → reject password login.
     if (!user || !user.passwordHash) {
       throw unauthorized("Invalid email or password");
     }
 
-    const ok = await bcrypt.compare(password, user.passwordHash);
+    const ok = await verifyPassword(password, user.passwordHash);
     if (!ok) {
       throw unauthorized("Invalid email or password");
     }

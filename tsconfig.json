@@ -16,5 +16,12 @@
     "sourceMap": true
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "src/**/*.test.ts"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/**/*.test.ts",
+    // Test-only, but not named *.test.ts, so it would otherwise be compiled into
+    // the shipped bundle as dead weight.
+    "src/routes/test-helpers.ts"
+  ]
 }

@@ -2,11 +2,17 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import request from "supertest";
 import { createApp } from "../app";
+import { stubAccountGuard } from "./test-helpers";
 import { signToken } from "../lib/jwt";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 
 const app = createApp();
+
+// This router now sits behind the account guard (see app.ts), which reads the
+// caller's account on every request. Answer that one read for the whole file;
+// every other user lookup still falls through and fails loudly if unstubbed.
+stubAccountGuard();
 const userId = "507f1f77bcf86cd799439011";
 const auth = {
   authorization: `Bearer ${signToken({ sub: userId, email: "user@example.com" })}`,

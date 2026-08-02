@@ -36,6 +36,20 @@ async function send(to: string, subject: string, html: string, text: string): Pr
   }
 }
 
+/** The shared card these emails are built from. Not a template engine — one
+ *  function, so the three messages cannot drift apart visually. */
+const shell = (inner: string) => `
+    <div style="font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial,sans-serif;max-width:480px;margin:0 auto;color:#1a1714">
+${inner}
+    </div>`;
+
+/** The big monospaced-looking code block, reused by both code emails. */
+const codeBlock = (label: string, code: string) => `
+      <div style="text-align:center;background:#faf7f1;border:1px solid #eae4d5;border-radius:14px;padding:22px;margin:0 0 20px">
+        <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#8a8175;margin-bottom:8px">${label}</div>
+        <div style="font-size:34px;font-weight:700;letter-spacing:.14em;color:#1a1714">${code}</div>
+      </div>`;
+
 /**
  * Email a partner the one-time code that turns the user's addiction protection
  * off. The recipient is the trusted partner, not the user.
@@ -60,5 +74,78 @@ export function sendOtpEmail(to: string, code: string): Promise<SendResult> {
         Share it only if you both agree it's the right moment — this code turns their protection off.
       </p>
     </div>`;
+  return send(to, subject, html, text);
+}
+
+/**
+ * Email someone the code that proves they can read the address they signed up
+ * with.
+ *
+ * The subject line carries the code on purpose: most people read it from a
+ * notification and never open the message, and a code they can act on from the
+ * lock screen is the difference between finishing signup and abandoning it.
+ */
+export function sendEmailVerificationCode(
+  to: string,
+  code: string,
+  ttlMinutes: number,
+): Promise<SendResult> {
+  const subject = `${code} is your WeLockin verification code`;
+  const text =
+    `Your WeLockin verification code is ${code}.\n\n` +
+    `It expires in ${ttlMinutes} minutes.\n\n` +
+    `If you didn't create a WeLockin account, you can ignore this email — ` +
+    `without the code, nothing happens.`;
+  const html = shell(`
+      <h2 style="font-size:18px;margin:0 0 8px">Confirm your email</h2>
+      <p style="font-size:14px;line-height:1.5;color:#5b5448;margin:0 0 20px">
+        Enter this code in <strong>WeLockin</strong> to finish setting up your account.
+      </p>
+${codeBlock("Verification code", code)}
+      <p style="font-size:13px;line-height:1.5;color:#8a8175;margin:0">
+        It expires in ${ttlMinutes} minutes. If you didn't create a WeLockin account,
+        ignore this email — without the code, nothing happens.
+      </p>`);
+  return send(to, subject, html, text);
+}
+
+/**
+ * Email a password-reset link.
+ *
+ * The URL is built by the caller from `PUBLIC_SITE_URL`, never from the request
+ * host — a link assembled from an attacker-supplied `Host` header is the
+ * classic way this exact email becomes an account-takeover primitive.
+ *
+ * Note what the copy does NOT do: it never says "someone requested a reset for
+ * your account". This message also goes out for addresses that have no account,
+ * so it must read sensibly to a stranger and confirm nothing either way.
+ */
+export function sendPasswordResetLink(
+  to: string,
+  url: string,
+  ttlMinutes: number,
+): Promise<SendResult> {
+  const subject = "Reset your WeLockin password";
+  const text =
+    `Open this link to choose a new WeLockin password:\n\n${url}\n\n` +
+    `The link works once and expires in ${ttlMinutes} minutes.\n\n` +
+    `If you didn't ask for this, ignore this email — your password stays as it is.`;
+  const html = shell(`
+      <h2 style="font-size:18px;margin:0 0 8px">Reset your password</h2>
+      <p style="font-size:14px;line-height:1.5;color:#5b5448;margin:0 0 20px">
+        Choose a new password for your <strong>WeLockin</strong> account.
+      </p>
+      <div style="text-align:center;margin:0 0 20px">
+        <a href="${url}" style="display:inline-block;background:#1a1714;color:#ffffff;text-decoration:none;font-size:15px;font-weight:600;padding:14px 26px;border-radius:12px">
+          Choose a new password
+        </a>
+      </div>
+      <p style="font-size:12px;line-height:1.5;color:#8a8175;margin:0 0 16px;word-break:break-all">
+        Or paste this into your browser:<br />${url}
+      </p>
+      <p style="font-size:13px;line-height:1.5;color:#8a8175;margin:0">
+        The link works once and expires in ${ttlMinutes} minutes. If you didn't ask
+        for this, ignore this email — your password stays as it is.
+      </p>`);
   return send(to, subject, html, text);
 }

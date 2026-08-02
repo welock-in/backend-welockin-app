@@ -2,6 +2,7 @@ import { Prisma, type TrialClaim } from "@prisma/client";
 import { prisma } from "./prisma";
 import { env } from "./env";
 import { ledgerHash } from "./hash";
+import { matchClaimByFingerprint, recordSignals, type Signal } from "./fingerprint";
 
 /**
  * The trial ledger: one free window per MACHINE, and it outlives the account.
@@ -60,6 +61,19 @@ export type ClaimOptions = {
   hardwareBacked?: boolean;
   /** The client's own clock. Recorded as a signal, never used for timing. */
   clientTime?: Date;
+  /**
+   * Composite hardware signals (desktop only — see lib/fingerprint.ts).
+   *
+   * A FOURTH way to recognise a machine, consulted only after the account and
+   * device-id legs come up empty. It exists because the device id is a value
+   * the client stores and can therefore reset: wipe it and the ledger sees a
+   * new machine. The MachineGuid and volume serial do not move when app data
+   * does, so they close that gap.
+   *
+   * Recorded on every claim, matched or fresh, so a machine stays recognisable
+   * as its hardware changes around it.
+   */
+  signals?: Signal[];
 };
 
 /**
@@ -83,7 +97,26 @@ export async function claimTrial(
   const clockSkewMs = opts.clientTime ? opts.clientTime.getTime() - now.getTime() : undefined;
   const overSkew = clockSkewMs != null && Math.abs(clockSkewMs) > CLOCK_SKEW_THRESHOLD_MS;
 
-  const prior = await findClaim(deviceIdHash, userId, idfvHash);
+  const signals = opts.signals ?? [];
+
+  // The account and device-id legs first, then the hardware. Order matters: the
+  // hardware match is the fallback for a device id that was reset, not a
+  // replacement for the cheap lookups.
+  let prior = await findClaim(deviceIdHash, userId, idfvHash);
+  if (!prior && signals.length > 0) {
+    const matchedId = await matchClaimByFingerprint(signals);
+    if (matchedId) {
+      prior = await prisma.trialClaim.findUnique({ where: { id: matchedId } });
+    }
+  }
+
+  if (prior) {
+    // Record BEFORE the early return below, so a claim recognised by one signal
+    // learns the others — that is how a machine stays matchable after the one
+    // signal that identified it changes.
+    if (signals.length > 0) await recordSignals(prior.id, signals);
+  }
+
   if (prior) {
     if (clockSkewMs == null) return prior;
     // A claim exists → startedAt / endsAt / trialDays are untouchable. Only the
@@ -109,7 +142,7 @@ export async function claimTrial(
   const days = unproven ? env.trialDaysUnverified : env.trialDays;
 
   try {
-    return await prisma.trialClaim.create({
+    const created = await prisma.trialClaim.create({
       data: {
         deviceIdHash,
         idfvHash,
@@ -124,11 +157,15 @@ export async function claimTrial(
         ...(overSkew ? { skewStrikes: 1 } : {}),
       },
     });
+    if (signals.length > 0) await recordSignals(created.id, signals);
+    return created;
   } catch (err) {
     // Someone else claimed this machine first. NOT an error, and explicitly not a
     // reset: the winner's window stands, so read it back and return that.
     if (!isDuplicateKey(err)) throw err;
-    return findClaim(deviceIdHash, userId, idfvHash);
+    const winner = await findClaim(deviceIdHash, userId, idfvHash);
+    if (winner && signals.length > 0) await recordSignals(winner.id, signals);
+    return winner;
   }
 }
 
@@ -146,10 +183,14 @@ export async function claimTrial(
  * to a three-day trial. Unknown means the benefit of the doubt; the anchor is
  * still one window per machine either way.
  */
-export async function claimTrialOnSignup(userId: string, deviceId: string): Promise<void> {
+export async function claimTrialOnSignup(
+  userId: string,
+  deviceId: string,
+  opts: ClaimOptions = {},
+): Promise<void> {
   if (!deviceId) return;
   try {
-    await claimTrial(userId, deviceId);
+    await claimTrial(userId, deviceId, opts);
   } catch (err) {
     // A ledger write that failed must never cost someone their account — they
     // would have no way to retry it, and the row they did get would be unusable.

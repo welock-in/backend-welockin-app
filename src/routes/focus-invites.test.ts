@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import request from "supertest";
 import { createApp } from "../app";
+import { stubAccountGuard } from "./test-helpers";
 import { signToken } from "../lib/jwt";
 import { prisma } from "../lib/prisma";
 import { resolveAudience } from "../services/notifications/audience";
@@ -11,6 +12,11 @@ import { resolveAudience } from "../services/notifications/audience";
 // paper over: who may be targeted, what a late joiner runs for, and scoping.
 
 const app = createApp();
+
+// This router now sits behind the account guard (see app.ts), which reads the
+// caller's account on every request. Answer that one read for the whole file;
+// every other user lookup still falls through and fails loudly if unstubbed.
+stubAccountGuard();
 const userId = "507f1f77bcf86cd799439011";
 const MAC = "mac-ba2f7ca4-ba2a-5f93-b21d-8c038f226086";
 const PHONE = "ios-57dd1ac9-3acb-40e2-8e6a-b6c79bc80dd3";

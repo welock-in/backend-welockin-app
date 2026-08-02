@@ -1,13 +1,41 @@
 import { z } from "zod";
 
+/**
+ * The password rule, defined once.
+ *
+ * Shared with the reset flow deliberately: a reset that accepted a weaker
+ * password than registration would be a downgrade path around the rule rather
+ * than a second opinion about it.
+ */
+const passwordRule = z.string().min(8, "Password must be at least 8 characters");
+
+/** Address normalisation, shared so a lookup can never miss on casing alone. */
+const emailRule = z.string().trim().toLowerCase().email();
+
 export const registerSchema = z.object({
-  email: z.string().trim().toLowerCase().email(),
-  password: z.string().min(8, "Password must be at least 8 characters"),
+  email: emailRule,
+  password: passwordRule,
 });
 
 export const loginSchema = z.object({
-  email: z.string().trim().toLowerCase().email(),
+  email: emailRule,
   password: z.string().min(1, "Password is required"),
+});
+
+// --- Email verification -----------------------------------------------------
+/** Exactly six digits. Anything else never reaches the database. */
+export const verifyEmailSchema = z.object({
+  code: z.string().trim().regex(/^[0-9]{6}$/, "Enter the 6-digit code"),
+});
+
+// --- Password reset ---------------------------------------------------------
+export const passwordResetRequestSchema = z.object({ email: emailRule });
+
+export const passwordResetSchema = z.object({
+  // Bounded on both sides: a base64url-encoded 32-byte token is 43 characters,
+  // and the ceiling keeps a megabyte of junk from ever being hashed.
+  token: z.string().trim().min(20).max(256),
+  password: passwordRule,
 });
 
 /** Spellings seen in the wild, normalised so `platform` can be a real enum. */

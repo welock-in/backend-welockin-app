@@ -88,3 +88,66 @@ export const onboardingIncomplete = (missing: string[]) =>
  */
 export const accountGone = (msg = "This account no longer exists") =>
   new HttpError(404, msg, { code: "ACCOUNT_NOT_FOUND" });
+
+// --- Email verification -----------------------------------------------------
+/**
+ * The account exists and the credentials were fine, but the address behind it
+ * has never been proved.
+ *
+ * Carries the address so the client can say "we sent a code to j***@gmail.com"
+ * without a second round trip, and MUST carry the code: this is the one 403 a
+ * client is expected to recover from on its own (show the code screen) rather
+ * than treat as "you may not do that".
+ */
+export const emailNotVerified = (email: string) =>
+  new HttpError(403, "Verify your email address to continue", {
+    code: "EMAIL_NOT_VERIFIED",
+    details: { email },
+  });
+/**
+ * Wrong code, expired code, or no outstanding code — deliberately one answer.
+ *
+ * 400, NOT 401, and the distinction is load-bearing rather than pedantic. The
+ * request WAS authenticated: the bearer token is valid and the account is real,
+ * and only a form field is wrong. Clients treat 401 as "this session is dead"
+ * and discard the token on it — the desktop app clears the Windows Credential
+ * Manager entry — so a 401 here meant one mistyped digit signed the user out and
+ * the next attempt failed with "not signed in". A genuinely expired token still
+ * produces a 401, from `requireAuth`, where it belongs.
+ */
+export const verificationCodeInvalid = (msg = "Incorrect or expired code") =>
+  new HttpError(400, msg, { code: "VERIFICATION_CODE_INVALID" });
+/**
+ * The attempt budget for this code is spent and the code is now dead.
+ *
+ * Distinct from the above on purpose: the recovery differs. "Wrong code" means
+ * try again, this means request a new one — and a client that showed "incorrect
+ * code" here would leave the user retyping a code that can no longer ever work.
+ */
+export const verificationAttemptsExhausted = (
+  msg = "Too many attempts — request a new code",
+) => new HttpError(400, msg, { code: "VERIFICATION_ATTEMPTS_EXHAUSTED" });
+
+// --- Password reset ---------------------------------------------------------
+/**
+ * ONE answer for expired, already-used and never-existed.
+ *
+ * Telling those apart would tell an attacker holding a guessed token which
+ * guesses are real, and telling a stranger that an address has an outstanding
+ * reset is itself an account-existence oracle.
+ */
+export const resetTokenInvalid = (msg = "This link has expired or has already been used") =>
+  new HttpError(400, msg, { code: "RESET_TOKEN_INVALID" });
+
+// --- Device binding ---------------------------------------------------------
+/**
+ * This machine already belongs to another account, and `DEVICE_BINDING_ENFORCED`
+ * says to refuse rather than merely withhold a second trial.
+ *
+ * The message names a way out on purpose. Everyone who hits this legitimately —
+ * a shared computer, a resold laptop — needs a human, and an error with no
+ * address to write to converts them into a lost customer instead of a ticket.
+ */
+export const deviceAlreadyClaimed = (
+  msg = "This computer is already linked to a WeLockIn account. Sign in with it, or contact hello@welock.in.",
+) => new HttpError(409, msg, { code: "DEVICE_ALREADY_CLAIMED" });

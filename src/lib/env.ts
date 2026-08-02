@@ -65,6 +65,29 @@ function resolveTrialPepper(): string {
   return createHmac("sha256", jwtSecret).update("welockin/trial-ledger-pepper/v1").digest("hex");
 }
 
+/**
+ * The server-only key behind emailed verification codes and reset tokens.
+ *
+ * Same derive-don't-die posture as the trial pepper above, but read the warning
+ * differently: rotating THIS one is harmless. It only invalidates the codes and
+ * links currently in flight, which expire in minutes anyway — nobody loses an
+ * entitlement over it. That is precisely why it must not share the ledger's
+ * pepper, whose rotation is a data-loss event.
+ */
+function resolveAuthPepper(): string {
+  const explicit = process.env.AUTH_TOKEN_PEPPER;
+  if (explicit) return explicit;
+  return createHmac("sha256", jwtSecret).update("welockin/auth-token-pepper/v1").digest("hex");
+}
+
+/**
+ * Strip trailing slashes so callers can concatenate a path without minting a
+ * `//` that some proxies redirect and some do not.
+ */
+function resolvePublicSiteUrl(): string {
+  return (process.env.PUBLIC_SITE_URL ?? "https://www.welock.in").replace(/\/+$/, "");
+}
+
 export const env = {
   port: Number.parseInt(process.env.PORT ?? "8787", 10),
   databaseUrl: required("DATABASE_URL", "mongodb://localhost:27017/welockin"),
@@ -161,6 +184,65 @@ export const env = {
    * the user can delete. Without this, "make ioreg unreadable" is the bypass.
    */
   trialDaysUnverified: Number.parseInt(process.env.TRIAL_DAYS_UNVERIFIED ?? "3", 10),
+
+  // --- Email verification + password reset -----------------------------------
+  /** Server-only HMAC key for emailed codes/tokens. See resolveAuthPepper. */
+  authTokenPepper: resolveAuthPepper(),
+  /**
+   * Base URL of the marketing site, used to build the emailed reset link.
+   *
+   * NEVER derive this from `req.headers.host`. Behind any permissive proxy that
+   * header is attacker-controlled, and a reset link is exactly the payload you
+   * do not want pointed at a host of someone else's choosing.
+   *
+   * Note the `www`: the apex 308-redirects to it, and a redirect in the middle
+   * of a link people click from a mail client is a needless place to lose them.
+   */
+  publicSiteUrl: resolvePublicSiteUrl(),
+  emailVerificationTtlMinutes: Number.parseInt(
+    process.env.EMAIL_VERIFICATION_TTL_MINUTES ?? "10",
+    10,
+  ),
+  emailVerificationMaxAttempts: Number.parseInt(
+    process.env.EMAIL_VERIFICATION_MAX_ATTEMPTS ?? "5",
+    10,
+  ),
+  passwordResetTtlMinutes: Number.parseInt(process.env.PASSWORD_RESET_TTL_MINUTES ?? "60", 10),
+  /**
+   * May the API refuse an unverified account?
+   *
+   * OFF by default, and the reason is the same shape as `entitlementEnforced`:
+   * every account that predates this feature reads `emailVerified` false or
+   * null, so flipping it without first backfilling that cohort locks out the
+   * entire existing user base at once — none of whom have a code in hand.
+   *
+   * The order is: ship the verification flow → run `npm run auth:migrate` (which
+   * grandfathers existing accounts) → make sure EVERY client (Windows, macOS,
+   * mobile) can render the code screen in response to a 403 EMAIL_NOT_VERIFIED →
+   * only then turn this on. A client that cannot handle the 403 is a client
+   * whose users simply see an error they cannot act on.
+   */
+  emailVerificationEnforced: (process.env.EMAIL_VERIFICATION_ENFORCED ?? "false") === "true",
+  /**
+   * May registration be REFUSED because this machine already belongs to another
+   * account?
+   *
+   * Independent of the anti-farm guarantee, which needs no flag: a second
+   * account on a claimed machine shares the existing claim and therefore gets no
+   * second trial whatever this is set to. This only controls the hard 409, whose
+   * false positives are real people — a shared family PC, a resold laptop, a
+   * lab machine — and which therefore needs an off switch that works in thirty
+   * seconds without a deploy.
+   */
+  deviceBindingEnforced: (process.env.DEVICE_BINDING_ENFORCED ?? "false") === "true",
+  /**
+   * Turn off auth rate limiting. TESTS ONLY.
+   *
+   * Requires the literal string "true" for the same reason
+   * `lemonSqueezyAllowTestMode` does: anything inferred from an unset NODE_ENV
+   * fails open on more machines than anyone expects.
+   */
+  authRateLimitDisabled: process.env.AUTH_RATE_LIMIT_DISABLED === "true",
 };
 
 export type PaymentConfigVerdict = {

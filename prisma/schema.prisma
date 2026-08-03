@@ -862,8 +862,21 @@ model Release {
   versionKey String
   notes      String  @default("")
   pubDate    DateTime
-  /// Absolute URL of the installer (R2). Immutable per version.
+  /// Absolute URL of the artifact the UPDATER downloads. Immutable per version.
   url String
+  /// Absolute URL of the artifact a HUMAN downloads, when it is a different
+  /// file. Optional, and absent means "same as `url`" — on Windows both are the
+  /// one `setup.exe`, so nothing existing has to change.
+  ///
+  /// macOS is why this exists. A release there produces two artifacts that are
+  /// NOT interchangeable: `.app.tar.gz`, which is the only shape Tauri's updater
+  /// can verify and unpack, and `.dmg`, which is the only shape a person can
+  /// install from. Hand the tarball to a browser and it expands to a bare `.app`
+  /// in ~/Downloads, macOS runs it translocated from a read-only temporary path,
+  /// and the app cannot arm its enforcement from a location that vanishes when
+  /// it quits. The visitor installs a blocker that blocks nothing, and is told
+  /// nothing.
+  installerUrl String?
   /// Verbatim contents of the .sig Tauri emits next to the installer. The client
   /// verifies the download against the pubkey compiled into it, so this value
   /// being wrong means "no client will install", never "an unsigned install".

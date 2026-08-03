@@ -285,10 +285,18 @@ test("a database failure answers 204 rather than an error", async (t) => {
     throw new Error("mongo is down");
   });
 
-  const res = await request(app).get("/api/updates/darwin/aarch64/stable/0.2.0");
   // The updater must never be able to break the app: any doubt reads as
-  // "you're up to date".
-  assert.ok(res.status === 204 || res.status >= 500, `got ${res.status}`);
+  // "you're up to date". A 500 would also arrive with no Cache-Control, so an
+  // outage would turn every machine's update check into origin traffic.
+  const manifest = await request(app).get("/api/updates/darwin/aarch64/stable/0.2.0");
+  assert.equal(manifest.status, 204);
+
+  const download = await request(app).get("/api/updates/download");
+  assert.equal(download.status, 404, "honest, and something the page can render");
+
+  const latest = await request(app).get("/api/updates/latest");
+  assert.equal(latest.status, 200);
+  assert.equal(latest.body.available, false);
 });
 
 test("a malformed version is refused without a query", async (t) => {
@@ -296,4 +304,121 @@ test("a malformed version is refused without a query", async (t) => {
   const res = await request(app).get("/api/updates/darwin/aarch64/stable/not-a-version");
   assert.equal(res.status, 204);
   assert.equal(calls.length, 0);
+});
+
+/* ── the download door: /download and /latest ──────────────────────────── */
+
+test("the bare download link still redirects to the Windows installer", async (t) => {
+  fakeReleases(t, [release()]);
+  const res = await request(app).get("/api/updates/download");
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.location.endsWith(".exe"), res.headers.location);
+});
+
+/**
+ * THE regression this file exists to prevent, and the reason `installerUrl` was
+ * added at all.
+ *
+ * A browser handed the `.app.tar.gz` expands it to a bare `.app` in ~/Downloads.
+ * macOS then runs it translocated, from a read-only temporary path that vanishes
+ * on quit, and the app cannot arm its enforcement from there. Nothing errors:
+ * the visitor installs a blocker that blocks nothing. This assertion is cheap
+ * and the failure it catches is silent, which is exactly the trade worth making.
+ */
+test("a Mac visitor is never handed the updater tarball", async (t) => {
+  fakeReleases(t, [
+    release({
+      id: "r2",
+      target: "darwin",
+      arch: "aarch64",
+      version: "0.2.0",
+      versionKey: toSortKey("0.2.0"),
+      url: "https://cdn/WeLockIn_0.2.0_aarch64.app.tar.gz",
+      installerUrl: "https://cdn/WeLockIn_0.2.0_aarch64.dmg",
+    }),
+  ]);
+
+  const res = await request(app).get("/api/updates/download?target=darwin&arch=aarch64");
+
+  assert.equal(res.status, 302);
+  const to = res.headers.location as string;
+  assert.ok(to.endsWith(".dmg"), `expected a .dmg, got ${to}`);
+  assert.ok(!to.endsWith(".tar.gz"), "the updater artifact must never reach a browser");
+});
+
+test("without an installerUrl the download falls back to url", async (t) => {
+  // Windows registers one file for both jobs, so the field is absent there.
+  fakeReleases(t, [release({ installerUrl: null })]);
+  const res = await request(app).get("/api/updates/download?target=windows&arch=x86_64");
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.location.endsWith(".exe"));
+});
+
+test("a Mac download 404s while no macOS release is published", async (t) => {
+  fakeReleases(t, [release()]);
+  const res = await request(app).get("/api/updates/download?target=darwin&arch=aarch64");
+  assert.equal(res.status, 404);
+  assert.ok(!String(res.text).includes(".exe"), "and never falls back to the Windows file");
+});
+
+test("a misspelled platform is a 400, not a .exe", async (t) => {
+  fakeReleases(t, [release()]);
+  for (const q of ["?target=macos&arch=aarch64", "?target=darwin&arch=x86_64", "?target=linux&arch=x86_64"]) {
+    const res = await request(app).get(`/api/updates/download${q}`);
+    assert.equal(res.status, 400, q);
+    assert.match(String(res.body.error), /darwin\/aarch64/);
+  }
+});
+
+/**
+ * A ramp protects machines that already work from a bad update. A first-time
+ * visitor has nothing to regress from — and gating this on 100% meant the
+ * site's primary button answered 404 for the whole of every canary.
+ */
+test("a canary is still downloadable, but a paused release is not", async (t) => {
+  fakeReleases(t, [release({ rolloutPercent: 1 })]);
+  const canary = await request(app).get("/api/updates/download");
+  assert.equal(canary.status, 302, "a 1% ramp must not break the download page");
+
+  invalidateReleaseCache();
+  fakeReleases(t, [release({ status: "paused" })]);
+  const paused = await request(app).get("/api/updates/download");
+  assert.equal(paused.status, 404, "but the kill switch still pulls it from downloads");
+});
+
+test("latest describes the same platform it was asked about", async (t) => {
+  fakeReleases(t, [
+    release(),
+    release({
+      id: "r2",
+      target: "darwin",
+      arch: "aarch64",
+      version: "0.2.0",
+      versionKey: toSortKey("0.2.0"),
+      sizeBytes: 12_345_678,
+      installerUrl: "https://cdn/mac.dmg",
+    }),
+  ]);
+
+  const mac = await request(app).get("/api/updates/latest?target=darwin&arch=aarch64");
+  assert.equal(mac.status, 200);
+  assert.equal(mac.body.available, true);
+  assert.equal(mac.body.version, "0.2.0");
+  assert.equal(mac.body.platform, "darwin");
+  assert.equal(mac.body.arch, "aarch64");
+  assert.equal(mac.body.sizeBytes, 12_345_678);
+  // The link it hands back must carry the platform, or a page copying it would
+  // point a Mac card at the Windows installer.
+  assert.match(String(mac.body.downloadUrl), /target=darwin&arch=aarch64/);
+
+  const win = await request(app).get("/api/updates/latest");
+  assert.equal(win.body.version, "0.3.2", "and the bare call still means Windows");
+  assert.equal(win.body.platform, "windows");
+});
+
+test("latest reports unavailable rather than erroring when nothing is published", async (t) => {
+  fakeReleases(t, [release()]);
+  const res = await request(app).get("/api/updates/latest?target=darwin&arch=aarch64");
+  assert.equal(res.status, 200, "a web page has to render something either way");
+  assert.equal(res.body.available, false);
 });

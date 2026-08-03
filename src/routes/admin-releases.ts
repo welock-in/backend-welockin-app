@@ -25,6 +25,15 @@ const createSchema = z
   .object({
     version: versionField,
     url: z.string().trim().url(),
+    /**
+     * The human-facing artifact, when it differs from `url`.
+     *
+     * Optional and defaulted downstream to `url`, so the Windows pipeline —
+     * where the installer and the update payload are the same setup.exe — needs
+     * no change. See the field's note in the schema for why macOS cannot share
+     * one file.
+     */
+    installerUrl: z.string().trim().url().optional(),
     signature: z.string().trim().min(1),
     notes: z.string().trim().max(4000).optional().default(""),
     sha256: z.string().trim().optional(),

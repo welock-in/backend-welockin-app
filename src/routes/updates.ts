@@ -3,7 +3,7 @@ import type { Release } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { asyncHandler } from "../middleware/async-handler";
 import { compare, isValid } from "../lib/semver";
-import { isSupportedTarget } from "../lib/update-targets";
+import { isSupportedTarget, supportedTargetList } from "../lib/update-targets";
 
 // Desktop auto-update manifest. PUBLIC and unauthenticated by design — a client
 // that can't reach it must simply keep working, and requiring a token would mean
@@ -49,10 +49,27 @@ async function liveRelease(target: string, arch: string): Promise<Release | null
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < TTL_MS) return hit.row;
 
-  const row = await prisma.release.findFirst({
-    where: { channel: "stable", target, arch, status: "live" },
-    orderBy: { versionKey: "desc" },
-  });
+  let row: Release | null;
+  try {
+    row = await prisma.release.findFirst({
+      where: { channel: "stable", target, arch, status: "live" },
+      orderBy: { versionKey: "desc" },
+    });
+  } catch (e) {
+    // FAIL SAFE, as the header of this file promises — and the promise was not
+    // being kept: a database failure escaped to the error middleware and became
+    // a 500. Two reasons that is the wrong answer here. The updater's contract
+    // is that any doubt means "you're up to date", never an error a client has
+    // to interpret. And a 500 carries no Cache-Control, so during an outage
+    // every machine in the fleet hammers the failing origin on its own schedule
+    // instead of letting the edge keep serving the last good manifest for a day
+    // (`stale-if-error`).
+    //
+    // NOT cached: a failure must not pin an empty answer for the TTL, so the
+    // first request after recovery gets a real one.
+    console.error(`[updates] release lookup failed for ${key}:`, e);
+    return null;
+  }
   cache.set(key, { at: Date.now(), row });
   return row;
 }
@@ -128,23 +145,65 @@ updatesRouter.get(
 );
 
 /**
- * GET /api/updates/download — 302 to the current fully-rolled-out installer.
+ * Which platform is this caller asking about?
+ *
+ * Defaults to Windows so every link that predates macOS keeps working untouched
+ * — the site has `/api/updates/download` hardcoded in one place, and it must
+ * keep meaning what it meant. Anything outside the shared allow-list is a 400
+ * rather than a silent fallback: `?target=macos` is a typo, and answering it
+ * with a `.exe` would be the worst possible guess.
+ */
+function askedFor(req: import("express").Request):
+  | { ok: true; target: string; arch: string }
+  | { ok: false } {
+  const target = typeof req.query.target === "string" ? req.query.target : "windows";
+  const arch = typeof req.query.arch === "string" ? req.query.arch : "x86_64";
+  return isSupportedTarget(target, arch) ? { ok: true, target, arch } : { ok: false };
+}
+
+const badTarget = (res: import("express").Response): void => {
+  res.status(400).json({ error: `Unsupported target/arch. Supported: ${supportedTargetList()}` });
+};
+
+/**
+ * What a HUMAN should download for this release.
+ *
+ * `installerUrl` when the release has one, `url` otherwise. On Windows they are
+ * the same setup.exe and the field is absent; on macOS they are two different
+ * files and serving the wrong one is silent — see the schema's note on
+ * `installerUrl`.
+ */
+const installerFor = (rel: Release): string => rel.installerUrl ?? rel.url;
+
+/**
+ * GET /api/updates/download[?target=&arch=] — 302 to the current installer.
  *
  * This is the permanent download link for the website, so the site's HTML never
  * changes when a version ships. A redirect has no body, so the serverless
  * response cap doesn't apply. It is also the recovery channel for a build that
  * crashes on launch and therefore can't auto-update itself.
+ *
+ * ROLLOUT DOES NOT APPLY HERE, and that is a deliberate change from how this
+ * behaved. A ramp exists to protect machines that already work from a bad
+ * update; someone downloading for the first time has nothing to regress from.
+ * Gating on 100% meant the site's primary button answered 404 for the entire
+ * duration of every canary — a broken download page is a worse failure than an
+ * early adopter. The kill switch still covers this path: pausing a release
+ * takes it out of `live`, so it stops being handed out here too.
  */
 updatesRouter.get(
   "/download",
-  asyncHandler(async (_req, res) => {
-    const rel = await liveRelease("windows", "x86_64");
-    if (!rel || rel.rolloutPercent < 100) {
+  asyncHandler(async (req, res) => {
+    const want = askedFor(req);
+    if (!want.ok) return badTarget(res);
+
+    const rel = await liveRelease(want.target, want.arch);
+    if (!rel) {
       res.status(404).json({ error: "No download is available right now" });
       return;
     }
     res.setHeader("Cache-Control", "public, max-age=60, s-maxage=60");
-    res.redirect(302, rel.url);
+    res.redirect(302, installerFor(rel));
   }),
 );
 
@@ -157,29 +216,36 @@ updatesRouter.get(
  * which is the same staleness the updater was built to end — a download page
  * advertising a version nobody ships is worse than one that says nothing.
  *
- * Deliberately NOT the update manifest: no signature, no rollout logic, and it
- * answers only for the release everyone is entitled to (100%), so a canary is
- * never advertised publicly. `available: false` rather than a 404, because the
- * caller is a web page that has to render something either way.
+ * Deliberately NOT the update manifest: no signature and no rollout gate — it
+ * describes whatever `/download` would hand over, and the two must never
+ * disagree about the version a page advertises versus the file it serves.
+ * `available: false` rather than a 404, because the caller is a web page that
+ * has to render something either way.
  */
 updatesRouter.get(
   "/latest",
-  asyncHandler(async (_req, res) => {
-    const rel = await liveRelease("windows", "x86_64");
+  asyncHandler(async (req, res) => {
+    const want = askedFor(req);
+    if (!want.ok) return badTarget(res);
+
+    const rel = await liveRelease(want.target, want.arch);
     res.setHeader("Cache-Control", CACHE);
-    if (!rel || rel.rolloutPercent < 100) {
+    if (!rel) {
       res.json({ available: false });
       return;
     }
     res.json({
       available: true,
       version: rel.version,
-      platform: "windows",
+      platform: want.target,
+      arch: want.arch,
       sizeBytes: rel.sizeBytes,
       pubDate: rel.pubDate.toISOString(),
       notes: rel.notes,
-      // The permanent link, so a page never has to build a URL itself.
-      downloadUrl: "/api/updates/download",
+      // The permanent link, so a page never has to build a URL itself — now
+      // carrying the platform it was asked about, so a Mac card cannot end up
+      // pointing at the Windows installer through a copied string.
+      downloadUrl: `/api/updates/download?target=${want.target}&arch=${want.arch}`,
     });
   }),
 );

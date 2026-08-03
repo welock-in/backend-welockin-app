@@ -125,3 +125,39 @@ updatesRouter.get(
     res.redirect(302, rel.url);
   }),
 );
+
+/**
+ * GET /api/updates/latest — what the download page should say about the build
+ * behind /download.
+ *
+ * Exists so a marketing page never hardcodes "Version 0.3.2 · 11 MB". A number
+ * typed into HTML is correct until the next release and wrong forever after,
+ * which is the same staleness the updater was built to end — a download page
+ * advertising a version nobody ships is worse than one that says nothing.
+ *
+ * Deliberately NOT the update manifest: no signature, no rollout logic, and it
+ * answers only for the release everyone is entitled to (100%), so a canary is
+ * never advertised publicly. `available: false` rather than a 404, because the
+ * caller is a web page that has to render something either way.
+ */
+updatesRouter.get(
+  "/latest",
+  asyncHandler(async (_req, res) => {
+    const rel = await liveRelease("windows", "x86_64");
+    res.setHeader("Cache-Control", CACHE);
+    if (!rel || rel.rolloutPercent < 100) {
+      res.json({ available: false });
+      return;
+    }
+    res.json({
+      available: true,
+      version: rel.version,
+      platform: "windows",
+      sizeBytes: rel.sizeBytes,
+      pubDate: rel.pubDate.toISOString(),
+      notes: rel.notes,
+      // The permanent link, so a page never has to build a URL itself.
+      downloadUrl: "/api/updates/download",
+    });
+  }),
+);

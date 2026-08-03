@@ -3,6 +3,7 @@ import type { Release } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { asyncHandler } from "../middleware/async-handler";
 import { compare, isValid } from "../lib/semver";
+import { isSupportedTarget } from "../lib/update-targets";
 
 // Desktop auto-update manifest. PUBLIC and unauthenticated by design — a client
 // that can't reach it must simply keep working, and requiring a token would mean
@@ -34,24 +35,38 @@ function nothing(res: import("express").Response): void {
 
 // A tiny in-process cache. Warm serverless containers then answer with zero
 // Mongo round-trips, which on this stack is the dominant cost.
+//
+// ONE ENTRY PER PLATFORM, not one entry total. A single slot was right while
+// there was a single platform; with two, a Windows request and a Mac request
+// evict each other on every alternation, so the cache would hold nothing on a
+// container serving both. Bounded by lib/update-targets — two rows today, and
+// it can only ever hold as many as there are supported pairs.
 const TTL_MS = 30_000;
-let cached: { at: number; key: string; row: Release | null } | null = null;
+const cache = new Map<string, { at: number; row: Release | null }>();
 
 async function liveRelease(target: string, arch: string): Promise<Release | null> {
   const key = `${target}/${arch}`;
-  if (cached && cached.key === key && Date.now() - cached.at < TTL_MS) return cached.row;
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.at < TTL_MS) return hit.row;
 
   const row = await prisma.release.findFirst({
     where: { channel: "stable", target, arch, status: "live" },
     orderBy: { versionKey: "desc" },
   });
-  cached = { at: Date.now(), key, row };
+  cache.set(key, { at: Date.now(), row });
   return row;
 }
 
-/** Let a write path drop the cache so a pause takes effect immediately here. */
+/**
+ * Let a write path drop the cache so a pause takes effect immediately here.
+ *
+ * Clears EVERY platform rather than the one that changed: the write paths do
+ * not tell us which they touched, and a stale Windows manifest served because a
+ * Mac release was paused is exactly the kind of cross-platform surprise this
+ * whole change exists to avoid. Two rows are not worth being clever about.
+ */
 export function invalidateReleaseCache(): void {
-  cached = null;
+  cache.clear();
 }
 
 /**
@@ -83,7 +98,14 @@ updatesRouter.get(
     const { target, arch, bucket, version } = req.params;
 
     // Validate before touching the DB, so a crafted path can't cost us a query.
-    if (target !== "windows" || arch !== "x86_64") return nothing(res);
+    //
+    // Checked as a PAIR, against lib/update-targets. Testing the two fields
+    // independently would let `darwin/x86_64` through to the query, where it
+    // would find nothing today — but would quietly start serving the aarch64
+    // build the moment someone registered one under a looser arch. An Intel Mac
+    // that installs an Apple-silicon build does not fail to update, it fails to
+    // start.
+    if (!isSupportedTarget(target, arch)) return nothing(res);
     if (!/^([0-9]|[1-9][0-9]|stable)$/.test(bucket)) return nothing(res);
     if (!isValid(version)) return nothing(res);
 

@@ -5,6 +5,7 @@ import { requireAdmin } from "../middleware/admin-auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { badRequest, notFound } from "../lib/http-error";
 import { compare, isValid, toSortKey } from "../lib/semver";
+import { isSupportedTarget, supportedTargetList } from "../lib/update-targets";
 import { invalidateReleaseCache } from "./updates";
 
 // Release control plane for the desktop auto-updater. Admin-only; the matching
@@ -20,17 +21,38 @@ const versionField = z
   .trim()
   .refine(isValid, "Must be semver, e.g. 0.2.0");
 
-const createSchema = z.object({
-  version: versionField,
-  url: z.string().trim().url(),
-  signature: z.string().trim().min(1),
-  notes: z.string().trim().max(4000).optional().default(""),
-  sha256: z.string().trim().optional(),
-  sizeBytes: z.number().int().positive().optional(),
-  target: z.string().trim().default("windows"),
-  arch: z.string().trim().default("x86_64"),
-  channel: z.string().trim().default("stable"),
-});
+const createSchema = z
+  .object({
+    version: versionField,
+    url: z.string().trim().url(),
+    signature: z.string().trim().min(1),
+    notes: z.string().trim().max(4000).optional().default(""),
+    sha256: z.string().trim().optional(),
+    sizeBytes: z.number().int().positive().optional(),
+    /**
+     * Optional, defaulting to Windows.
+     *
+     * The default is load-bearing, not politeness: the shipped Windows
+     * `release.mjs` sends neither field, so making them required would break
+     * the pipeline that publishes the app most people are running.
+     */
+    target: z.string().trim().default("windows"),
+    arch: z.string().trim().default("x86_64"),
+    channel: z.string().trim().default("stable"),
+  })
+  /**
+   * Rejected as a PAIR, against the same list the public route reads.
+   *
+   * A free-form string here was the quiet failure mode: `"macos"` instead of
+   * `"darwin"` creates a perfectly valid-looking release that publishes, ramps,
+   * and reaches nobody — because the updater asks for `darwin`, and nothing
+   * anywhere reports a mismatch. The typo would surface as "the Mac update
+   * doesn't work", days later, with no error to search for.
+   */
+  .refine((v) => isSupportedTarget(v.target, v.arch), {
+    message: `Unsupported target/arch. Supported: ${supportedTargetList()}`,
+    path: ["target"],
+  });
 
 const publishSchema = z.object({
   rolloutPercent: z.number().int().min(0).max(100).default(0),

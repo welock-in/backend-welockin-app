@@ -88,8 +88,29 @@ function resolvePublicSiteUrl(): string {
   return (process.env.PUBLIC_SITE_URL ?? "https://www.welock.in").replace(/\/+$/, "");
 }
 
+/**
+ * A whole number from the environment, with a default that actually applies.
+ *
+ * `Number.parseInt(process.env.X ?? "60", 10)` looks safe and is not: `??` only
+ * catches null and undefined, while a hosting dashboard hands back an EMPTY
+ * STRING for a variable someone created and left blank — which is a normal
+ * accident when pasting a block of names. `parseInt("")` is NaN, and a NaN
+ * minute count becomes an Invalid Date that either throws deep inside the
+ * database driver or, worse, is stored and silently never compares true.
+ */
+function intFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n)) {
+    console.warn(`[env] ${name}="${raw}" is not a number — using ${fallback}`);
+    return fallback;
+  }
+  return n;
+}
+
 export const env = {
-  port: Number.parseInt(process.env.PORT ?? "8787", 10),
+  port: intFromEnv("PORT", 8787),
   databaseUrl: required("DATABASE_URL", "mongodb://localhost:27017/welockin"),
   jwtSecret,
   jwtExpiresIn: process.env.JWT_EXPIRES_IN ?? "30d",
@@ -124,7 +145,7 @@ export const env = {
   adminJwtExpiresIn: process.env.ADMIN_JWT_EXPIRES_IN ?? "12h",
   // A live session with no heartbeat for longer than this is considered ended
   // (client crashed/offline). Default = 2 missed 5-min beats + grace.
-  liveSessionStaleSeconds: Number.parseInt(process.env.LIVE_SESSION_STALE_SECONDS ?? "660", 10),
+  liveSessionStaleSeconds: intFromEnv("LIVE_SESSION_STALE_SECONDS", 660),
 
   // --- Resend (transactional email — addiction-protection partner OTP) ---
   // API key from resend.com. Email sending is DISABLED (no-op, logged) while empty.
@@ -177,13 +198,13 @@ export const env = {
    * How long a full trial lasts. Snapshotted onto each claim, so changing this
    * never moves the end date of a window someone is already inside.
    */
-  trialDays: Number.parseInt(process.env.TRIAL_DAYS ?? "14", 10),
+  trialDays: intFromEnv("TRIAL_DAYS", 14),
   /**
    * The shorter window given to a machine whose identity is resettable — a Mac
    * whose `IOPlatformUUID` could not be read, so the client fell back to a file
    * the user can delete. Without this, "make ioreg unreadable" is the bypass.
    */
-  trialDaysUnverified: Number.parseInt(process.env.TRIAL_DAYS_UNVERIFIED ?? "3", 10),
+  trialDaysUnverified: intFromEnv("TRIAL_DAYS_UNVERIFIED", 3),
 
   // --- Email verification + password reset -----------------------------------
   /** Server-only HMAC key for emailed codes/tokens. See resolveAuthPepper. */
@@ -199,15 +220,9 @@ export const env = {
    * of a link people click from a mail client is a needless place to lose them.
    */
   publicSiteUrl: resolvePublicSiteUrl(),
-  emailVerificationTtlMinutes: Number.parseInt(
-    process.env.EMAIL_VERIFICATION_TTL_MINUTES ?? "10",
-    10,
-  ),
-  emailVerificationMaxAttempts: Number.parseInt(
-    process.env.EMAIL_VERIFICATION_MAX_ATTEMPTS ?? "5",
-    10,
-  ),
-  passwordResetTtlMinutes: Number.parseInt(process.env.PASSWORD_RESET_TTL_MINUTES ?? "60", 10),
+  emailVerificationTtlMinutes: intFromEnv("EMAIL_VERIFICATION_TTL_MINUTES", 10),
+  emailVerificationMaxAttempts: intFromEnv("EMAIL_VERIFICATION_MAX_ATTEMPTS", 5),
+  passwordResetTtlMinutes: intFromEnv("PASSWORD_RESET_TTL_MINUTES", 60),
   /**
    * May the API refuse an unverified account?
    *

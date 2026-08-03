@@ -56,6 +56,9 @@ async function issueVerificationCode(userId: string, email: string): Promise<str
       email,
       codeHash: hashCode(code),
       expiresAt: new Date(Date.now() + minutes(env.emailVerificationTtlMinutes)),
+      // Same reasoning as the reset row: the outstanding-code lookup filters on
+      // `consumedAt: null`, so the field must exist.
+      consumedAt: null,
     },
   });
 
@@ -152,17 +155,48 @@ authEmailRouter.post(
       return;
     }
 
-    const record = await prisma.emailVerification.findFirst({
-      where: { userId, consumedAt: null, expiresAt: { gt: new Date() } },
+    // Fetched by owner and recency ONLY, with `consumedAt` and `expiresAt`
+    // judged in code rather than in the `where`.
+    //
+    // Not a style preference. Filtering on `consumedAt: null` asks the driver to
+    // decide whether a field that is ABSENT from a MongoDB document counts as
+    // null, and when the answer is no, every correct code is reported as
+    // "incorrect or expired" — the user sees a wrong-code error for a code that
+    // is perfectly right, with nothing anywhere saying why. Reading the row and
+    // testing the two dates is unambiguous. Nothing is lost: this path never
+    // needed a conditional write, because the attempt counter below is what has
+    // to be atomic, not the lookup.
+    const latest = await prisma.emailVerification.findFirst({
+      where: { userId },
       orderBy: { createdAt: "desc" },
     });
-    if (!record) throw verificationCodeInvalid();
+    const now = new Date();
+    const record = latest && !latest.consumedAt && latest.expiresAt > now ? latest : null;
+    if (!record) {
+      if (!latest) {
+        console.warn("[auth] verify refused: this account has no verification row at all");
+      } else if (latest.consumedAt) {
+        console.warn(
+          `[auth] verify refused: newest code already consumed at ${latest.consumedAt.toISOString()}`,
+        );
+      } else {
+        console.warn(
+          `[auth] verify refused: newest code expired at ${latest.expiresAt.toISOString()} ` +
+            `(issued ${latest.createdAt.toISOString()}, TTL ${env.emailVerificationTtlMinutes}m)`,
+        );
+      }
+      throw verificationCodeInvalid();
+    }
 
     if (record.attempts >= env.emailVerificationMaxAttempts) {
       throw verificationAttemptsExhausted();
     }
 
     if (!safeEqualHex(hashCode(code), record.codeHash)) {
+      // A wrong digit and a changed pepper are indistinguishable to the user —
+      // both read "incorrect code" — but not to us: if EVERY code fails for
+      // every account, the hash key moved, it is not six people mistyping.
+      console.warn(`[auth] verify: code mismatch (attempt ${record.attempts + 1})`);
       // ATOMIC. A read-modify-write would let N parallel guesses all read the
       // same count and all write count+1, spending one attempt for N tries —
       // the same reasoning as the partner-OTP counter.
@@ -187,7 +221,6 @@ authEmailRouter.post(
     // account's address moved since, this code proves nothing about the new one.
     if (record.email !== user.email) throw verificationCodeInvalid();
 
-    const now = new Date();
     await prisma.$transaction([
       prisma.emailVerification.update({
         where: { id: record.id },
@@ -245,6 +278,13 @@ authEmailRouter.post(
             tokenHash: hashResetToken(token),
             expiresAt: new Date(Date.now() + minutes(env.passwordResetTtlMinutes)),
             requestIp: ip,
+            // Written EXPLICITLY, not left to the optional column's absence.
+            // On MongoDB an unset optional field is missing from the document
+            // rather than null, and the whole single-use guarantee rests on a
+            // `consumedAt: null` filter matching it. Storing the null removes
+            // the question entirely instead of relying on how the driver
+            // happens to translate one today.
+            consumedAt: null,
           },
         });
 
@@ -274,21 +314,55 @@ authEmailRouter.post(
     const tokenHash = hashResetToken(token);
     const now = new Date();
 
-    // Single-use, enforced by a CONDITIONAL write rather than read-then-write.
-    // Two requests arriving with the same token both pass a findFirst; only one
-    // can win this, because the unique index on tokenHash serialises them.
+    // Read first, judge in code, then claim.
+    //
+    // `tokenHash` is unique, so the read is exact. The dates are tested here
+    // rather than in the `where` for the same reason as the verification path:
+    // a `consumedAt: null` filter asks the driver whether a field ABSENT from a
+    // MongoDB document counts as null, and when the answer is no, a perfectly
+    // good link is reported as expired-or-used with nothing saying why.
+    //
+    // The conditional write below is still what makes single use real — it just
+    // no longer has to also carry the "is this link valid" question. Two clicks
+    // landing at once still contend on it, and exactly one wins.
+    const row = await prisma.passwordReset.findUnique({ where: { tokenHash } });
+
+    if (!row) {
+      // No token, no hash and no address in the log: which CONDITION failed is
+      // the useful part, not whose it was. The answer to the CALLER stays
+      // uniform — telling expired from used from unknown is an existence oracle.
+      console.warn(
+        "[auth] reset refused: no row for this token hash. Either the link is " +
+          "forged, or AUTH_TOKEN_PEPPER/JWT_SECRET changed after the mail went out " +
+          "(the hash is keyed with it), or the row was never written.",
+      );
+      throw resetTokenInvalid();
+    }
+    if (row.consumedAt) {
+      console.warn(`[auth] reset refused: already used at ${row.consumedAt.toISOString()}`);
+      throw resetTokenInvalid();
+    }
+    if (row.expiresAt <= now) {
+      console.warn(
+        `[auth] reset refused: expired at ${row.expiresAt.toISOString()} ` +
+          `(issued ${row.createdAt.toISOString()}, TTL ${env.passwordResetTtlMinutes}m)`,
+      );
+      throw resetTokenInvalid();
+    }
+
     const claimed = await prisma.passwordReset.updateMany({
-      where: { tokenHash, consumedAt: null, expiresAt: { gt: now } },
+      where: { tokenHash, consumedAt: null },
       data: { consumedAt: now },
     });
-    // Expired, already used, or never existed — one answer for all three.
-    if (claimed.count !== 1) throw resetTokenInvalid();
+    if (claimed.count !== 1) {
+      // The row was live a moment ago, so this is a genuine race — another
+      // request consumed it between the read and the write. Exactly what the
+      // conditional write is for.
+      console.warn("[auth] reset refused: lost the race to consume this link");
+      throw resetTokenInvalid();
+    }
 
-    const record = await prisma.passwordReset.findUnique({
-      where: { tokenHash },
-      select: { userId: true },
-    });
-    if (!record) throw resetTokenInvalid();
+    const record = { userId: row.userId };
 
     await prisma.user.update({
       where: { id: record.userId },

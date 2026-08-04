@@ -19,6 +19,7 @@ import {
   purchaseEffect,
 } from "../lib/entitlement";
 import { InvalidTransaction, verifySignedTransaction } from "../lib/apple-jws";
+import { assertCanWrite } from "../lib/purchase-providers";
 import { resolveAndCache } from "./entitlement";
 
 /* ─────────────────────────────────────────────────────────────
@@ -81,6 +82,11 @@ purchasesRouter.post(
   "/",
   requireAuth,
   asyncHandler(async (req, res) => {
+    // The shop must be open before anything is verified. Closed is not a
+    // rejection of this request, it is the absence of this whole path — see
+    // lib/purchase-providers.ts, which is also where iOS gets wired in.
+    assertCanWrite(APP_STORE);
+
     const { jws, idfv } = submitSchema.parse(req.body);
 
     let tx;

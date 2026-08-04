@@ -141,6 +141,18 @@ export const env = {
    * platform. Apple puts the answer in the payload; we simply have to read it.
    */
   appleEnvironment: process.env.APPLE_ENVIRONMENT ?? "Production",
+  /**
+   * May Apple purchases be RECORDED at all?
+   *
+   * OFF until an iOS build ships. See lib/purchase-providers.ts — a door nobody
+   * uses should not be open, and while there is no iOS client every request to
+   * that route is either a mistake or an attempt.
+   *
+   * Requires the literal "true", like every other switch here that guards money:
+   * anything inferred from an unset value fails open on more machines than
+   * anyone expects.
+   */
+  applePurchasesEnabled: process.env.APPLE_PURCHASES_ENABLED === "true",
 
   // --- Admin console (POST /api/admin/login) ---
   // Credentials checked by the admin API. Set these in the backend's environment

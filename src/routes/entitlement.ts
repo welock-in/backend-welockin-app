@@ -3,6 +3,7 @@ import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { ledgerHash } from "../lib/hash";
 import { readDeviceId } from "../lib/device";
+import { parseFingerprint } from "../lib/fingerprint";
 import { claimTrial, findClaim } from "../lib/trial-claim";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
@@ -156,7 +157,21 @@ entitlementRouter.post(
     if (!deviceId) throw badRequest("A device id is required to start a trial");
 
     const opts = startTrialSchema.parse(req.body ?? {});
-    await claimTrial(userId, deviceId, opts);
+
+    // The hardware signals, which this route did not read before — and its whole
+    // job is to create claims. A claim written with no DeviceSignal rows is
+    // INVISIBLE to `matchClaimByFingerprint` for ever, so the machine can never
+    // be recognised again once its stored device id is wiped. The damage
+    // accumulated silently: every claim minted here widened the hole.
+    const fp = parseFingerprint(req);
+    await claimTrial(userId, deviceId, {
+      ...opts,
+      signals: fp.signals,
+      // Only when the client actually sent a fingerprint. Absent means "this
+      // client says nothing", which must stay distinct from "this client looked
+      // and failed" — see ClaimOptions.
+      ...(fp.signals.length > 0 ? { hardwareBacked: fp.hardwareBacked } : {}),
+    });
 
     res.json(await resolveAndCache(userId, deviceId));
   }),

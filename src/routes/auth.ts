@@ -227,7 +227,17 @@ authRouter.post(
     // Only a genuinely new account claims: signing in again, or linking Apple to
     // an existing account, must not look like a first run. `claimTrial` would
     // return the existing claim anyway — this just avoids the write.
-    if (created) await claimTrialOnSignup(user.id, readDeviceId(req));
+    // Same signals as the password path. Without them an Apple signup writes a
+    // claim with no DeviceSignal rows, so the machine is invisible to the
+    // fingerprint matcher afterwards — a claim that cannot be matched is a claim
+    // that cannot stop the next one.
+    if (created) {
+      const fp = parseFingerprint(req);
+      await claimTrialOnSignup(user.id, readDeviceId(req), {
+        signals: fp.signals,
+        ...(fp.signals.length > 0 ? { hardwareBacked: fp.hardwareBacked } : {}),
+      });
+    }
 
     const token = signToken({ sub: user.id, email: user.email });
     res.status(created ? 201 : 200).json({ token, user: toPublicUser(user) });

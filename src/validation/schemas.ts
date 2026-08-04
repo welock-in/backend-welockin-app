@@ -270,8 +270,15 @@ export const startTrialSchema = z.object({
   /**
    * Whether the client's device id came from the hardware or from a file it can
    * delete. Self-reported and therefore not trusted as a grant — only ever used
-   * to make a claim WEAKER (shorter window, flagged), never stronger. Defaults to
-   * false so an old client that omits it is treated as the cautious case.
+   * to make a claim WEAKER (shorter window, flagged), never stronger.
+   *
+   * NOT defaulted, despite what this comment used to claim. An omitted value is
+   * `undefined`, and `claimTrial` treats only an explicit `false` as unproven —
+   * so saying nothing currently earns a FULL window while admitting a failed
+   * hardware read earns a short one. That asymmetry is deliberate for old clients
+   * that never heard of the field, and it is also the reason a modern client must
+   * send the fingerprint header: the routes derive this from it when present, so
+   * "say nothing" stops being the strongest position available.
    */
   hardwareBacked: z.boolean().optional(),
   /** The client's own clock, recorded as an abuse signal. Never used for timing. */

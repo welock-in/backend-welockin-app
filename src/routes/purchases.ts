@@ -99,6 +99,23 @@ purchasesRouter.post(
       throw transactionUnknownProduct();
     }
 
+    // A SANDBOX transaction is signed by the same Apple chain as a real one, and
+    // carries the real bundle id and the real product id — every check above
+    // passes on it. It is also free. Without this comparison the route was a
+    // lifetime-licence tap that anyone with a developer account could open, and
+    // `requireAuth` is no obstacle: it is reachable with curl from any platform.
+    //
+    // A MISSING environment is refused too. It is not a courtesy to old clients:
+    // absence is indistinguishable from a payload trimmed to dodge the check, and
+    // this is the money path. Apple has sent the field since StoreKit 2 shipped.
+    if ((tx.environment ?? "").toLowerCase() !== env.appleEnvironment.toLowerCase()) {
+      console.warn(
+        `[purchases] refused: environment ${JSON.stringify(tx.environment ?? null)} ` +
+          `!= ${JSON.stringify(env.appleEnvironment)} (product ${tx.productId})`,
+      );
+      throw transactionForeign("This purchase did not come from the App Store");
+    }
+
     const userId = req.user!.id;
     const deviceId = readDeviceId(req);
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true } });

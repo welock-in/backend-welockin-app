@@ -6,6 +6,7 @@ import { LIFETIME_PRODUCT_ID } from "../lib/entitlement";
 import { asyncHandler } from "../middleware/async-handler";
 import {
   HANDLED_EVENTS,
+  isFullRefund,
   isObjectId,
   isSellableOrder,
   parseOrderEvent,
@@ -189,7 +190,24 @@ async function refund(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
     select: { id: true },
   });
 
+  const full = isFullRefund(order);
+
   if (existing) {
+    if (!full) {
+      // A PARTIAL refund. Record what happened and leave the licence alone: the
+      // customer paid, kept most of it, and revoking here would take the product
+      // away from someone we just gave a goodwill gesture to. Only `rawEvent`
+      // moves, so support can see it and so a later full refund still lands.
+      await prisma.purchase.update({
+        where: { id: existing.id },
+        data: { rawEvent: body as Prisma.InputJsonValue },
+      });
+      console.warn(
+        `[lemonsqueezy] partial refund on order ${order.orderId} ` +
+          `(${order.refundedAmountUsd ?? "?"} of ${order.priceUsd ?? "?"}) — licence kept`,
+      );
+      return { status: "processed" };
+    }
     await prisma.purchase.update({
       where: { id: existing.id },
       data: {

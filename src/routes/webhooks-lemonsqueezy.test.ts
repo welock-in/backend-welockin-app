@@ -523,3 +523,81 @@ test("a malformed refund timestamp still revokes the licence", async (t) => {
   assert.equal(isRefunded, true);
   assert.ok(refundedAt instanceof Date && !Number.isNaN(refundedAt.getTime()));
 });
+
+/* ── Partial refunds ─────────────────────────────────────────────────── */
+
+/*
+ * `order_refunded` fires for a PARTIAL refund too, and the two must not be
+ * confused: a goodwill gesture of one euro on a twenty-euro order used to revoke
+ * the licence of a customer who had paid in full and kept nineteen euros of it.
+ * The branch had never run in production, so the bug was invisible.
+ */
+test("a PARTIAL refund keeps the licence", async (t) => {
+  configured(t);
+  const db = stubDb(t, { purchaseFind: async () => ({ id: "purchase-1" }) });
+
+  const res = await deliver(
+    orderBody({
+      meta: { event_name: "order_refunded", custom_data: { user_id: USER } },
+      attributes: {
+        status: "partial_refund",
+        refunded: true,
+        refunded_at: "2026-07-31T09:00:00.000Z",
+        total_usd: 1999,
+        refunded_amount_usd: 100,
+      },
+    }),
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(db.purchaseUpdate.length, 1, "the row is touched, to keep the payload");
+  assert.equal(
+    db.purchaseUpdate[0][0].data.isRefunded,
+    undefined,
+    "isRefunded must not be written at all on a partial refund",
+  );
+  assert.equal(finalStatus(db.eventUpdate), "processed");
+});
+
+/*
+ * The amounts decide when the status does not. A refund equal to the total is a
+ * full refund even if Lemon Squeezy labelled it something else.
+ */
+test("a refund of the whole amount revokes, whatever the status says", async (t) => {
+  configured(t);
+  const db = stubDb(t, { purchaseFind: async () => ({ id: "purchase-1" }) });
+
+  await deliver(
+    orderBody({
+      meta: { event_name: "order_refunded", custom_data: { user_id: USER } },
+      attributes: {
+        status: "something-new",
+        refunded: true,
+        total_usd: 1999,
+        refunded_amount_usd: 1999,
+      },
+    }),
+  );
+
+  assert.equal(db.purchaseUpdate[0][0].data.isRefunded, true);
+});
+
+/*
+ * The uncomfortable default, pinned on purpose. A refund we cannot classify —
+ * no status we know, no amounts — revokes. Shipping the product free to someone
+ * who was refunded is never noticed; a wrongly-revoked customer writes in and
+ * support restores them.
+ */
+test("an unclassifiable refund revokes rather than failing open", async (t) => {
+  configured(t);
+  const db = stubDb(t, { purchaseFind: async () => ({ id: "purchase-1" }) });
+
+  await deliver(
+    orderBody({
+      meta: { event_name: "order_refunded", custom_data: { user_id: USER } },
+      attributes: { status: "mystery", refunded: true, total_usd: undefined, refunded_amount_usd: undefined },
+    }),
+  );
+
+  assert.equal(db.purchaseUpdate[0][0].data.isRefunded, true);
+});

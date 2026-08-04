@@ -131,6 +131,16 @@ export const env = {
   appAttestEnv: process.env.APP_ATTEST_ENV ?? "production",
   // App Attest app identifier = "<TeamID>.<BundleID>".
   appAttestAppId: process.env.APP_ATTEST_APP_ID ?? "YF7AFPJRYH.in.welock.app",
+  /**
+   * Which StoreKit environment a purchase must come from: "Production" or "Sandbox".
+   *
+   * A Sandbox transaction is signed by the SAME Apple chain as a real one, carries
+   * the real bundle id and the real product id — and costs nothing. Every check
+   * that existed before this one passes on it, so without this comparison the
+   * purchase route was a free lifetime-licence tap, reachable with curl from any
+   * platform. Apple puts the answer in the payload; we simply have to read it.
+   */
+  appleEnvironment: process.env.APPLE_ENVIRONMENT ?? "Production",
 
   // --- Admin console (POST /api/admin/login) ---
   // Credentials checked by the admin API. Set these in the backend's environment

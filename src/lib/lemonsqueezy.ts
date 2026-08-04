@@ -61,6 +61,7 @@ export type LemonSqueezyWebhook = {
       refunded?: boolean;
       refunded_at?: string | null;
       total_usd?: number;
+      refunded_amount_usd?: number;
       created_at?: string;
       test_mode?: boolean;
       store_id?: number;
@@ -86,12 +87,54 @@ export type ParsedOrder = {
   customUserId: string | null;
   refunded: boolean;
   refundedAt: Date | null;
+  /**
+   * How much came back, in the same unit as `priceUsd`.
+   *
+   * Load-bearing, not informational: `order_refunded` fires for a PARTIAL refund
+   * too, so without this a one-euro goodwill gesture on a twenty-euro order was
+   * indistinguishable from giving the whole thing back — and revoked the licence
+   * of a customer who had paid in full and kept nineteen euros of it.
+   */
+  refundedAmountUsd: number | null;
   purchasedAt: Date;
   priceUsd: number | null;
   storeId: string | null;
   variantId: string | null;
   testMode: boolean;
 };
+
+/**
+ * Does this refund end the licence, or is it a partial gesture?
+ *
+ * Lemon Squeezy fires `order_refunded` for BOTH, and the difference is the whole
+ * question: a one-euro goodwill refund on a twenty-euro order must not revoke
+ * anything, while a full refund must revoke immediately.
+ *
+ * The order of the tests matters. `status` is Lemon Squeezy's own verdict and is
+ * believed first — it distinguishes `refunded` from `partial_refund` explicitly.
+ * Only when the status is unhelpful do we compare amounts, and only when BOTH
+ * numbers are present: comparing against a missing total would make every refund
+ * look total.
+ *
+ * The final fallback is REVOKE. That is deliberate and it is the uncomfortable
+ * choice: a payment we cannot classify is more likely to be a real refund than a
+ * partial one, and refusing to revoke a genuine refund means shipping the product
+ * for free. A wrongly-revoked customer writes in and support restores them; a
+ * wrongly-kept licence is never noticed.
+ */
+export function isFullRefund(order: ParsedOrder): boolean {
+  if (order.status === "partial_refund") return false;
+  if (order.status === "refunded") return true;
+
+  const back = order.refundedAmountUsd;
+  const total = order.priceUsd;
+  if (back != null && total != null && total > 0) {
+    // A hair of tolerance for currency conversion and rounding: Lemon Squeezy
+    // reports in cents, and a refund of the full amount can land a cent short.
+    return back >= total - 0.01;
+  }
+  return true;
+}
 
 /**
  * `custom_data` is untyped by contract — it is whatever the checkout put there,
@@ -143,6 +186,8 @@ export function parseOrderEvent(body: LemonSqueezyWebhook): ParsedOrder | null {
     customUserId: coerceCustomId(custom.user_id) ?? coerceCustomId(custom.userId),
     refunded: attrs.refunded === true || attrs.status === "refunded",
     refundedAt: parseDate(attrs.refunded_at),
+    refundedAmountUsd:
+      typeof attrs.refunded_amount_usd === "number" ? attrs.refunded_amount_usd / 100 : null,
     // Falling back to "now" is right for a missing field and wrong for a broken
     // one, but both are better than storing a date arithmetic cannot use.
     purchasedAt: parseDate(attrs.created_at) ?? new Date(),

@@ -5,6 +5,7 @@ import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { deviceSchema } from "../validation/schemas";
 import { readDeviceId, toPublicDevice } from "../lib/device";
+import { resolveAndCache } from "./entitlement";
 import { conflict, notFound } from "../lib/http-error";
 
 export const devicesRouter = Router();
@@ -141,12 +142,34 @@ devicesRouter.post(
     if (!device) throw notFound("Device not found");
 
     const stale = Date.now() - device.lastSeenAt.getTime() > HEARTBEAT_THROTTLE_MS;
-    if (stale) {
-      await prisma.device
-        .update({ where: { id: device.id }, data: { lastSeenAt: new Date() } })
-        .catch(() => undefined); // best-effort: a missed heartbeat is not an error
+    if (!stale) {
+      // Beaten again inside the throttle window. Nothing has been written and
+      // nothing needs resolving — answer as this route always has.
+      res.status(204).end();
+      return;
     }
-    res.status(204).end();
+
+    await prisma.device
+      .update({ where: { id: device.id }, data: { lastSeenAt: new Date() } })
+      .catch(() => undefined); // best-effort: a missed heartbeat is not an error
+
+    // The entitlement rides the beat that already exists — but only on the beats
+    // that were doing work anyway.
+    //
+    // The desktop posts here every five minutes and the route answered 204: a
+    // round trip already being paid for that said nothing. Carrying the receipt
+    // on it means a machine's licence, its countdown and its revocation refresh
+    // with no second loop to schedule and no extra request on a laptop battery.
+    //
+    // Gated on `stale` deliberately. Resolving costs four queries, and doing that
+    // on EVERY beat would multiply the busiest route in the system by four for no
+    // gain — the answer cannot have changed in the seconds since the last one. So
+    // it rides the throttle that already exists rather than adding a second
+    // cadence to reason about.
+    //
+    // A client that needs an answer NOW — after a purchase, on boot — calls
+    // GET /api/entitlement, which is never throttled.
+    res.json(await resolveAndCache(userId, deviceId));
   }),
 );
 

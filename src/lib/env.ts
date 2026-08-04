@@ -153,6 +153,19 @@ export const env = {
    * anyone expects.
    */
   applePurchasesEnabled: process.env.APPLE_PURCHASES_ENABLED === "true",
+  /**
+   * Ed25519 private key that signs entitlement receipts (PEM, or that PEM
+   * base64-encoded). See lib/entitlement-receipt.ts.
+   *
+   * Empty is a legitimate state: no key means no receipts, and clients fall back
+   * to the unsigned view they already read. That is what lets this ship before
+   * every client understands it.
+   *
+   * Treat it like the updater key. Losing it does not lose data, but every
+   * receipt in the field stops verifying the moment you replace it, so each
+   * machine is locked until it can next reach the server.
+   */
+  entitlementSigningKey: process.env.ENTITLEMENT_SIGNING_KEY ?? "",
 
   // --- Admin console (POST /api/admin/login) ---
   // Credentials checked by the admin API. Set these in the backend's environment

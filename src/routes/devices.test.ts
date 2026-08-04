@@ -204,16 +204,32 @@ test("removing a real device reports what was removed", async (t) => {
   assert.equal(where.deviceId, DEVICE_ID);
 });
 
+/*
+ * The write throttle, which is what this test has always been about: a desktop
+ * beats every five minutes and only a stale row should cost a write.
+ *
+ * The route used to answer 204. It now answers the entitlement, because the beat
+ * was a round trip already being paid for that said nothing — carrying the
+ * licence on it is how a machine's status refreshes with no second loop. Safe to
+ * change: the desktop calls this through a helper that only reads the status
+ * code, and no other client calls it at all.
+ */
 test("a heartbeat refreshes a stale lastSeenAt and stays quiet when fresh", async (t) => {
   const stale = deviceRow({ lastSeenAt: new Date(Date.now() - 60 * 60 * 1000) });
   stubMethod(t, prisma.device as any, "findFirst", async () => stale);
   const updates = stubMethod(t, prisma.device as any, "update", async () => stale);
+  // The stale branch resolves the entitlement, so its reads need stubbing.
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ id: userId, email: "u@e.co" }));
+  stubMethod(t, prisma.user as any, "update", async () => ({}));
+  stubMethod(t, prisma.purchase as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findFirst", async () => null);
 
   const res = await request(app)
     .post("/api/devices/heartbeat")
     .set({ ...auth, "x-welockin-device-id": DEVICE_ID });
 
-  assert.equal(res.status, 204);
+  assert.equal(res.status, 200);
+  assert.ok(res.body.status, "a beat that did work carries the entitlement back");
   assert.equal(updates.length, 1, "a desktop's last-seen must actually move");
 
   const fresh = deviceRow({ lastSeenAt: new Date() });
@@ -224,6 +240,9 @@ test("a heartbeat refreshes a stale lastSeenAt and stays quiet when fresh", asyn
     .post("/api/devices/heartbeat")
     .set({ ...auth, "x-welockin-device-id": DEVICE_ID });
 
+  // Throttled: no write, and no entitlement resolution either. Resolving costs
+  // four queries and the answer cannot have changed in seconds — doing it on
+  // every beat would multiply the busiest route in the system for nothing.
   assert.equal(second.status, 204);
   assert.equal(freshUpdates.length, 0, "throttled: no write when it was just seen");
 });

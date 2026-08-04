@@ -69,6 +69,17 @@ export interface EntitlementView {
    * nothing published it, flipping the env var would do nothing at all.
    */
   enforced: boolean;
+  /**
+   * The signed, self-contained, time-bounded copy of everything above.
+   *
+   * Null when the deploy has no signing key. A client MUST treat null as "no
+   * receipt available" and fall back to the fields above — never as a refusal,
+   * or a deploy without the key would lock out everyone at once.
+   *
+   * It is what a client caches for offline use: the plain fields are advice a
+   * patched binary can rewrite, this is the part it cannot.
+   */
+  receipt?: string | null;
 }
 
 export interface EntitlementInputs {

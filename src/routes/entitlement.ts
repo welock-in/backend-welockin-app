@@ -2,6 +2,7 @@ import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { ledgerHash } from "../lib/hash";
+import { issueReceipt } from "../lib/entitlement-receipt";
 import { readDeviceId } from "../lib/device";
 import { parseFingerprint } from "../lib/fingerprint";
 import { claimTrial, findClaim } from "../lib/trial-claim";
@@ -94,7 +95,26 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   });
 
   await cacheOnUser(userId, view, now);
-  return view;
+
+  // The signed half. Everything above is advice a patched client may ignore;
+  // this is the part it cannot forge, and therefore the only part it may still
+  // believe once the network is gone. Null when no key is configured, which
+  // clients read as "this server does not issue receipts" rather than as a
+  // refusal — that is what lets the field appear on a deploy without every
+  // client in the field understanding it the same day.
+  //
+  // Bound to the deviceId, so a receipt cannot be carried to another machine.
+  return {
+    ...view,
+    receipt: issueReceipt({
+      userId,
+      deviceId,
+      status: view.status,
+      isPro: view.isPro,
+      trialEndsAt: view.trialEndsAt ? new Date(view.trialEndsAt) : null,
+      serverTime: now,
+    }),
+  };
 }
 
 /**

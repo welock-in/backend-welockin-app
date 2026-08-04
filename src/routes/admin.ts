@@ -7,7 +7,13 @@ import { requireAdmin } from "../middleware/admin-auth";
 import { signAdminToken } from "../lib/admin-jwt";
 import { toPublicUser } from "../lib/user";
 import { notFound, unauthorized, HttpError } from "../lib/http-error";
-import { adminLoginSchema, adminSetPlanSchema } from "../validation/schemas";
+import {
+  adminCompSchema,
+  adminLoginSchema,
+  adminRevokeSchema,
+  adminSetPlanSchema,
+  adminTrialResetSchema,
+} from "../validation/schemas";
 import {
   overview,
   usersList,
@@ -255,3 +261,195 @@ async function getUserOr404(id: string) {
   if (!user) throw notFound("User not found");
   return user;
 }
+
+/* ── Entitlement overrides ────────────────────────────────────────────────
+ *
+ * The two ways a human can overrule the resolver, plus the one way to undo the
+ * machine rule. They exist because the alternative is editing Mongo by hand:
+ * the "one trial per machine" ledger WILL produce false positives — a shared
+ * family PC, a resold laptop, a replaced motherboard — and a rule with no
+ * recourse is a rule that turns a support ticket into a lost customer.
+ *
+ * Every write lands in AdminAuditLog with a mandatory reason and the before/after,
+ * because an override nobody can explain later is indistinguishable from a
+ * mistake.
+ */
+
+/** The admin identity is an env credential, not a user row — hence a fixed id. */
+const ADMIN_ACTOR = "000000000000000000000000";
+
+async function audit(
+  req: { admin?: { username: string } },
+  action: string,
+  targetUserId: string,
+  reason: string,
+  before: unknown,
+  after: unknown,
+): Promise<void> {
+  await prisma.adminAuditLog
+    .create({
+      data: {
+        actorId: ADMIN_ACTOR,
+        actorEmail: `admin:${req.admin?.username ?? "unknown"}`,
+        action,
+        targetUserId,
+        reason,
+        before: before as never,
+        after: after as never,
+      },
+    })
+    // Best-effort: losing the audit row must not cost the operator the action
+    // they came to perform. It is logged loudly instead.
+    .catch((e) => console.error("[admin] audit row failed:", e));
+}
+
+/**
+ * Grant access without a payment: a lifetime comp, or a time-boxed one.
+ *
+ * Also how support extends someone's trial — there is no separate "extend"
+ * verb, because a time-boxed comp already is one and a second mechanism would
+ * be a second thing to reason about.
+ */
+adminRouter.post(
+  "/users/:id/comp",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const before = await getUserOr404(req.params.id);
+    const { reason, until } = adminCompSchema.parse(req.body);
+
+    const user = await prisma.user.update({
+      where: { id: req.params.id },
+      data: {
+        compActive: true,
+        compReason: reason,
+        compedUntil: until ?? null,
+        compedAt: new Date(),
+      },
+    });
+
+    await audit(req, "comp", user.id, reason, {
+      compActive: before.compActive,
+      compedUntil: before.compedUntil,
+    }, { compActive: true, compedUntil: until ?? null });
+
+    res.json({ user: toPublicUser(user) });
+  }),
+);
+
+/** Withdraw a comp. Does NOT revoke access — a paid licence still stands. */
+adminRouter.delete(
+  "/users/:id/comp",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const before = await getUserOr404(req.params.id);
+    const { reason } = adminRevokeSchema.parse(req.body ?? {});
+
+    const user = await prisma.user.update({
+      where: { id: req.params.id },
+      data: { compActive: false, compReason: reason, compedUntil: null },
+    });
+
+    await audit(req, "comp_withdraw", user.id, reason, {
+      compActive: before.compActive,
+      compedUntil: before.compedUntil,
+    }, { compActive: false });
+
+    res.json({ user: toPublicUser(user) });
+  }),
+);
+
+/**
+ * The hard stop. Outranks everything in the resolver, INCLUDING a live purchase
+ * — which is the point: a chargeback or a terms breach must not be survivable by
+ * having paid once.
+ */
+adminRouter.post(
+  "/users/:id/revoke",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const before = await getUserOr404(req.params.id);
+    const { reason } = adminRevokeSchema.parse(req.body);
+
+    const user = await prisma.user.update({
+      where: { id: req.params.id },
+      data: { accessRevoked: true, revokedReason: reason, revokedAt: new Date() },
+    });
+
+    await audit(req, "revoke", user.id, reason, { accessRevoked: before.accessRevoked }, {
+      accessRevoked: true,
+    });
+
+    res.json({ user: toPublicUser(user) });
+  }),
+);
+
+/** Undo a revocation. Whatever the account was entitled to before comes back. */
+adminRouter.delete(
+  "/users/:id/revoke",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const before = await getUserOr404(req.params.id);
+    const { reason } = adminRevokeSchema.parse(req.body ?? {});
+
+    const user = await prisma.user.update({
+      where: { id: req.params.id },
+      data: { accessRevoked: false, revokedReason: reason, revokedAt: null },
+    });
+
+    await audit(req, "revoke_undo", user.id, reason, { accessRevoked: before.accessRevoked }, {
+      accessRevoked: false,
+    });
+
+    res.json({ user: toPublicUser(user) });
+  }),
+);
+
+/**
+ * Give a machine its trial back.
+ *
+ * This is deliberately the most awkward route in the file, because it performs
+ * the exact operation the ledger exists to prevent: it deletes a claim so the
+ * hardware can earn a fresh window. It is the ONLY recourse for someone the
+ * machine rule got wrong, and it must never be reachable by a mis-click — hence
+ * `confirmUserId` in the body having to match the path.
+ *
+ * The DeviceSignal rows go with the claim. Leaving them would keep the hardware
+ * pointing at a claim that no longer exists, which is worse than either state.
+ */
+adminRouter.post(
+  "/users/:id/trial-reset",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const user = await getUserOr404(req.params.id);
+    const { reason, confirmUserId } = adminTrialResetSchema.parse(req.body);
+    if (confirmUserId !== req.params.id) {
+      throw new HttpError(400, "confirmUserId does not match the account being reset");
+    }
+
+    const claims = await prisma.trialClaim.findMany({
+      where: { firstUserId: user.id },
+      select: { id: true, endsAt: true, deviceIdHash: true },
+    });
+    if (claims.length === 0) {
+      res.json({ user: toPublicUser(user), claimsDeleted: 0 });
+      return;
+    }
+
+    const ids = claims.map((c) => c.id);
+    await prisma.deviceSignal.deleteMany({ where: { claimId: { in: ids } } });
+    await prisma.trialClaim.deleteMany({ where: { id: { in: ids } } });
+    // The legacy per-account window has to go too, or the resolver keeps
+    // answering from it and the reset appears to have done nothing.
+    const updated = await prisma.user.update({
+      where: { id: user.id },
+      data: { trialEndsAt: null },
+    });
+
+    await audit(req, "reset_trial", user.id, reason, {
+      claims: claims.map((c) => ({ endsAt: c.endsAt })),
+      trialEndsAt: user.trialEndsAt,
+    }, { claimsDeleted: ids.length });
+
+    res.json({ user: toPublicUser(updated), claimsDeleted: ids.length });
+  }),
+);

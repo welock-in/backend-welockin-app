@@ -461,3 +461,37 @@ export const onboardingSubmitSchema = z.object({
   clientProjection: clientProjectionSchema.optional(),
 });
 
+
+// --- Admin entitlement overrides ---------------------------------------------
+/**
+ * Every one of these demands a `reason`, and that is not paperwork.
+ *
+ * A comp and a revocation are the two ways a human can overrule the entitlement
+ * resolver, and an override nobody can explain later is indistinguishable from a
+ * mistake — which is exactly what you are trying to tell apart when you go
+ * looking six months on.
+ */
+const adminReason = z.string().trim().min(3, "A reason is required").max(500);
+
+export const adminCompSchema = z.object({
+  reason: adminReason,
+  /**
+   * When the comp ends. Omit for a LIFETIME grant.
+   *
+   * Explicitly nullable as well as optional so the admin UI can send `null` to
+   * mean "no end date" without it reading as "field forgotten".
+   */
+  until: dateInput.nullish(),
+});
+
+export const adminRevokeSchema = z.object({ reason: adminReason });
+
+export const adminTrialResetSchema = z.object({
+  reason: adminReason,
+  /**
+   * Deleting a trial claim is the exact operation the ledger exists to prevent,
+   * so it cannot be reached by a fat finger: the caller must say out loud which
+   * account they are handing a second window to.
+   */
+  confirmUserId: z.string().trim().min(1),
+});

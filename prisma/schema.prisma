@@ -694,13 +694,6 @@ model Subscription {
   /// thing that settles it is what actually arrived.
   rawEvent Json?
 
-  /// When the "your trial ends in two days" email went out, so it goes out ONCE.
-  ///
-  /// Stamped on the subscription rather than tracked in a job table because the
-  /// thing being deduplicated is a property of THIS trial: a customer who
-  /// cancels, resubscribes and gets a second trial deserves a second warning,
-  /// and a row keyed on the user would silently swallow it.
-  trialReminderSentAt DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

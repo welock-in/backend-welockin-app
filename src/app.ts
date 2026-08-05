@@ -5,7 +5,6 @@ import morgan from "morgan";
 import { env } from "./lib/env";
 import { healthRouter } from "./routes/health";
 import { updatesRouter } from "./routes/updates";
-import { cronRouter } from "./routes/cron";
 import { authRouter } from "./routes/auth";
 import { authEmailRouter } from "./routes/auth-email";
 import { contactRouter } from "./routes/contact";
@@ -75,9 +74,6 @@ export function createApp(): Express {
   // Desktop auto-update manifest. PUBLIC like /api/health: a signed-out machine
   // must still be able to receive a fix.
   app.use("/api/updates", updatesRouter);
-  // Scheduled work. NOT behind requireAuth — the caller is a scheduler, not a
-  // person — and gated instead by CRON_SECRET, which is closed when unset.
-  app.use("/api/cron", cronRouter);
   app.use("/api/auth", authRouter);
   // Email verification + password reset. Same mount point, its own file: these
   // are the routes an UNVERIFIED account must still be able to reach, so they

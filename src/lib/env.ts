@@ -166,15 +166,6 @@ export const env = {
    * machine is locked until it can next reach the server.
    */
   entitlementSigningKey: process.env.ENTITLEMENT_SIGNING_KEY ?? "",
-  /**
-   * Shared secret every scheduled job must present. See routes/cron.ts.
-   *
-   * Unset means scheduled jobs are DISABLED, not open. Without that, a fresh
-   * deploy exposes an unauthenticated endpoint that sends email to real
-   * customers — a spam cannon with our own domain on the envelope — for exactly
-   * as long as it takes someone to notice.
-   */
-  cronSecret: process.env.CRON_SECRET ?? "",
 
   // --- Admin console (POST /api/admin/login) ---
   // Credentials checked by the admin API. Set these in the backend's environment

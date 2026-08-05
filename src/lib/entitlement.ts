@@ -84,8 +84,20 @@ export interface EntitlementView {
 
 export interface EntitlementInputs {
   now: Date;
-  hasActivePurchase: boolean; // a non-refunded Purchase exists
+  hasActivePurchase: boolean; // a non-refunded Purchase exists (the LIFETIME leg)
   hasRefundedPurchase: boolean; // a refunded Purchase exists
+  /**
+   * A Lemon Squeezy subscription that still grants — see lib/subscription.ts,
+   * which is the only place that decides what "still grants" means.
+   *
+   * Separate from `hasActivePurchase` because the two are different shapes, not
+   * two names for one thing: a purchase is a fact that happened once, a
+   * subscription is a state that moves. Merging them at the input would hide
+   * which one a customer actually has, exactly when support needs to know.
+   */
+  hasActiveSubscription: boolean;
+  /** On trial with Lemon Squeezy, so the UI can say so rather than "active". */
+  subscriptionOnTrial: boolean;
   compActive: boolean; // caller pre-computes: compActive && (compedUntil == null || compedUntil > now)
   accessRevoked: boolean; // admin hard kill
   trialEndsAt: Date | null; // from the device's TrialClaim (null if none)
@@ -106,6 +118,16 @@ export function computeEntitlement(input: EntitlementInputs): EntitlementView {
     isPro = false;
   } else if (input.hasActivePurchase) {
     status = "active";
+    isPro = true;
+  } else if (input.hasActiveSubscription) {
+    // Ranked immediately after the lifetime purchase and BEFORE the comp: someone
+    // who is paying us every month should read as a customer, not as a charity
+    // case, and support looking at the row should see the money.
+    //
+    // `trialing` when Lemon Squeezy says on_trial, because the client draws a
+    // countdown from it — and a paying customer shown a trial countdown is a
+    // support ticket.
+    status = input.subscriptionOnTrial ? "trialing" : "active";
     isPro = true;
   } else if (input.compActive) {
     status = "comped";
@@ -129,7 +151,10 @@ export function computeEntitlement(input: EntitlementInputs): EntitlementView {
     !isPro &&
     !input.accessRevoked &&
     !input.hasRefundedPurchase &&
-    !input.hasActivePurchase;
+    !input.hasActivePurchase &&
+    // Someone who has ever subscribed does not also get the machine's free
+    // window: the subscription's OWN trial is the one they were offered.
+    !input.hasActiveSubscription;
 
   return {
     status,

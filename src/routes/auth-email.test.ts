@@ -44,6 +44,10 @@ import {
 // imported object is what works (process.env is read once, at module load).
 (env as { authRateLimitDisabled: boolean }).authRateLimitDisabled = true;
 
+import { stubNoSubscriptions } from "./test-helpers";
+
+stubNoSubscriptions();
+
 const app = createApp();
 
 const USER_ID = "507f1f77bcf86cd799439011";

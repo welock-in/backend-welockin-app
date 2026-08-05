@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import request from "supertest";
 import { createApp } from "../app";
-import { stubAccountGuard } from "./test-helpers";
+import { stubAccountGuard, stubNoSubscriptions } from "./test-helpers";
+
+stubNoSubscriptions();
 import { signToken } from "../lib/jwt";
 import { prisma } from "../lib/prisma";
 import { Prisma } from "@prisma/client";

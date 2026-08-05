@@ -80,3 +80,19 @@ export function stubAccountGuard(account: Partial<GuardAccount> = {}): void {
     return previous(args);
   };
 }
+
+/**
+ * Answer "this account has no Lemon Squeezy subscription" for the whole file.
+ *
+ * The entitlement resolver reads subscriptions on every call, which means every
+ * test that touches it — and that is most of them, because the resolver is on
+ * the boot path — would otherwise reach an unstubbed Prisma client and 500.
+ *
+ * Installed at module scope rather than per test, and NOT restored: a suite that
+ * wants a subscription stubs `findMany` itself afterwards, which wins because it
+ * replaces this one.
+ */
+export function stubNoSubscriptions(): void {
+  const target = prisma.subscription as unknown as Record<string, any>;
+  target.findMany = async () => [];
+}

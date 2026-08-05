@@ -8,6 +8,10 @@ import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { ledgerHash } from "../lib/hash";
 
+import { stubNoSubscriptions } from "./test-helpers";
+
+stubNoSubscriptions();
+
 const app = createApp();
 const userId = "507f1f77bcf86cd799439011";
 const otherUserId = "507f1f77bcf86cd799439022";

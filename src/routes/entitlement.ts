@@ -2,6 +2,7 @@ import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { ledgerHash } from "../lib/hash";
+import { subscriptionGrants } from "../lib/subscription";
 import { issueReceipt } from "../lib/entitlement-receipt";
 import { readDeviceId } from "../lib/device";
 import { parseFingerprint } from "../lib/fingerprint";
@@ -51,7 +52,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   const now = new Date();
   const deviceIdHash = deviceId ? ledgerHash(deviceId) : null;
 
-  const [user, purchases, claim] = await Promise.all([
+  const [user, purchases, claim, subs] = await Promise.all([
     prisma.user.findUnique({
       where: { id: userId },
       select: {
@@ -68,6 +69,13 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     // is what lets someone's SECOND Mac see the trial they are already inside
     // rather than being handed a fresh one.
     findClaim(deviceIdHash, userId),
+    // Every subscription this account has ever had, not just the live one: a
+    // customer who cancelled and resubscribed has two rows, and which of them
+    // grants is `subscriptionGrants`'s question, not this query's.
+    prisma.subscription.findMany({
+      where: { userId },
+      select: { status: true, validUntil: true },
+    }),
   ]);
 
   // A valid JWT for a deleted account reaches here (stateless verification).
@@ -80,6 +88,12 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   const view = computeEntitlement({
     now,
     hasActivePurchase: purchases.some((p) => !p.isRefunded),
+    hasActiveSubscription: subs.some((sub) => subscriptionGrants(sub, now)),
+    // Only when the granting one is the trial. A customer with a live paid
+    // subscription AND an old lapsed trial row must not read as trialing.
+    subscriptionOnTrial: subs.some(
+      (sub) => sub.status === "on_trial" && subscriptionGrants(sub, now),
+    ),
     // Only decides anything when nothing is live: an active purchase outranks a
     // refunded one, so someone who bought twice and was refunded once keeps access.
     hasRefundedPurchase: purchases.some((p) => p.isRefunded),

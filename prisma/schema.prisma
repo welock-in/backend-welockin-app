@@ -119,6 +119,7 @@ model User {
   pushTokens         PushToken[]
   onboarding         OnboardingProfile?
   purchases          Purchase[]
+  subscriptions      Subscription[]
   emailVerifications EmailVerification[]
   passwordResets     PasswordReset[]
 }
@@ -629,6 +630,75 @@ model WebhookEvent {
   processedAt DateTime?
 
   @@unique([provider, eventId])
+}
+
+/// A Lemon Squeezy subscription, mirrored so the resolver can answer offline and
+/// so support can see what a customer actually has.
+///
+/// A SUBSCRIPTION IS NOT A PURCHASE, and conflating them is the trap this model
+/// exists to avoid. A `Purchase` is a fact that happened once and stays true; a
+/// subscription has a status that moves under you — on_trial, active, past_due,
+/// cancelled, expired — and a validity date that slides forward on every
+/// renewal. Storing one as the other means either losing the movement or
+/// rewriting history on every webhook.
+///
+/// THE ONE RULE FOR READING IT: access is `status IN (on_trial, active, cancelled)
+/// AND validUntil > now`. Cancelled belongs in that list — Lemon Squeezy keeps a
+/// cancelled subscription VALID until the end of the period already paid for, so
+/// treating `cancelled` as "no access" cuts off someone who paid through the end
+/// of the month and is right to complain. `expired` is the status that means gone.
+model Subscription {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  userId String @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// "lemonsqueezy". Present from the start so a second provider does not need a
+  /// migration — the same reason Purchase carries one.
+  provider String
+  /// Lemon Squeezy's subscription id. Unique WITH the provider, never alone: two
+  /// shops number their subscriptions independently.
+  externalId String
+
+  /// Which plan, so the UI can say "Yearly" rather than a bare price, and so a
+  /// change of plan is visible in support.
+  variantId String
+  /// "monthly" | "yearly" — derived from the variant at write time, because the
+  /// variant id alone means nothing to a human reading a row.
+  interval  String?
+
+  /// Lemon Squeezy's own word for the state. Stored verbatim rather than mapped
+  /// to something of ours: when a customer and support disagree, the useful
+  /// question is what the payment processor thinks, not what we translated it to.
+  status String
+
+  /// When access actually runs out — `ends_at` for a cancelled subscription,
+  /// `renews_at` otherwise, `trial_ends_at` while on trial.
+  ///
+  /// One column rather than three, because the resolver needs ONE answer and
+  /// picking between three at read time is how the three drift apart.
+  validUntil DateTime?
+  /// Kept alongside for support and for the UI's countdown, never for the
+  /// decision.
+  trialEndsAt DateTime?
+  renewsAt    DateTime?
+  endsAt      DateTime?
+
+  /// The customer portal URL Lemon Squeezy mints, so "manage my subscription"
+  /// does not have to be a support ticket. Refreshed on every webhook because LS
+  /// signs it with an expiry.
+  updatePaymentUrl String?
+  customerPortalUrl String?
+
+  /// The last payload, verbatim. When a status transition surprises us, the only
+  /// thing that settles it is what actually arrived.
+  rawEvent Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([provider, externalId])
+  @@index([userId, status])
 }
 
 /// The anti-abuse ledger: one free trial per MACHINE, forever.

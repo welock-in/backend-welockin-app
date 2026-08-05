@@ -9,11 +9,15 @@ import {
   isFullRefund,
   isObjectId,
   isSellableOrder,
+  isSubscriptionEvent,
   parseOrderEvent,
+  parseSubscriptionEvent,
   verifyWebhookSignature,
   type LemonSqueezyWebhook,
   type ParsedOrder,
+  type ParsedSubscription,
 } from "../lib/lemonsqueezy";
+import { intervalForVariant, subscriptionGrants, validUntilFrom } from "../lib/subscription";
 
 export const lemonSqueezyWebhookRouter = Router();
 
@@ -63,6 +67,41 @@ lemonSqueezyWebhookRouter.post(
     }
 
     const body = req.body as LemonSqueezyWebhook;
+
+    // Subscriptions branch FIRST, and share nothing with the order path below
+    // beyond the signature and the dedupe table. Their payload is a different
+    // shape and their question is a different question: an order asks "was this
+    // paid for, and for what", a subscription asks "what is its state now".
+    const event = body.meta?.event_name ?? "";
+    if (isSubscriptionEvent(event)) {
+      const sub = parseSubscriptionEvent(body);
+      if (!sub) {
+        console.warn("[lemonsqueezy] signed subscription delivery we cannot parse");
+        res.status(200).json({ ok: true, skipped: "unparsable" });
+        return;
+      }
+      const claim = await claimEventKey(sub.eventKey, sub.event, body);
+      if (claim === "done") {
+        res.status(200).json({ ok: true, deduped: true });
+        return;
+      }
+      if (claim === "retry") {
+        res.status(503).json({ error: { code: "IN_FLIGHT" } });
+        return;
+      }
+      try {
+        const outcome = await handleSubscription(sub, body);
+        await markEvent(sub.eventKey, outcome.status, outcome.reason);
+        res.status(200).json({ ok: true, status: outcome.status });
+      } catch (e) {
+        await markEvent(sub.eventKey, "failed", e instanceof Error ? e.message : "error");
+        // 500 so Lemon Squeezy retries: a subscription state we failed to record
+        // is a customer whose access is about to be wrong.
+        throw e;
+      }
+      return;
+    }
+
     const order = parseOrderEvent(body);
     if (!order) {
       console.warn("[lemonsqueezy] signed delivery we cannot parse");
@@ -276,12 +315,27 @@ async function resolveUserId(order: ParsedOrder): Promise<string | null> {
  * "retry" — the claim itself conflicted and did not land.
  */
 async function claimEvent(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<"fresh" | "done" | "retry"> {
+  return claimEventKey(order.eventKey, order.event, body);
+}
+
+/**
+ * Claim a delivery by key.
+ *
+ * Split out of `claimEvent` so subscriptions reuse it rather than growing a
+ * second copy: the P2034-versus-P2002 distinction below is the part that took a
+ * lost sale to get right, and two copies of it would eventually disagree.
+ */
+async function claimEventKey(
+  eventKey: string,
+  type: string,
+  body: LemonSqueezyWebhook,
+): Promise<"fresh" | "done" | "retry"> {
   try {
     await prisma.webhookEvent.create({
       data: {
         provider: PROVIDER,
-        eventId: order.eventKey,
-        type: order.event,
+        eventId: eventKey,
+        type,
         payload: body as Prisma.InputJsonValue,
         status: "processing",
       },
@@ -297,7 +351,7 @@ async function claimEvent(order: ParsedOrder, body: LemonSqueezyWebhook): Promis
     if (err.code !== "P2002") throw err;
 
     const prior = await prisma.webhookEvent.findUnique({
-      where: { provider_eventId: { provider: PROVIDER, eventId: order.eventKey } },
+      where: { provider_eventId: { provider: PROVIDER, eventId: eventKey } },
       select: { status: true },
     });
     if (prior && DONE.has(prior.status)) return "done";
@@ -307,7 +361,7 @@ async function claimEvent(order: ParsedOrder, body: LemonSqueezyWebhook): Promis
     // idempotent, so redoing it is safe.
     await prisma.webhookEvent
       .update({
-        where: { provider_eventId: { provider: PROVIDER, eventId: order.eventKey } },
+        where: { provider_eventId: { provider: PROVIDER, eventId: eventKey } },
         data: { status: "processing", attempts: { increment: 1 } },
       })
       .catch(() => undefined);
@@ -327,4 +381,104 @@ async function markEvent(eventKey: string, status: string, error?: string): Prom
       // healthy queue indistinguishable from a stuck one.
       console.error(`[lemonsqueezy] could not mark ${eventKey} as ${status}:`, e);
     });
+}
+
+/**
+ * Record what a subscription now IS.
+ *
+ * ONE handler for all eleven events, which is the design and not a shortcut.
+ * Every subscription payload carries the full object with Lemon Squeezy's own
+ * `status` in it, and their guide says `subscription_updated` fires at every
+ * event after the first payment. Nine event-specific branches would be nine
+ * chances for our idea of the state to drift from theirs, over a payload that
+ * already contains the answer. So we mirror what arrived, and
+ * `subscriptionGrants` reads it.
+ *
+ * The event name survives only in the audit row — useful when a customer and
+ * support disagree about when something changed.
+ */
+async function handleSubscription(
+  sub: ParsedSubscription,
+  body: LemonSqueezyWebhook,
+): Promise<Outcome> {
+  // Someone else's store. Unconditional, unlike the order path's historical
+  // `if (storeId && ...)`: a payload with no store id is not ours to trust.
+  if (sub.storeId !== env.lemonSqueezyStoreId) {
+    return { status: "skipped", reason: `store ${sub.storeId ?? "unknown"} is not ours` };
+  }
+
+  // Test-mode gating applies to GRANTING states only. An expiry or a cancellation
+  // arriving from a test subscription still deserves to be written — refusing to
+  // record an ending is how a test row stays live for ever.
+  const granting = subscriptionGrants(
+    { status: sub.status, validUntil: validUntilFrom(sub) },
+    new Date(),
+  );
+  if (sub.testMode && !env.lemonSqueezyAllowTestMode && granting) {
+    return { status: "skipped", reason: "test-mode subscription ignored here" };
+  }
+
+  const userId = await resolveSubscriptionUser(sub);
+  if (!userId) {
+    console.warn(`[lemonsqueezy] unmatched subscription ${sub.subscriptionId} (${sub.event})`);
+    return { status: "failed", reason: `no account matches subscription ${sub.subscriptionId}` };
+  }
+
+  const validUntil = validUntilFrom(sub);
+  const data = {
+    status: sub.status,
+    variantId: sub.variantId ?? "",
+    interval: intervalForVariant(
+      sub.variantId ?? "",
+      env.lemonSqueezyVariantMonthly,
+      env.lemonSqueezyVariantYearly,
+    ),
+    validUntil,
+    trialEndsAt: sub.trialEndsAt,
+    renewsAt: sub.renewsAt,
+    endsAt: sub.endsAt,
+    updatePaymentUrl: sub.updatePaymentUrl,
+    customerPortalUrl: sub.customerPortalUrl,
+    rawEvent: body as Prisma.InputJsonValue,
+  };
+
+  await prisma.subscription.upsert({
+    where: { provider_externalId: { provider: PROVIDER, externalId: sub.subscriptionId } },
+    create: { userId, provider: PROVIDER, externalId: sub.subscriptionId, ...data },
+    // `userId` is deliberately NOT in the update: a redelivery whose custom data
+    // named a different account would otherwise MOVE the subscription. The same
+    // reasoning as the order path, learned there.
+    update: data,
+  });
+
+  return { status: "processed" };
+}
+
+/**
+ * Which account this subscription belongs to.
+ *
+ * `custom_data.user_id` first and by design — it is the only field we control,
+ * because our own checkout put it there. The email fallback exists because a
+ * subscription's LATER events (a renewal a year on) can arrive without the
+ * custom data the original checkout carried, and refusing them would silently
+ * stop tracking a paying customer.
+ */
+async function resolveSubscriptionUser(sub: ParsedSubscription): Promise<string | null> {
+  if (sub.customUserId) {
+    const byId = await prisma.user.findUnique({
+      where: { id: sub.customUserId },
+      select: { id: true },
+    });
+    if (byId) return byId.id;
+  }
+  // Already recorded once? Then we know the answer without trusting an address.
+  const existing = await prisma.subscription.findUnique({
+    where: { provider_externalId: { provider: PROVIDER, externalId: sub.subscriptionId } },
+    select: { userId: true },
+  });
+  if (existing) return existing.userId;
+
+  if (!sub.email) return null;
+  const byEmail = await prisma.user.findUnique({ where: { email: sub.email }, select: { id: true } });
+  return byEmail?.id ?? null;
 }

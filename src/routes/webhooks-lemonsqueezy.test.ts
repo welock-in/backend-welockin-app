@@ -473,7 +473,10 @@ test("an event we do not handle is acknowledged, not retried forever", async (t)
   configured(t);
   const db = stubDb(t);
 
-  const res = await deliver(orderBody({ meta: { event_name: "subscription_created", custom_data: {} } }));
+  // Was `subscription_created` until subscriptions shipped. The property is
+  // unchanged — an event we do not act on must be acknowledged rather than
+  // redelivered for ever — so the example moved to one we genuinely ignore.
+  const res = await deliver(orderBody({ meta: { event_name: "license_key_created", custom_data: {} } }));
 
   assert.equal(res.status, 200);
   assert.equal(db.purchaseUpsert.length, 0);
@@ -600,4 +603,119 @@ test("an unclassifiable refund revokes rather than failing open", async (t) => {
   );
 
   assert.equal(db.purchaseUpdate[0][0].data.isRefunded, true);
+});
+
+
+/* ── Subscriptions ───────────────────────────────────────────────────── */
+
+function subBody(over: Record<string, any> = {}) {
+  const { meta: metaOver, attributes: attrOver, ...rest } = over;
+  return {
+    meta: {
+      event_name: "subscription_created",
+      custom_data: { user_id: USER },
+      ...metaOver,
+    },
+    data: {
+      id: "77001",
+      attributes: {
+        user_email: "buyer@example.com",
+        status: "on_trial",
+        store_id: Number(STORE),
+        variant_id: 5551,
+        trial_ends_at: "2026-08-11T10:00:00.000Z",
+        renews_at: "2026-08-11T10:00:00.000Z",
+        ends_at: null,
+        updated_at: "2026-08-04T10:00:00.000Z",
+        test_mode: false,
+        urls: { update_payment_method: "https://x/pay", customer_portal: "https://x/portal" },
+        ...attrOver,
+      },
+    },
+    ...rest,
+  };
+}
+
+test("a subscription is mirrored with the status Lemon Squeezy actually sent", async (t) => {
+  configured(t);
+  const db = stubDb(t, { userFirst: async () => ({ id: USER }) });
+  const upserts = stubMethod(t, prisma.subscription as any, "upsert", async () => ({}));
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
+
+  const res = await deliver(subBody());
+
+  assert.equal(res.status, 200);
+  assert.equal(upserts.length, 1);
+  assert.equal(upserts[0][0].create.status, "on_trial", "their word, stored verbatim");
+  assert.equal(finalStatus(db.eventUpdate), "processed");
+});
+
+/*
+ * The date the resolver reads is derived ONCE here rather than chosen at read
+ * time, because picking between three dates in four places is how the three
+ * drift apart. On trial, the trial's end is the one that matters.
+ */
+test("validUntil is derived from the right one of the three dates", async (t) => {
+  configured(t);
+  stubDb(t, { userFirst: async () => ({ id: USER }) });
+  const upserts = stubMethod(t, prisma.subscription as any, "upsert", async () => ({}));
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
+
+  await deliver(
+    subBody({
+      attributes: { status: "cancelled", ends_at: "2026-09-01T00:00:00.000Z", renews_at: "2026-10-01T00:00:00.000Z" },
+    }),
+  );
+
+  // ends_at wins: it is the hard stop, and a cancelled subscription stays valid
+  // until then rather than until the renewal that will never happen.
+  assert.equal(
+    upserts[0][0].create.validUntil.toISOString(),
+    "2026-09-01T00:00:00.000Z",
+  );
+});
+
+/*
+ * The same lesson the order path had to learn: a redelivery whose custom data
+ * named a different account must not MOVE the subscription to it.
+ */
+test("a replayed subscription event never reassigns the account", async (t) => {
+  configured(t);
+  stubDb(t, { userFirst: async () => ({ id: USER }) });
+  const upserts = stubMethod(t, prisma.subscription as any, "upsert", async () => ({}));
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
+
+  await deliver(subBody());
+
+  assert.equal(upserts[0][0].update.userId, undefined, "userId is not in the update branch");
+});
+
+test("a subscription from another store is refused", async (t) => {
+  configured(t);
+  const db = stubDb(t);
+  const upserts = stubMethod(t, prisma.subscription as any, "upsert", async () => ({}));
+
+  await deliver(subBody({ attributes: { store_id: 999999 } }));
+
+  assert.equal(upserts.length, 0);
+  assert.equal(finalStatus(db.eventUpdate), "skipped");
+});
+
+/*
+ * Test-mode gating applies to GRANTING states only. Refusing to record an ending
+ * is how a test row stays live for ever.
+ */
+test("a test-mode ENDING is still recorded, even though a test-mode start is not", async (t) => {
+  configured(t);
+  stubDb(t, { userFirst: async () => ({ id: USER }) });
+  const upserts = stubMethod(t, prisma.subscription as any, "upsert", async () => ({}));
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
+
+  await deliver(subBody({ attributes: { test_mode: true, status: "expired" } }));
+  assert.equal(upserts.length, 1, "an expiry is written whatever mode it came from");
+
+  await deliver(
+    subBody({ meta: { event_name: "subscription_updated" }, attributes: { test_mode: true, status: "active" } }),
+  );
+  assert.equal(upserts.length, 1, "but a granting state is not");
 });

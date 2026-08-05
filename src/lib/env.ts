@@ -199,8 +199,25 @@ export const env = {
   lemonSqueezyApiKey: process.env.LEMONSQUEEZY_API_KEY ?? "",
   lemonSqueezyWebhookSecret: process.env.LEMONSQUEEZY_WEBHOOK_SECRET ?? "",
   lemonSqueezyStoreId: process.env.LEMONSQUEEZY_STORE_ID ?? "",
-  /** The one variant we sell. Unset means SELL NOTHING, never sell everything. */
+  /**
+   * The LIFETIME variant — a one-off order.
+   *
+   * Kept under its original name because the webhook's `isSellableOrder` already
+   * checks orders against it, and orders are still exactly one product. Unset
+   * means SELL NOTHING, never sell everything.
+   */
   lemonSqueezyVariantId: process.env.LEMONSQUEEZY_VARIANT_ID ?? "",
+  /**
+   * The two SUBSCRIPTION variants.
+   *
+   * Used only to label a row "monthly" or "yearly" for humans — never to decide
+   * whether a subscription grants, which is `subscriptionGrants`'s job and reads
+   * the status. So an unrecognised variant degrades to an unlabelled row rather
+   * than to a refused customer: the day a price changes, someone paying us must
+   * not lose access because the id in the environment is one release behind.
+   */
+  lemonSqueezyVariantMonthly: process.env.LEMONSQUEEZY_VARIANT_MONTHLY ?? "",
+  lemonSqueezyVariantYearly: process.env.LEMONSQUEEZY_VARIANT_YEARLY ?? "",
   lemonSqueezyApiBase: process.env.LEMONSQUEEZY_API_BASE ?? "https://api.lemonsqueezy.com",
   /**
    * May a TEST-mode order grant a real lifetime licence?

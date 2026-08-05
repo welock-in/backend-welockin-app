@@ -17,6 +17,36 @@ export const HANDLED_EVENTS = ["order_created", "order_refunded"] as const;
 export type HandledEvent = (typeof HANDLED_EVENTS)[number];
 
 /**
+ * Every subscription event we act on.
+ *
+ * All of them are handled the SAME WAY, and that is the design rather than
+ * laziness. Each one carries a full subscription object whose `status` is Lemon
+ * Squeezy's current verdict, and their own guide says `subscription_updated`
+ * fires at every event after the first payment — so nine event-specific branches
+ * would be nine chances for our idea of the state to disagree with theirs, over
+ * a payload that already tells us the answer.
+ *
+ * We mirror what arrived and let `subscriptionGrants` read it. The event name is
+ * kept only for the audit trail.
+ */
+export const SUBSCRIPTION_EVENTS = [
+  "subscription_created",
+  "subscription_updated",
+  "subscription_cancelled",
+  "subscription_resumed",
+  "subscription_expired",
+  "subscription_paused",
+  "subscription_unpaused",
+  "subscription_payment_success",
+  "subscription_payment_failed",
+  "subscription_payment_recovered",
+  "subscription_payment_refunded",
+] as const;
+
+export const isSubscriptionEvent = (event: string): boolean =>
+  (SUBSCRIPTION_EVENTS as readonly string[]).includes(event);
+
+/**
  * Is this signature genuinely Lemon Squeezy's?
  *
  * HMAC-SHA256 over the RAW request bytes, compared in constant time.
@@ -66,6 +96,16 @@ export type LemonSqueezyWebhook = {
       test_mode?: boolean;
       store_id?: number;
       first_order_item?: { product_id?: number; variant_id?: number };
+      // --- subscription-shaped payloads ---
+      variant_id?: number;
+      product_id?: number;
+      trial_ends_at?: string | null;
+      renews_at?: string | null;
+      ends_at?: string | null;
+      urls?: { update_payment_method?: string; customer_portal?: string };
+      /// Part of the dedup key: a redelivery of one event repeats it, a genuinely
+      /// new event on the same subscription does not.
+      updated_at?: string;
     };
   };
 };
@@ -169,6 +209,64 @@ function parseDate(value: unknown): Date | null {
  * rests on, and a Purchase keyed on `undefined` would collapse every customer's
  * licence onto a single row.
  */
+export type ParsedSubscription = {
+  event: string;
+  /** Lemon Squeezy's subscription id. */
+  subscriptionId: string;
+  eventKey: string;
+  /** Their word for the state, stored verbatim. */
+  status: string;
+  email: string | null;
+  customUserId: string | null;
+  variantId: string | null;
+  storeId: string | null;
+  trialEndsAt: Date | null;
+  renewsAt: Date | null;
+  endsAt: Date | null;
+  updatePaymentUrl: string | null;
+  customerPortalUrl: string | null;
+  testMode: boolean;
+};
+
+/**
+ * Read a subscription event.
+ *
+ * Deliberately does NOT decide anything — no "is this sellable", no status
+ * mapping. A subscription event is a statement of fact from the payment
+ * processor about a subscription that already exists; the only judgement worth
+ * making about it is whether it is ours, and that is the caller's job.
+ */
+export function parseSubscriptionEvent(body: LemonSqueezyWebhook): ParsedSubscription | null {
+  const event = body.meta?.event_name;
+  const subscriptionId = body.data?.id;
+  const attrs = body.data?.attributes;
+  if (!event || !subscriptionId || !attrs) return null;
+  if (!isSubscriptionEvent(event)) return null;
+
+  const custom = body.meta?.custom_data ?? {};
+  const str = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v.trim() : null);
+
+  return {
+    event,
+    subscriptionId: String(subscriptionId),
+    // Keyed on the EVENT as well as the id: unlike an order, a subscription
+    // produces many events over its life and they must not deduplicate against
+    // one another. Only a redelivery of the SAME event is a duplicate.
+    eventKey: `${event}:${subscriptionId}:${str(attrs.updated_at) ?? ""}`,
+    status: typeof attrs.status === "string" ? attrs.status : "unknown",
+    email: typeof attrs.user_email === "string" ? attrs.user_email.trim().toLowerCase() : null,
+    customUserId: coerceCustomId(custom.user_id) ?? coerceCustomId(custom.userId),
+    variantId: attrs.variant_id != null ? String(attrs.variant_id) : null,
+    storeId: attrs.store_id != null ? String(attrs.store_id) : null,
+    trialEndsAt: parseDate(attrs.trial_ends_at),
+    renewsAt: parseDate(attrs.renews_at),
+    endsAt: parseDate(attrs.ends_at),
+    updatePaymentUrl: str(attrs.urls?.update_payment_method),
+    customerPortalUrl: str(attrs.urls?.customer_portal),
+    testMode: attrs.test_mode === true || body.meta?.test_mode === true,
+  };
+}
+
 export function parseOrderEvent(body: LemonSqueezyWebhook): ParsedOrder | null {
   const event = body.meta?.event_name;
   const orderId = body.data?.id;

@@ -495,3 +495,17 @@ export const adminTrialResetSchema = z.object({
    */
   confirmUserId: z.string().trim().min(1),
 });
+
+// --- Checkout ----------------------------------------------------------------
+/**
+ * Which plan to buy — a NAME, never a variant id.
+ *
+ * That distinction is the whole security of this endpoint. The server maps the
+ * name to a variant from its own environment, so a caller can ask for "monthly"
+ * but cannot ask for a variant of their choosing: not a €0 test variant, not
+ * another store's, not one belonging to a different product entirely. The set of
+ * things purchasable is fixed at deploy time, not at request time.
+ */
+export const checkoutSchema = z.object({
+  plan: z.enum(["monthly", "yearly", "lifetime"]),
+});

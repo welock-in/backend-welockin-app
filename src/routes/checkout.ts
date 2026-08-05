@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
+import { checkoutSchema } from "../validation/schemas";
+import { subscriptionGrants } from "../lib/subscription";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { accountGone, conflict, badRequest } from "../lib/http-error";
@@ -31,10 +33,25 @@ checkoutRouter.post(
   "/",
   requireAuth,
   asyncHandler(async (req, res) => {
-    if (!env.lemonSqueezyApiKey || !env.lemonSqueezyStoreId || !env.lemonSqueezyVariantId) {
+    const { plan } = checkoutSchema.parse(req.body ?? {});
+
+    // The NAME becomes an id here and nowhere else. A caller can ask for
+    // "monthly"; it can never ask for a variant of its choosing — not a €0 test
+    // variant, not another store's, not one belonging to a different product.
+    // What is purchasable is fixed at deploy time, not at request time.
+    const variantId =
+      plan === "monthly"
+        ? env.lemonSqueezyVariantMonthly
+        : plan === "yearly"
+          ? env.lemonSqueezyVariantYearly
+          : env.lemonSqueezyVariantId;
+
+    if (!env.lemonSqueezyApiKey || !env.lemonSqueezyStoreId || !variantId) {
       // Configuration, not user error — and worth being loud about, because the
-      // symptom otherwise is a paywall button that silently does nothing.
-      console.error("[checkout] Lemon Squeezy is not configured (api key / store / variant)");
+      // symptom otherwise is a paywall button that silently does nothing. Named
+      // per plan: "purchasing is broken" and "the yearly id is missing" send an
+      // operator to very different places.
+      console.error(`[checkout] Lemon Squeezy is not configured for plan "${plan}"`);
       throw badRequest("Purchasing is not available right now.");
     }
 
@@ -45,14 +62,30 @@ checkoutRouter.post(
     });
     if (!user) throw accountGone();
 
-    // Do not send someone to pay for what they already own. This is a lifetime
-    // licence: a second purchase buys nothing, and refunding it afterwards costs
-    // us the fee and them the goodwill.
+    // Do not send someone to pay for what they already own. A lifetime licence
+    // makes every plan pointless — a second purchase buys nothing, and refunding
+    // it afterwards costs us the fee and them the goodwill.
     const owned = await prisma.purchase.findFirst({
       where: { userId, isRefunded: false },
       select: { id: true },
     });
     if (owned) throw conflict("You already own the lifetime licence.");
+
+    // A live subscription blocks a SECOND subscription, but never the upgrade to
+    // lifetime: someone paying monthly who wants to stop paying monthly is the
+    // best possible customer, and refusing them is refusing money. Changing
+    // between monthly and yearly is a Lemon Squeezy operation on the existing
+    // subscription, not a new checkout — sending them here would leave them
+    // holding two.
+    if (plan !== "lifetime") {
+      const subs = await prisma.subscription.findMany({
+        where: { userId },
+        select: { status: true, validUntil: true },
+      });
+      if (subs.some((sub) => subscriptionGrants(sub, new Date()))) {
+        throw conflict("You already have an active subscription.");
+      }
+    }
 
     const body = {
       data: {
@@ -66,7 +99,7 @@ checkoutRouter.post(
         },
         relationships: {
           store: { data: { type: "stores", id: env.lemonSqueezyStoreId } },
-          variant: { data: { type: "variants", id: env.lemonSqueezyVariantId } },
+          variant: { data: { type: "variants", id: variantId } },
         },
       },
     };

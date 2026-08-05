@@ -3,7 +3,7 @@ import type { Release } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { asyncHandler } from "../middleware/async-handler";
 import { compare, isValid } from "../lib/semver";
-import { isSupportedTarget, supportedTargetList } from "../lib/update-targets";
+import { DOWNLOAD_ALIASES, isSupportedTarget, supportedTargetList } from "../lib/update-targets";
 
 // Desktop auto-update manifest. PUBLIC and unauthenticated by design — a client
 // that can't reach it must simply keep working, and requiring a token would mean
@@ -198,6 +198,40 @@ updatesRouter.get(
     if (!want.ok) return badTarget(res);
 
     const rel = await liveRelease(want.target, want.arch);
+    if (!rel) {
+      res.status(404).json({ error: "No download is available right now" });
+      return;
+    }
+    res.setHeader("Cache-Control", "public, max-age=60, s-maxage=60");
+    res.redirect(302, installerFor(rel));
+  }),
+);
+
+/**
+ * GET /api/updates/download/:platform — the same door, named for humans.
+ *
+ * This is the URL that goes on the website. `?target=darwin&arch=aarch64` works
+ * and stays, but it is a bad thing to hand a person writing a link: it leaks
+ * Tauri's build triple and the Mac build's CPU into marketing HTML, where both
+ * are one silent typo away from serving a `.exe` to a Mac. `/download/macos`
+ * carries neither, and the mapping lives in one place next to the triples it
+ * maps to.
+ *
+ * An unknown platform is a 404 with the list, not a redirect to Windows: a
+ * misspelled link should be visibly broken to whoever wrote it, not quietly
+ * correct for the majority platform.
+ */
+updatesRouter.get(
+  "/download/:platform",
+  asyncHandler(async (req, res) => {
+    const alias = DOWNLOAD_ALIASES[req.params.platform.toLowerCase()];
+    if (!alias) {
+      res.status(404).json({
+        error: `Unknown platform. Try: ${Object.keys(DOWNLOAD_ALIASES).join(", ")}`,
+      });
+      return;
+    }
+    const rel = await liveRelease(alias.target, alias.arch);
     if (!rel) {
       res.status(404).json({ error: "No download is available right now" });
       return;

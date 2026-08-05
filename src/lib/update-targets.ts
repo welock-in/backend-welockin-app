@@ -16,6 +16,23 @@
  * on it, since their update checks would start answering 204 forever — pause
  * the release instead.
  */
+/**
+ * The names a HUMAN writes, mapped to the triple above.
+ *
+ * A website link is written by a person, and `?target=darwin&arch=aarch64` asks
+ * that person to know two things they have no business knowing: Tauri's build
+ * triple, and which CPU the Mac build targets. Both are ours to keep track of.
+ *
+ * `macos` is the obvious word and it is deliberately NOT a valid `target` on the
+ * updater path — an updater asking for `macos` is a client with a wrong build
+ * triple and must be told so. Here it is the ONLY spelling, because here it is
+ * a person typing a URL, not a machine reporting what it is.
+ */
+export const DOWNLOAD_ALIASES: Record<string, { target: string; arch: string }> = {
+  windows: { target: "windows", arch: "x86_64" },
+  macos: { target: "darwin", arch: "aarch64" },
+};
+
 export const UPDATE_TARGETS = [
   { target: "windows", arch: "x86_64" },
   /**

@@ -44,6 +44,16 @@ export type ReceiptInput = {
   isPro: boolean;
   trialEndsAt: Date | null;
   serverTime: Date;
+  /**
+   * ENTITLEMENT_ENFORCED. Inside the signature on purpose.
+   *
+   * It is the master switch that says whether the client may hard-gate, so a
+   * client reading it from anywhere else reads it from somewhere the user can
+   * edit — and `UPDATE kv SET value='false'` would turn the paywall off
+   * completely. That is the exact attack the rest of this file exists to stop;
+   * leaving the switch outside the envelope would have handed it back.
+   */
+  enforced: boolean;
 };
 
 /**
@@ -90,6 +100,7 @@ function canonical(p: Record<string, unknown>): string {
     "serverTime",
     "expiresAt",
     "nonce",
+    "enforced",
   ];
   return JSON.stringify(Object.fromEntries(order.map((k) => [k, p[k] ?? null])));
 }
@@ -141,6 +152,11 @@ export function issueReceipt(input: ReceiptInput): string | null {
       now.getTime() + ttlMs(input.status, input.isPro, input.trialEndsAt, now),
     ).toISOString(),
     nonce: randomBytes(9).toString("base64url"),
+    // Appended AFTER nonce rather than inserted next to `isPro`, where it reads
+    // more naturally: the order in `canonical` is the signed byte order, so
+    // inserting mid-list would invalidate every receipt already in the field.
+    // New fields go on the end, always.
+    enforced: input.enforced,
   });
 
   try {

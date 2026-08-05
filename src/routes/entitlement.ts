@@ -127,6 +127,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
       isPro: view.isPro,
       trialEndsAt: view.trialEndsAt ? new Date(view.trialEndsAt) : null,
       serverTime: now,
+      enforced: view.enforced,
     }),
   };
 }

@@ -40,6 +40,10 @@ healthRouter.get("/config", (_req, res) => {
       // False here = no receipts are being signed = every desktop client runs
       // on Access::Unknown and GRANTS. The paywall does not bite without it.
       receiptsEnabled: receiptsEnabled(),
+      // Present-but-not-enabled is the diagnosis that matters: the variable is
+      // set and its VALUE cannot be parsed as a key — a mangled paste, not a
+      // missing paste. Telling those apart used to take reading server logs.
+      signingKeyPresent: Boolean(env.entitlementSigningKey),
       enforced: env.entitlementEnforced,
     },
     email: {

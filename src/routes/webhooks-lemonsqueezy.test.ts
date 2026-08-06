@@ -6,6 +6,7 @@ import { Prisma } from "@prisma/client";
 import { createApp } from "../app";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
+import { parseOrderEvent, parseSubscriptionEvent } from "../lib/lemonsqueezy";
 import { REAL_ORDER_CREATED, REAL_ORDER_REFUNDED, REAL_USER_ID } from "./lemonsqueezy-fixtures";
 
 /*
@@ -59,6 +60,8 @@ function configured(t: Ctx, extra: Record<string, unknown> = {}) {
     lemonSqueezyWebhookSecret: SECRET,
     lemonSqueezyStoreId: STORE,
     lemonSqueezyVariantId: VARIANT,
+    lemonSqueezyVariantMonthly: "1986433",
+    lemonSqueezyVariantYearly: "1986420",
     lemonSqueezyAllowTestMode: false,
     ...extra,
   });
@@ -77,6 +80,13 @@ function stubDb(t: Ctx, overrides: Record<string, (...args: any[]) => any> = {})
     eventCreate: stubMethod(t, prisma.webhookEvent as any, "create", pick("eventCreate", async () => ({}))),
     eventFind: stubMethod(t, prisma.webhookEvent as any, "findUnique", pick("eventFind", async () => null)),
     eventUpdate: stubMethod(t, prisma.webhookEvent as any, "update", pick("eventUpdate", async () => ({}))),
+    // markEvent writes through updateMany (its WHERE carries the terminal-status
+    // guard); the claim path's re-mark still uses plain update above.
+    eventMark: stubMethod(t, prisma.webhookEvent as any, "updateMany", pick("eventMark", async () => ({ count: 1 }))),
+    // The subscription write path: conditional updateMany, then create when no
+    // row matched. Baseline mirrors "nothing exists yet": count 0, create lands.
+    subWrite: stubMethod(t, prisma.subscription as any, "updateMany", pick("subWrite", async () => ({ count: 0 }))),
+    subCreate: stubMethod(t, prisma.subscription as any, "create", pick("subCreate", async () => ({}))),
     purchaseUpsert: stubMethod(t, prisma.purchase as any, "upsert", pick("purchaseUpsert", async () => ({}))),
     purchaseFind: stubMethod(t, prisma.purchase as any, "findUnique", pick("purchaseFind", async () => null)),
     purchaseUpdate: stubMethod(t, prisma.purchase as any, "update", pick("purchaseUpdate", async () => ({}))),
@@ -195,7 +205,7 @@ test("a paid order for our variant grants the licence to the account the checkou
   assert.equal(arg.create.isRefunded, false);
   // A replayed order_created must not resurrect a refunded licence.
   assert.ok(!("isRefunded" in arg.update));
-  assert.equal(finalStatus(db.eventUpdate), "processed");
+  assert.equal(finalStatus(db.eventMark), "processed");
 });
 
 /*
@@ -216,15 +226,30 @@ test("a custom_data.user_id that is not a string degrades to the email match", a
   assert.equal(db.purchaseUpsert.length, 5, "and the order is still granted, via email");
 });
 
-test("an order for another variant is refused permanently", async (t) => {
+/*
+ * Variant mismatches split two ways, and the split IS the point. A subscription
+ * checkout fires order_created too — one per monthly/yearly signup, for ever —
+ * and those are terminally skipped (the grant comes from subscription_* events).
+ * Any OTHER variant is far more likely OUR stale config than a foreign product,
+ * and the customer has already paid — so it stays claimable for a dashboard
+ * resend after the env is fixed.
+ */
+test("a subscription's own order_created is skipped; an unknown variant stays claimable", async (t) => {
   configured(t);
   const db = stubDb(t);
 
-  const res = await deliver(orderBody({ attributes: { first_order_item: { variant_id: 999999 } } }));
+  const monthly = await deliver(
+    orderBody({ attributes: { first_order_item: { variant_id: 1986433 } } }),
+  );
+  assert.equal(monthly.status, 200);
+  assert.equal(finalStatus(db.eventMark), "skipped", "expected noise, never a to-do");
 
-  assert.equal(res.status, 200, "understood and declined — redelivering it would change nothing");
-  assert.equal(db.purchaseUpsert.length, 0);
-  assert.equal(finalStatus(db.eventUpdate), "skipped");
+  const unknown = await deliver(
+    orderBody({ attributes: { first_order_item: { variant_id: 999999 } } }),
+  );
+  assert.equal(unknown.status, 200);
+  assert.equal(finalStatus(db.eventMark), "failed", "a paid order behind a stale env must stay claimable");
+  assert.equal(db.purchaseUpsert.length, 0, "neither grants anything");
 });
 
 test("an order from another store is refused permanently", async (t) => {
@@ -235,7 +260,7 @@ test("an order from another store is refused permanently", async (t) => {
 
   assert.equal(res.status, 200);
   assert.equal(db.purchaseUpsert.length, 0);
-  assert.equal(finalStatus(db.eventUpdate), "skipped");
+  assert.equal(finalStatus(db.eventMark), "skipped");
 });
 
 /*
@@ -254,7 +279,7 @@ test("our own misconfiguration leaves a paid order claimable, not permanently dr
 
   assert.equal(res.status, 200);
   assert.equal(db.purchaseUpsert.length, 0);
-  assert.equal(finalStatus(db.eventUpdate), "failed", "must NOT be the terminal 'skipped'");
+  assert.equal(finalStatus(db.eventMark), "failed", "must NOT be the terminal 'skipped'");
 });
 
 test("a test-mode order does not mint a real licence on a live backend", async (t) => {
@@ -265,7 +290,7 @@ test("a test-mode order does not mint a real licence on a live backend", async (
 
   assert.equal(res.status, 200);
   assert.equal(db.purchaseUpsert.length, 0);
-  assert.equal(finalStatus(db.eventUpdate), "skipped");
+  assert.equal(finalStatus(db.eventMark), "skipped");
 });
 
 test("meta.test_mode alone is enough to refuse a test order", async (t) => {
@@ -307,7 +332,7 @@ test("an order matching no account is parked as unfinished business, not swallow
 
   assert.equal(res.status, 200, "retrying will not conjure a user");
   assert.equal(db.purchaseUpsert.length, 0);
-  assert.equal(finalStatus(db.eventUpdate), "failed", "queryable, because a human has to finish it");
+  assert.equal(finalStatus(db.eventMark), "failed", "queryable, because a human has to finish it");
 });
 
 test("an order with no custom user id falls back to the buyer's email", async (t) => {
@@ -346,7 +371,7 @@ test("a refund revokes the licence on the order we already recorded", async (t) 
 
   assert.equal(res.status, 200);
   assert.equal(db.purchaseUpdate[0][0].data.isRefunded, true);
-  assert.equal(finalStatus(db.eventUpdate), "processed");
+  assert.equal(finalStatus(db.eventMark), "processed");
 });
 
 /*
@@ -465,7 +490,7 @@ test("a failure while granting is left claimable and asks to be redelivered", as
   const res = await deliver(orderBody());
 
   assert.equal(res.status, 500, "a 500 is how we ask for the redelivery we need");
-  assert.equal(finalStatus(db.eventUpdate), "failed", "non-terminal, so the retry re-runs the work");
+  assert.equal(finalStatus(db.eventMark), "failed", "non-terminal, so the retry re-runs the work");
 });
 
 /* ── Someone else's payload ───────────────────────────────────────────── */
@@ -481,7 +506,7 @@ test("an event we do not handle is acknowledged, not retried forever", async (t)
 
   assert.equal(res.status, 200);
   assert.equal(db.purchaseUpsert.length, 0);
-  assert.equal(finalStatus(db.eventUpdate), "skipped");
+  assert.equal(finalStatus(db.eventMark), "skipped");
 });
 
 test("a signed delivery with no order id is acknowledged and dropped", async (t) => {
@@ -560,7 +585,7 @@ test("a PARTIAL refund keeps the licence", async (t) => {
     undefined,
     "isRefunded must not be written at all on a partial refund",
   );
-  assert.equal(finalStatus(db.eventUpdate), "processed");
+  assert.equal(finalStatus(db.eventMark), "processed");
 });
 
 /*
@@ -640,15 +665,19 @@ function subBody(over: Record<string, any> = {}) {
 test("a subscription is mirrored with the status Lemon Squeezy actually sent", async (t) => {
   configured(t);
   const db = stubDb(t, { userFirst: async () => ({ id: USER }) });
-  const upserts = stubMethod(t, prisma.subscription as any, "upsert", async () => ({}));
   stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
 
   const res = await deliver(subBody());
 
   assert.equal(res.status, 200);
-  assert.equal(upserts.length, 1);
-  assert.equal(upserts[0][0].create.status, "on_trial", "their word, stored verbatim");
-  assert.equal(finalStatus(db.eventUpdate), "processed");
+  assert.equal(db.subCreate.length, 1);
+  assert.equal(db.subCreate[0][0].data.status, "on_trial", "their word, stored verbatim");
+  // The ordering guard's clock rides along, parsed from the event itself.
+  assert.equal(
+    db.subCreate[0][0].data.providerUpdatedAt.toISOString(),
+    "2026-08-04T10:00:00.000Z",
+  );
+  assert.equal(finalStatus(db.eventMark), "processed");
 });
 
 /*
@@ -658,8 +687,7 @@ test("a subscription is mirrored with the status Lemon Squeezy actually sent", a
  */
 test("validUntil is derived from the right one of the three dates", async (t) => {
   configured(t);
-  stubDb(t, { userFirst: async () => ({ id: USER }) });
-  const upserts = stubMethod(t, prisma.subscription as any, "upsert", async () => ({}));
+  const db = stubDb(t, { userFirst: async () => ({ id: USER }) });
   stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
 
   await deliver(
@@ -671,7 +699,7 @@ test("validUntil is derived from the right one of the three dates", async (t) =>
   // ends_at wins: it is the hard stop, and a cancelled subscription stays valid
   // until then rather than until the renewal that will never happen.
   assert.equal(
-    upserts[0][0].create.validUntil.toISOString(),
+    db.subCreate[0][0].data.validUntil.toISOString(),
     "2026-09-01T00:00:00.000Z",
   );
 });
@@ -682,24 +710,27 @@ test("validUntil is derived from the right one of the three dates", async (t) =>
  */
 test("a replayed subscription event never reassigns the account", async (t) => {
   configured(t);
-  stubDb(t, { userFirst: async () => ({ id: USER }) });
-  const upserts = stubMethod(t, prisma.subscription as any, "upsert", async () => ({}));
+  const db = stubDb(t, { userFirst: async () => ({ id: USER }) });
   stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
 
   await deliver(subBody());
 
-  assert.equal(upserts[0][0].update.userId, undefined, "userId is not in the update branch");
+  // Ownership is decided at create and nowhere else: the conditional update
+  // that lands on an existing row must not carry a userId at all.
+  assert.equal(db.subWrite.length >= 1, true);
+  assert.equal(db.subWrite[0][0].data.userId, undefined, "userId is not in the update data");
+  assert.equal(db.subCreate[0][0].data.userId, USER, "create is where ownership lives");
 });
 
 test("a subscription from another store is refused", async (t) => {
   configured(t);
   const db = stubDb(t);
-  const upserts = stubMethod(t, prisma.subscription as any, "upsert", async () => ({}));
 
   await deliver(subBody({ attributes: { store_id: 999999 } }));
 
-  assert.equal(upserts.length, 0);
-  assert.equal(finalStatus(db.eventUpdate), "skipped");
+  assert.equal(db.subCreate.length, 0);
+  assert.equal(db.subWrite.length, 0);
+  assert.equal(finalStatus(db.eventMark), "skipped");
 });
 
 /*
@@ -708,17 +739,16 @@ test("a subscription from another store is refused", async (t) => {
  */
 test("a test-mode ENDING is still recorded, even though a test-mode start is not", async (t) => {
   configured(t);
-  stubDb(t, { userFirst: async () => ({ id: USER }) });
-  const upserts = stubMethod(t, prisma.subscription as any, "upsert", async () => ({}));
+  const db = stubDb(t, { userFirst: async () => ({ id: USER }) });
   stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
 
   await deliver(subBody({ attributes: { test_mode: true, status: "expired" } }));
-  assert.equal(upserts.length, 1, "an expiry is written whatever mode it came from");
+  assert.equal(db.subCreate.length, 1, "an expiry is written whatever mode it came from");
 
   await deliver(
     subBody({ meta: { event_name: "subscription_updated" }, attributes: { test_mode: true, status: "active" } }),
   );
-  assert.equal(upserts.length, 1, "but a granting state is not");
+  assert.equal(db.subCreate.length, 1, "but a granting state is not");
 });
 
 /*
@@ -741,7 +771,7 @@ test("the real order_created is refused while test mode is closed", async (t) =>
 
   assert.equal(res.status, 200, "understood and deliberately ignored — never retried");
   assert.equal(db.purchaseUpsert.length, 0, "no licence for money never really paid");
-  assert.equal(finalStatus(db.eventUpdate), "skipped");
+  assert.equal(finalStatus(db.eventMark), "skipped");
 });
 
 test("the real order_created grants the lifetime licence when test mode is open", async (t) => {
@@ -756,7 +786,7 @@ test("the real order_created grants the lifetime licence when test mode is open"
   const res = await deliver(REAL_ORDER_CREATED);
 
   assert.equal(res.status, 200);
-  assert.equal(finalStatus(db.eventUpdate), "processed");
+  assert.equal(finalStatus(db.eventMark), "processed");
   assert.equal(db.purchaseUpsert.length, 1);
   const written = db.purchaseUpsert[0][0].create;
   assert.equal(written.userId, REAL_USER_ID);
@@ -779,7 +809,7 @@ test("the real order_refunded revokes even though test mode is closed", async (t
   const res = await deliver(REAL_ORDER_REFUNDED);
 
   assert.equal(res.status, 200);
-  assert.equal(finalStatus(db.eventUpdate), "processed");
+  assert.equal(finalStatus(db.eventMark), "processed");
   const revokes = db.purchaseUpdate.filter((c) => c[0]?.data?.isRefunded === true);
   assert.equal(revokes.length, 1, "a full refund must revoke the licence");
   // status "refunded" + refunded_amount_usd === total_usd: both signals agree,
@@ -835,6 +865,12 @@ test("a full refund after a partial refund still revokes", async (t) => {
       if (row && typeof args.data.status === "string") row.status = args.data.status;
       return {};
     },
+    eventMark: async (args: any) => {
+      const row = rows.get(args.where.eventId);
+      if (!row || ["processed", "skipped"].includes(row.status)) return { count: 0 };
+      row.status = args.data.status;
+      return { count: 1 };
+    },
     purchaseFind: async () => ({ id: "purchase-9090213" }),
   });
 
@@ -869,4 +905,180 @@ test("a full refund after a partial refund still revokes", async (t) => {
     1,
     "byte-identical redeliveries still land exactly once",
   );
+});
+
+/*
+ * ── What the adversarial review of the real payloads changed ────────────
+ *
+ * Ten findings survived verification (20 agents, each defect independently
+ * refutation-tested). The tests below pin the seven that changed code; the
+ * refuted ones need no pinning — they were wrong about the code as it stands.
+ */
+
+// Finding: revocation was gated behind isSellableOrder, so rotating the variant
+// id (a price change) would have made every refund of the OLD variant refuse
+// terminally — money returned, licence live. A Purchase we recorded is ours to
+// revoke whatever the env says today.
+test("a refund still revokes after the variant id has been rotated", async (t) => {
+  configured(t, { lemonSqueezyVariantId: "7777777" }); // the env moved on
+  const db = stubDb(t, {
+    purchaseFind: async () => ({ id: "purchase-9090213" }),
+  });
+
+  const res = await deliver(REAL_ORDER_REFUNDED); // still carries variant 1960881
+
+  assert.equal(res.status, 200);
+  assert.equal(finalStatus(db.eventMark), "processed");
+  assert.equal(
+    db.purchaseUpdate.filter((c) => c[0]?.data?.isRefunded === true).length,
+    1,
+    "the licence we granted must be revocable whatever the env says today",
+  );
+});
+
+// The sellable question a refund DOES raise: an order we never saw created must
+// not mint a row when it is not even ours.
+test("an orphan refund from a foreign store mints nothing", async (t) => {
+  configured(t);
+  const db = stubDb(t, { purchaseFind: async () => null });
+
+  const body = JSON.parse(JSON.stringify(REAL_ORDER_REFUNDED));
+  body.data.attributes.store_id = 999999;
+  const res = await deliver(body);
+
+  assert.equal(res.status, 200);
+  assert.equal(db.purchaseCreate.length, 0);
+  assert.equal(finalStatus(db.eventMark), "skipped");
+});
+
+// Finding: the orphan branch ignored the partial/full verdict and stamped every
+// refund born-revoked — so a customer whose order_created was lost and who then
+// received a small goodwill refund lost the licence they had paid in full for.
+test("an orphan PARTIAL refund is parked for a human, not written as a revoke", async (t) => {
+  configured(t);
+  const db = stubDb(t, { purchaseFind: async () => null });
+
+  const body = JSON.parse(JSON.stringify(REAL_ORDER_REFUNDED));
+  body.data.attributes.status = "partial_refund";
+  body.data.attributes.refunded_amount = 500;
+  body.data.attributes.refunded_amount_usd = 573;
+  const res = await deliver(body);
+
+  assert.equal(res.status, 200);
+  assert.equal(db.purchaseCreate.length, 0, "born-revoked would punish a paying customer");
+  assert.equal(db.purchaseUpdate.length, 0, "and there is nothing to update");
+  assert.equal(finalStatus(db.eventMark), "failed", "claimable: redeliver the order_created");
+});
+
+/*
+ * Finding: the money fields were read type-strictly, and the real fixtures prove
+ * Lemon Squeezy mutates numeric fields into decimal strings between events
+ * (tax_rate: 0 then "0.00"). A string total nulled priceUsd — and then a partial
+ * refund with an unhelpful status fell through isFullRefund's deliberate
+ * fail-toward-revoke fallback, revoking a customer who had paid in full.
+ */
+test("money delivered as strings still parses, and still protects a partial refund", async (t) => {
+  configured(t, { lemonSqueezyAllowTestMode: true });
+  const db = stubDb(t, {
+    userFind: async (args: any) =>
+      args?.where?.id === REAL_USER_ID ? { id: REAL_USER_ID } : null,
+  });
+
+  // The grant leg: a string total must not lose the price.
+  const created = JSON.parse(JSON.stringify(REAL_ORDER_CREATED));
+  created.data.attributes.total_usd = "2292";
+  await deliver(created);
+  assert.equal(db.purchaseUpsert[0][0].create.priceUsd, 22.92);
+
+  // The revoke leg: a PARTIAL refund whose status is unhelpfully "paid" and
+  // whose amounts arrive as strings. Before toCents, both amounts parsed to
+  // null, the comparison was impossible, and the fallback revoked.
+  stubMethod(t, prisma.purchase as any, "findUnique", async () => ({ id: "purchase-9090213" }));
+  const partial = JSON.parse(JSON.stringify(REAL_ORDER_REFUNDED));
+  partial.data.attributes.status = "paid";
+  partial.data.attributes.refunded = false;
+  partial.data.attributes.refunded_amount_usd = "573";
+  partial.data.attributes.total_usd = "2292";
+  await deliver(partial);
+
+  assert.equal(
+    db.purchaseUpdate.filter((c) => c[0]?.data?.isRefunded === true).length,
+    0,
+    "573 of 2292 back is a partial refund, string typing notwithstanding",
+  );
+});
+
+/*
+ * Finding: the subscription dedupe key fell back to "" when updated_at was not
+ * a string — so one type mutation from Lemon Squeezy would collapse every
+ * future renewal of that subscription onto one terminal key, silently ending a
+ * paying customer's access at their first period. The stamp now survives any
+ * type, then falls to the delivery-unique webhook_id.
+ */
+test("the dedupe keys survive a type-mutated or missing updated_at", () => {
+  const base = subBody();
+
+  const numeric = JSON.parse(JSON.stringify(base));
+  numeric.data.attributes.updated_at = 1786000000;
+  const n = parseSubscriptionEvent(numeric)!;
+  assert.equal(n.eventKey, "subscription_created:77001:1786000000", "never collapsed to ''");
+
+  const absent = JSON.parse(JSON.stringify(base));
+  delete absent.data.attributes.updated_at;
+  absent.meta.webhook_id = "wh-abc-123";
+  const a = parseSubscriptionEvent(absent)!;
+  assert.equal(a.eventKey, "subscription_created:77001:wh-abc-123", "webhook_id is the fallback");
+
+  // Orders use the same stamp — the partial-then-full regression must not be
+  // reintroducible by a type flip.
+  const order = JSON.parse(JSON.stringify(REAL_ORDER_REFUNDED));
+  order.data.attributes.updated_at = 1786000001;
+  assert.equal(parseOrderEvent(order)!.eventKey, "order_refunded:9090213:1786000001");
+});
+
+/*
+ * Finding: handleSubscription was pure last-writer-wins, and Lemon Squeezy
+ * retries failed deliveries over HOURS — so a stale retry could resurrect a
+ * cancelled state or roll validUntil back a month. The write is now conditional
+ * on nothing newer being recorded.
+ */
+test("a stale subscription event cannot overwrite a newer recorded state", async (t) => {
+  configured(t);
+  const db = stubDb(t, {
+    userFirst: async () => ({ id: USER }),
+    // The conditional update matches nothing: the stored row is NEWER.
+    subWrite: async () => ({ count: 0 }),
+  });
+  stubMethod(t, prisma.subscription as any, "findUnique", async (args: any) =>
+    args?.select?.id ? { id: "sub-row-1" } : { userId: USER },
+  );
+
+  const res = await deliver(
+    subBody({ meta: { event_name: "subscription_updated" }, attributes: { status: "active" } }),
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(db.subCreate.length, 0, "the row exists — a stale event must not clone it");
+  assert.equal(finalStatus(db.eventMark), "skipped");
+  // And the guard itself: the WHERE only matches rows not newer than this event.
+  const where = db.subWrite[0][0].where;
+  assert.ok(where.OR, "the write carries the staleness condition");
+  assert.equal(
+    where.OR[1].providerUpdatedAt.lte.toISOString(),
+    "2026-08-04T10:00:00.000Z",
+  );
+});
+
+// Finding: the order upsert's update branch carried userId, so a replay whose
+// custom data resolved differently could MOVE a licence between accounts —
+// the exact hazard the subscription path documents avoiding.
+test("a replayed order never reassigns the licence's owner", async (t) => {
+  configured(t);
+  const db = stubDb(t);
+
+  await deliver(orderBody());
+
+  const arg = db.purchaseUpsert[0][0];
+  assert.equal(arg.create.userId, USER, "ownership is decided at create");
+  assert.ok(!("userId" in arg.update), "and never re-decided on a replay");
 });

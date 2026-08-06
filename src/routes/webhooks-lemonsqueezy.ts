@@ -151,6 +151,21 @@ async function handle(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
     return { status: "skipped", reason: `unhandled event ${order.event}` };
   }
 
+  // REVOKING is never gated — and that has to include the sellable check, which
+  // used to run first. A Purchase WE recorded is ours to revoke whatever the env
+  // says today: rotate the variant id after a price change and every refund of
+  // the old variant would have been refused as "not the lifetime licence",
+  // terminally — money returned, licence live, invisible until support. The
+  // test-mode guard below has the same shape for the same reason: it protects
+  // against handing out licences nobody paid for; taking one away has no such
+  // downside, and guarding it is actively harmful. (A test order created while
+  // the door was open could never be undone once it closed — not hypothetical,
+  // it happened here.) The one sellable question a refund does raise — should
+  // an order we never saw created mint a row — is answered inside `refund`.
+  if (order.event === "order_refunded") {
+    return refund(order, body);
+  }
+
   const sellable = isSellableOrder(order);
   if (!sellable.ok) {
     // `skipped` is TERMINAL (see DONE) — a redelivery finding one short-circuits
@@ -162,18 +177,14 @@ async function handle(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
     return { status: sellable.retryable ? "failed" : "skipped", reason: sellable.reason };
   }
 
-  // REVOKING is never gated. The test-mode guard below protects against handing
-  // out licences nobody paid for; taking one away has no such downside, and
-  // guarding it is actively harmful — a test order created while the door was
-  // open could never be undone once it closed, leaving the licence live and the
-  // order frozen as "paid" for good. That is not hypothetical: it happened here.
-  if (order.event === "order_refunded") {
-    return refund(order, body);
-  }
-
   // A test order costs nothing and is trivial to produce. Honouring one on a
   // live backend is a free-licence tap, so it takes an explicit opt-in — not an
   // inference from NODE_ENV, which is unset on more machines than people expect.
+  //
+  // The skip is TERMINAL on purpose: flipping the flag later does not resurrect
+  // orders skipped while it was off (their keys are burned) — retest with a
+  // NEW order. The alternative, keeping every test order claimable, would grow
+  // a permanent to-do per test forever.
   if (order.testMode && !env.lemonSqueezyAllowTestMode) {
     return { status: "skipped", reason: "test-mode order ignored here" };
   }
@@ -208,8 +219,11 @@ async function handle(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
       rawEvent: body as Prisma.InputJsonValue,
     },
     // `isRefunded` is deliberately absent: a replayed order_created arriving
-    // after a refund must not resurrect the licence.
-    update: { userId, priceUsd: order.priceUsd, rawEvent: body as Prisma.InputJsonValue },
+    // after a refund must not resurrect the licence. `userId` is absent too —
+    // ownership is decided once, at create; a replay whose custom data resolved
+    // differently (an email that changed hands, a stale-claim re-run) must not
+    // MOVE the licence to another account. Same rule as the subscription upsert.
+    update: { priceUsd: order.priceUsd, rawEvent: body as Prisma.InputJsonValue },
   });
   return { status: "processed" };
 }
@@ -258,9 +272,32 @@ async function refund(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
     return { status: "processed" };
   }
 
-  // The refund arrived for an order we never saw created — a delivery lost while
-  // this endpoint was down. Record it refunded anyway, so the later (or replayed)
-  // creation cannot grant what has already been given back.
+  // The refund arrived for an order we never saw created — a delivery lost
+  // while this endpoint was down. The sellable check lives HERE, not in front
+  // of the whole refund path: revoking an existing row above needed no gate,
+  // but MINTING a row from a refund does, or a foreign store's refund would
+  // write Purchases into our table.
+  const sellable = isSellableOrder(order);
+  if (!sellable.ok) {
+    return { status: sellable.retryable ? "failed" : "skipped", reason: sellable.reason };
+  }
+
+  // A PARTIAL refund for an order we never recorded is parked for a human, not
+  // written. Recording it born-revoked would revoke a customer who paid and
+  // kept most of it (the existing-row branch above exists to prevent exactly
+  // that), and recording it UNREFUNDED would mint a granting licence from a
+  // refund delivery — which, with the test-mode gate deliberately absent on
+  // this path, would turn test partial refunds into free licences. Neither is
+  // acceptable; a lost order_created is rare enough to be a to-do.
+  if (!full) {
+    return {
+      status: "failed",
+      reason: `partial refund for order ${order.orderId}, which was never seen created — redeliver its order_created`,
+    };
+  }
+
+  // A FULL refund is recorded born-revoked, so the later (or replayed) creation
+  // cannot grant what has already been given back.
   const userId = await resolveUserId(order);
   if (!userId) {
     return { status: "failed", reason: `refund for unknown order ${order.orderId} and unknown account` };
@@ -371,8 +408,17 @@ async function claimEventKey(
 
 async function markEvent(eventKey: string, status: string, error?: string): Promise<void> {
   await prisma.webhookEvent
-    .update({
-      where: { provider_eventId: { provider: PROVIDER, eventId: eventKey } },
+    // updateMany for its WHERE, not its many: the status filter makes a finished
+    // row immovable. The claim race (two instances re-running one event) is
+    // survivable because every write is idempotent — but only if the LOSER
+    // finishing late cannot re-mark the winner's `processed` as `failed`, which
+    // would put a completed sale back on the to-do list.
+    .updateMany({
+      where: {
+        provider: PROVIDER,
+        eventId: eventKey,
+        status: { notIn: Array.from(DONE) },
+      },
       data: { status, error: error ?? null, processedAt: new Date() },
     })
     .catch((e) => {
@@ -440,16 +486,59 @@ async function handleSubscription(
     updatePaymentUrl: sub.updatePaymentUrl,
     customerPortalUrl: sub.customerPortalUrl,
     rawEvent: body as Prisma.InputJsonValue,
+    ...(sub.updatedAt ? { providerUpdatedAt: sub.updatedAt } : {}),
   };
 
-  await prisma.subscription.upsert({
-    where: { provider_externalId: { provider: PROVIDER, externalId: sub.subscriptionId } },
-    create: { userId, provider: PROVIDER, externalId: sub.subscriptionId, ...data },
-    // `userId` is deliberately NOT in the update: a redelivery whose custom data
-    // named a different account would otherwise MOVE the subscription. The same
-    // reasoning as the order path, learned there.
-    update: data,
+  // The staleness guard, shared by both write attempts below. Lemon Squeezy
+  // retries failed deliveries with backoff over HOURS, so an old event can
+  // legitimately arrive after a newer one — and blindly mirroring it would
+  // resurrect a cancelled state, or roll a renewal's validUntil back a month.
+  // `lte`, not `lt`: two events can share a second, and a redelivery must
+  // still be able to complete a row whose first write half-finished.
+  const notNewer = sub.updatedAt
+    ? { OR: [{ providerUpdatedAt: null }, { providerUpdatedAt: { lte: sub.updatedAt } }] }
+    : {};
+
+  // Conditional, not last-writer-wins: this event lands only if nothing newer
+  // is already recorded. updateMany for its WHERE — an `upsert` cannot carry
+  // the staleness condition, and a read-then-write version of this check is a
+  // race between the two deliveries it exists to order.
+  const updated = await prisma.subscription.updateMany({
+    where: { provider: PROVIDER, externalId: sub.subscriptionId, ...notNewer },
+    data,
   });
+
+  if (updated.count === 0) {
+    const existing = await prisma.subscription.findUnique({
+      where: { provider_externalId: { provider: PROVIDER, externalId: sub.subscriptionId } },
+      select: { id: true },
+    });
+    if (existing) {
+      // The row exists and is NEWER than this event: a stale retry, understood
+      // and deliberately dropped. Terminal — redelivering it would only ask
+      // the same question again and get the same answer.
+      return { status: "skipped", reason: "stale event — a newer state is already recorded" };
+    }
+    try {
+      // `userId` is set HERE and never in an update: a later event whose custom
+      // data named a different account must not MOVE the subscription.
+      await prisma.subscription.create({
+        data: { userId, provider: PROVIDER, externalId: sub.subscriptionId, ...data },
+      });
+    } catch (err) {
+      // A racing instance created the row between our updateMany and create.
+      // Re-run the conditional update once, against the row that now exists,
+      // under the same staleness guard.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        await prisma.subscription.updateMany({
+          where: { provider: PROVIDER, externalId: sub.subscriptionId, ...notNewer },
+          data,
+        });
+      } else {
+        throw err;
+      }
+    }
+  }
 
   return { status: "processed" };
 }

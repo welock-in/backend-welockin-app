@@ -694,6 +694,14 @@ model Subscription {
   /// thing that settles it is what actually arrived.
   rawEvent Json?
 
+  /// Lemon Squeezy's own `updated_at` for the LAST event applied to this row —
+  /// the ordering guard's clock. Their retries back off over hours, so an old
+  /// event can arrive after a newer one; the webhook only writes when the
+  /// incoming stamp is not older than this. Optional: rows written before the
+  /// guard existed have none, and `null` always accepts the next write.
+  /// (Prisma's own `updatedAt` below is OUR write time — useless for ordering
+  /// someone else's events.)
+  providerUpdatedAt DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

@@ -82,6 +82,9 @@ export type LemonSqueezyWebhook = {
     event_name?: string;
     test_mode?: boolean;
     custom_data?: Record<string, unknown>;
+    /// Unique per DELIVERY (both captured fixtures carry one). The dedupe keys
+    /// fall back to it when `updated_at` is unusable — see `eventStamp`.
+    webhook_id?: string;
   };
   data?: {
     id?: string;
@@ -190,6 +193,44 @@ function coerceCustomId(value: unknown): string | null {
 }
 
 /**
+ * Money in cents, whatever type it arrived as.
+ *
+ * The captured fixtures (lemonsqueezy-fixtures.ts) prove Lemon Squeezy mutates
+ * numeric fields into decimal STRINGS between events on the same order
+ * (`tax_rate`: 0 in order_created, "0.00" in order_refunded — and
+ * `currency_rate` is always a string). A type-strict read of `total_usd` would
+ * turn a classifiable payload into an unclassifiable one, and `isFullRefund`'s
+ * deliberate fail-toward-revoke fallback would then revoke on a PARTIAL refund
+ * whose amounts were sitting right there in the payload as strings.
+ */
+function toCents(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && /^-?\d+(\.\d+)?$/.test(value.trim())) {
+    return Number(value.trim());
+  }
+  return null;
+}
+
+/**
+ * The per-event discriminator both dedupe keys end with.
+ *
+ * NEVER a constant fallback. An earlier form fell back to "" when `updated_at`
+ * was not a string — which collapsed every future event of that name onto one
+ * key, and a terminal row under a collapsed key eats every renewal that
+ * follows: a paying subscriber loses access at the end of their first period
+ * while the webhook table looks perfectly healthy. So: the stamp, whatever
+ * type it arrived as; else the delivery-unique webhook_id. The residual ""
+ * (neither present) degrades dedupe toward RE-RUNNING an idempotent write,
+ * which is the survivable direction — a collapsed key is not.
+ */
+function eventStamp(updatedAt: unknown, webhookId: unknown): string {
+  if (typeof updatedAt === "string" && updatedAt.trim()) return updatedAt;
+  if (updatedAt != null) return String(updatedAt);
+  if (typeof webhookId === "string") return webhookId;
+  return "";
+}
+
+/**
  * A timestamp we cannot parse must become `null`, never an Invalid Date.
  *
  * Prisma throws on an Invalid Date, the throw leaves the route as a 500, and a
@@ -225,6 +266,13 @@ export type ParsedSubscription = {
   endsAt: Date | null;
   updatePaymentUrl: string | null;
   customerPortalUrl: string | null;
+  /**
+   * Lemon Squeezy's `updated_at` for THIS event — the ordering guard's clock.
+   * Their retries back off over hours, so an old event can legitimately arrive
+   * after a newer one; without this the handler is pure last-writer-wins and a
+   * stale retry can resurrect a cancelled state.
+   */
+  updatedAt: Date | null;
   testMode: boolean;
 };
 
@@ -252,7 +300,7 @@ export function parseSubscriptionEvent(body: LemonSqueezyWebhook): ParsedSubscri
     // Keyed on the EVENT as well as the id: unlike an order, a subscription
     // produces many events over its life and they must not deduplicate against
     // one another. Only a redelivery of the SAME event is a duplicate.
-    eventKey: `${event}:${subscriptionId}:${str(attrs.updated_at) ?? ""}`,
+    eventKey: `${event}:${subscriptionId}:${eventStamp(attrs.updated_at, body.meta?.webhook_id)}`,
     status: typeof attrs.status === "string" ? attrs.status : "unknown",
     email: typeof attrs.user_email === "string" ? attrs.user_email.trim().toLowerCase() : null,
     customUserId: coerceCustomId(custom.user_id) ?? coerceCustomId(custom.userId),
@@ -263,6 +311,7 @@ export function parseSubscriptionEvent(body: LemonSqueezyWebhook): ParsedSubscri
     endsAt: parseDate(attrs.ends_at),
     updatePaymentUrl: str(attrs.urls?.update_payment_method),
     customerPortalUrl: str(attrs.urls?.customer_portal),
+    updatedAt: parseDate(attrs.updated_at),
     testMode: attrs.test_mode === true || body.meta?.test_mode === true,
   };
 }
@@ -291,19 +340,18 @@ export function parseOrderEvent(body: LemonSqueezyWebhook): ParsedOrder | null {
     // Rows claimed under the OLD key shape stay terminal under their old keys;
     // a post-deploy redelivery of one simply re-runs, and every write in this
     // route is idempotent, so that costs nothing.
-    eventKey: `${event}:${orderId}:${typeof attrs.updated_at === "string" ? attrs.updated_at : ""}`,
+    eventKey: `${event}:${orderId}:${eventStamp(attrs.updated_at, body.meta?.webhook_id)}`,
     status: typeof attrs.status === "string" ? attrs.status : null,
     email: typeof attrs.user_email === "string" ? attrs.user_email.trim().toLowerCase() : null,
     customUserId: coerceCustomId(custom.user_id) ?? coerceCustomId(custom.userId),
     refunded: attrs.refunded === true || attrs.status === "refunded",
     refundedAt: parseDate(attrs.refunded_at),
-    refundedAmountUsd:
-      typeof attrs.refunded_amount_usd === "number" ? attrs.refunded_amount_usd / 100 : null,
+    refundedAmountUsd: toCents(attrs.refunded_amount_usd) != null ? toCents(attrs.refunded_amount_usd)! / 100 : null,
     // Falling back to "now" is right for a missing field and wrong for a broken
     // one, but both are better than storing a date arithmetic cannot use.
     purchasedAt: parseDate(attrs.created_at) ?? new Date(),
-    // Lemon Squeezy reports money in cents.
-    priceUsd: typeof attrs.total_usd === "number" ? attrs.total_usd / 100 : null,
+    // Lemon Squeezy reports money in cents — sometimes as strings; see toCents.
+    priceUsd: toCents(attrs.total_usd) != null ? toCents(attrs.total_usd)! / 100 : null,
     storeId: attrs.store_id != null ? String(attrs.store_id) : null,
     variantId: attrs.first_order_item?.variant_id != null ? String(attrs.first_order_item.variant_id) : null,
     // `data.attributes.test_mode` is the field the official example payloads
@@ -342,10 +390,32 @@ export function isSellableOrder(order: ParsedOrder): SellableVerdict {
     return { ok: false, reason: `store ${order.storeId} is not ours`, retryable: false };
   }
   if (order.variantId !== env.lemonSqueezyVariantId) {
+    // A SUBSCRIPTION checkout also fires order_created — one per monthly or
+    // yearly signup, for ever. Those are correctly ignored here (the grant
+    // comes from the subscription_* events), and marking them retryable would
+    // fill the failed queue with a permanent to-do per subscriber. So the two
+    // KNOWN subscription variants are terminal…
+    const subscriptionVariants = [env.lemonSqueezyVariantMonthly, env.lemonSqueezyVariantYearly]
+      .filter(Boolean);
+    if (order.variantId && subscriptionVariants.includes(order.variantId)) {
+      return {
+        ok: false,
+        reason: `variant ${order.variantId} is a subscription — granted via subscription events`,
+        retryable: false,
+      };
+    }
+    // …while anything ELSE mismatching is far more likely OUR configuration
+    // (a rotated variant id after a price change) than a foreign product, and
+    // the customer has already paid. Terminal here would burn the eventKey:
+    // fixing the env and redelivering from the dashboard would be answered
+    // "already handled", and the sale lost for good. Retryable keeps it
+    // claimable; Lemon Squeezy still gets its 200 either way.
     return {
       ok: false,
-      reason: `variant ${order.variantId ?? "?"} is not the lifetime licence`,
-      retryable: false,
+      reason:
+        `variant ${order.variantId ?? "?"} matches neither the lifetime licence nor a ` +
+        `known subscription — check LEMONSQUEEZY_VARIANT_ID`,
+      retryable: true,
     };
   }
   return { ok: true };

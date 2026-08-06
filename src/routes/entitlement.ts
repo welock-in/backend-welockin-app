@@ -118,6 +118,17 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   // client in the field understanding it the same day.
   //
   // Bound to the deviceId, so a receipt cannot be carried to another machine.
+  // WHICH window is the client allowed to run on offline?
+  //
+  // `view.trialEndsAt` is the DEVICE ledger's date and nothing else — it is
+  // what the countdown in the UI draws. When the thing granting access is a
+  // Lemon Squeezy trial instead, that date is unrelated and usually in the
+  // past, and handing it to the receipt made the receipt expire on issue: a
+  // customer locked out at the exact moment they paid. So the receipt is told
+  // the window that GRANTS, which for a subscription trial is its validUntil.
+  const trialSub = subs.find((sub) => sub.status === "on_trial" && subscriptionGrants(sub, now));
+  const grantingUntil = trialSub ? (trialSub.validUntil ?? null) : view.trialEndsAt ? new Date(view.trialEndsAt) : null;
+
   return {
     ...view,
     receipt: issueReceipt({
@@ -125,7 +136,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
       deviceId,
       status: view.status,
       isPro: view.isPro,
-      trialEndsAt: view.trialEndsAt ? new Date(view.trialEndsAt) : null,
+      trialEndsAt: grantingUntil,
       serverTime: now,
       enforced: view.enforced,
     }),

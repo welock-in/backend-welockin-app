@@ -67,15 +67,29 @@ export type ReceiptInput = {
  * A trial receipt never outlives the trial itself: handing someone a seven-day
  * offline pass on the last day of their window would extend it by seven days.
  */
+const LOCKED_TTL_MS = 6 * 60 * 60 * 1000;
+
 function ttlMs(status: string, isPro: boolean, trialEndsAt: Date | null, now: Date): number {
   if (!isPro) {
     // Locked. A short life so a licence bought five minutes from now is not
     // shut out until tomorrow — the client refreshes and the wall lifts.
-    return 6 * 60 * 60 * 1000;
+    return LOCKED_TTL_MS;
   }
   if (status === "trialing" && trialEndsAt) {
     const untilTrialEnds = trialEndsAt.getTime() - now.getTime();
-    return Math.max(0, Math.min(7 * DAY_MS, untilTrialEnds));
+    // FLOORED, and the floor is the whole point. `status` and `trialEndsAt`
+    // come from different places: "trialing" can mean a Lemon Squeezy trial
+    // (subscriptionOnTrial), while trialEndsAt is the DEVICE ledger's date.
+    // For anyone whose old device window has already elapsed, the two disagree
+    // and this arithmetic went NEGATIVE — clamping to zero and minting a
+    // receipt that was expired the moment it was signed. The client stores it,
+    // reads it back as Stale, and locks out a customer who has just paid.
+    //
+    // The caller now passes the window that actually grants (see
+    // routes/entitlement.ts), so this should no longer go negative. The floor
+    // stays anyway: a receipt that grants nothing is never the right answer to
+    // "isPro", and this cost a paying customer their app once already.
+    return Math.max(LOCKED_TTL_MS, Math.min(7 * DAY_MS, untilTrialEnds));
   }
   // active / comped — a paid or granted licence.
   return 30 * DAY_MS;

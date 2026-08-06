@@ -157,12 +157,19 @@ test("a trial receipt never outlives the trial", () => {
   );
 });
 
-test("a trial that has already ended grants no offline time at all", () => {
+/*
+ * This used to assert a TTL of exactly 0, which was the bug rather than the
+ * rule: a zero-TTL receipt is expired the instant it is signed, and the client
+ * reads that back as Stale and LOCKS. See the floor in ttlMs, and the test at
+ * the bottom of this file for the case that made it a customer-facing failure.
+ */
+test("a trial in the past is floored, not zeroed", () => {
   const past = new Date(BASE.serverTime.getTime() - DAY);
 
   assert.equal(
     ttl(issueReceipt({ ...BASE, status: "trialing", isPro: true, trialEndsAt: past })!),
-    0,
+    6 * HOUR,
+    "short, so the client re-asks quickly — but never zero",
   );
 });
 
@@ -199,4 +206,25 @@ test("an unreadable key disables receipts instead of crashing the route", async 
     console.error = realError;
     (env as any).entitlementSigningKey = before;
   }
+});
+
+/*
+ * THE ONE THAT LOCKED OUT A CUSTOMER AT THE MOMENT THEY PAID.
+ *
+ * `status` and `trialEndsAt` come from different places: "trialing" can mean a
+ * Lemon Squeezy trial, while trialEndsAt is the DEVICE ledger's date. For
+ * anyone whose old device window had elapsed the subtraction went negative,
+ * clamped to zero, and minted a receipt already expired when signed — stored,
+ * read back as Stale, and enforced as a lock.
+ */
+test("a receipt is never born expired, whatever the two trial windows disagree about", () => {
+  const now = BASE.serverTime;
+  const stale = new Date(now.getTime() - 90 * DAY); // an old device trial
+
+  const ttlMs = ttl(
+    issueReceipt({ ...BASE, status: "trialing", isPro: true, trialEndsAt: stale })!,
+  );
+
+  assert.ok(ttlMs > 0, "a receipt that grants nothing is never the right answer to isPro");
+  assert.equal(ttlMs, 6 * HOUR, "floored at the locked TTL, so the client refreshes soon");
 });

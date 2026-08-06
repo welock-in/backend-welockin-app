@@ -278,7 +278,20 @@ export function parseOrderEvent(body: LemonSqueezyWebhook): ParsedOrder | null {
   return {
     event,
     orderId: String(orderId),
-    eventKey: `${event}:${orderId}`,
+    // `updated_at` is part of the key for the same reason it is in the
+    // subscription key: one order can emit the SAME event more than once with
+    // different content. `order_refunded` in particular fires once per refund —
+    // partial or full — so a key of event+id alone made a partial refund
+    // (marked `processed`, which is terminal) swallow the later FULL refund as
+    // a duplicate: money returned, licence never revoked, invisible until a
+    // support ticket. The real captured deliveries (lemonsqueezy-fixtures.ts)
+    // show `updated_at` moving between events on one order, while a redelivery
+    // of the same event repeats it — exactly the distinction a dedupe key needs.
+    //
+    // Rows claimed under the OLD key shape stay terminal under their old keys;
+    // a post-deploy redelivery of one simply re-runs, and every write in this
+    // route is idempotent, so that costs nothing.
+    eventKey: `${event}:${orderId}:${typeof attrs.updated_at === "string" ? attrs.updated_at : ""}`,
     status: typeof attrs.status === "string" ? attrs.status : null,
     email: typeof attrs.user_email === "string" ? attrs.user_email.trim().toLowerCase() : null,
     customUserId: coerceCustomId(custom.user_id) ?? coerceCustomId(custom.userId),

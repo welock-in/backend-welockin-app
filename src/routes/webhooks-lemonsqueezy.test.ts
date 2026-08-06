@@ -6,6 +6,7 @@ import { Prisma } from "@prisma/client";
 import { createApp } from "../app";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
+import { REAL_ORDER_CREATED, REAL_ORDER_REFUNDED, REAL_USER_ID } from "./lemonsqueezy-fixtures";
 
 /*
  * The order webhook is the only endpoint in this backend that turns money into
@@ -718,4 +719,154 @@ test("a test-mode ENDING is still recorded, even though a test-mode start is not
     subBody({ meta: { event_name: "subscription_updated" }, attributes: { test_mode: true, status: "active" } }),
   );
   assert.equal(upserts.length, 1, "but a granting state is not");
+});
+
+/*
+ * ── The REAL deliveries, verbatim ───────────────────────────────────────
+ *
+ * Everything above tests payloads we wrote. These four run the two deliveries
+ * the store ACTUALLY sent for order 9090213 (captured 2026-08-06, byte content
+ * preserved in lemonsqueezy-fixtures.ts) through the whole route — signature,
+ * claim, handle — so "the webhook works" is pinned against Lemon Squeezy's real
+ * output rather than our idea of it. The fixtures carry the traps a hand-written
+ * body never would: microsecond timestamps, tax_rate flipping between number
+ * and string across events, meta.test_mode and attributes.test_mode both set.
+ */
+
+test("the real order_created is refused while test mode is closed", async (t) => {
+  configured(t); // lemonSqueezyAllowTestMode: false — the production posture
+  const db = stubDb(t);
+
+  const res = await deliver(REAL_ORDER_CREATED);
+
+  assert.equal(res.status, 200, "understood and deliberately ignored — never retried");
+  assert.equal(db.purchaseUpsert.length, 0, "no licence for money never really paid");
+  assert.equal(finalStatus(db.eventUpdate), "skipped");
+});
+
+test("the real order_created grants the lifetime licence when test mode is open", async (t) => {
+  configured(t, { lemonSqueezyAllowTestMode: true });
+  const db = stubDb(t, {
+    // Answer ONLY for the account the checkout stamped into custom_data, so the
+    // assertion below proves the id was read from the payload, not defaulted.
+    userFind: async (args: any) =>
+      args?.where?.id === REAL_USER_ID ? { id: REAL_USER_ID } : null,
+  });
+
+  const res = await deliver(REAL_ORDER_CREATED);
+
+  assert.equal(res.status, 200);
+  assert.equal(finalStatus(db.eventUpdate), "processed");
+  assert.equal(db.purchaseUpsert.length, 1);
+  const written = db.purchaseUpsert[0][0].create;
+  assert.equal(written.userId, REAL_USER_ID);
+  assert.equal(written.productId, "1960881", "recorded against the real lifetime variant");
+  assert.equal(written.priceUsd, 22.92);
+  // The load-bearing detail: Lemon Squeezy timestamps carry MICROSECONDS
+  // ("...T12:07:50.000000Z"), which the date spec does not describe. If parsing
+  // ever regressed, parseDate's fallback would silently stamp the purchase with
+  // the DELIVERY time — and this assertion is what would catch it.
+  assert.equal(written.purchasedAt.toISOString(), "2026-07-30T12:07:50.000Z");
+  assert.equal(written.isRefunded, false);
+});
+
+test("the real order_refunded revokes even though test mode is closed", async (t) => {
+  configured(t); // allow=false — revoking is never gated
+  const db = stubDb(t, {
+    purchaseFind: async () => ({ id: "purchase-9090213" }),
+  });
+
+  const res = await deliver(REAL_ORDER_REFUNDED);
+
+  assert.equal(res.status, 200);
+  assert.equal(finalStatus(db.eventUpdate), "processed");
+  const revokes = db.purchaseUpdate.filter((c) => c[0]?.data?.isRefunded === true);
+  assert.equal(revokes.length, 1, "a full refund must revoke the licence");
+  // status "refunded" + refunded_amount_usd === total_usd: both signals agree,
+  // and the string tax_rate riding alongside broke nothing on the way.
+  assert.equal(
+    revokes[0][0].data.refundedAt.toISOString(),
+    "2026-07-31T17:03:13.000Z",
+    "stamped with Lemon Squeezy's refund time, not ours",
+  );
+});
+
+test("the real refund converges even if its order_created was never seen", async (t) => {
+  // The deliveries can arrive in any order across serverless instances, and a
+  // refund for an order we never recorded must still make the later (replayed)
+  // creation unable to grant.
+  configured(t);
+  const db = stubDb(t, {
+    purchaseFind: async () => null,
+    userFind: async (args: any) =>
+      args?.where?.id === REAL_USER_ID ? { id: REAL_USER_ID } : null,
+  });
+
+  const res = await deliver(REAL_ORDER_REFUNDED);
+
+  assert.equal(res.status, 200);
+  assert.equal(db.purchaseCreate.length, 1);
+  const created = db.purchaseCreate[0][0].data;
+  assert.equal(created.userId, REAL_USER_ID);
+  assert.equal(created.isRefunded, true, "born revoked, so a replayed creation cannot resurrect it");
+});
+
+/*
+ * The dedupe key must separate two DIFFERENT refunds on one order, while still
+ * collapsing redeliveries of the same one. Before `updated_at` joined the order
+ * eventKey, a partial refund (terminal `processed`) swallowed the later full
+ * refund as a duplicate — money returned, licence never revoked.
+ */
+test("a full refund after a partial refund still revokes", async (t) => {
+  configured(t);
+
+  // A tiny in-memory webhookEvent table, so the claim/dedupe path runs for real
+  // instead of being stubbed to "always fresh".
+  const rows = new Map<string, { status: string }>();
+  const db = stubDb(t, {
+    eventCreate: async (args: any) => {
+      if (rows.has(args.data.eventId)) throw duplicateKey();
+      rows.set(args.data.eventId, { status: "processing" });
+      return {};
+    },
+    eventFind: async (args: any) => rows.get(args.where.provider_eventId.eventId) ?? null,
+    eventUpdate: async (args: any) => {
+      const row = rows.get(args.where.provider_eventId.eventId);
+      if (row && typeof args.data.status === "string") row.status = args.data.status;
+      return {};
+    },
+    purchaseFind: async () => ({ id: "purchase-9090213" }),
+  });
+
+  // Day 1: a partial goodwill refund. Licence deliberately kept.
+  const partial = JSON.parse(JSON.stringify(REAL_ORDER_REFUNDED));
+  partial.data.attributes.status = "partial_refund";
+  partial.data.attributes.refunded_amount = 500;
+  partial.data.attributes.refunded_amount_usd = 573;
+  partial.data.attributes.updated_at = "2026-07-30T15:00:00.000000Z";
+  const first = await deliver(partial);
+  assert.equal(first.status, 200);
+  assert.equal(
+    db.purchaseUpdate.filter((c) => c[0]?.data?.isRefunded === true).length,
+    0,
+    "a partial refund must not revoke",
+  );
+
+  // Day 2: the FULL refund — same order, same event name, later updated_at.
+  const second = await deliver(REAL_ORDER_REFUNDED);
+  assert.equal(second.status, 200);
+  assert.equal(
+    db.purchaseUpdate.filter((c) => c[0]?.data?.isRefunded === true).length,
+    1,
+    "the full refund is a NEW event, not a redelivery of the partial one",
+  );
+
+  // And an actual redelivery of that same full refund is still collapsed.
+  const replay = await deliver(REAL_ORDER_REFUNDED);
+  assert.equal(replay.body.deduped, true);
+  assert.equal(
+    db.purchaseUpdate.filter((c) => c[0]?.data?.isRefunded === true).length,
+    1,
+    "byte-identical redeliveries still land exactly once",
+  );
 });

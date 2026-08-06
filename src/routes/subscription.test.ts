@@ -175,3 +175,103 @@ test("an unconfigured storefront fails loudly instead of pretending to charge", 
 
   assert.equal(res.status, 400);
 });
+
+/* ── Cancelling ─────────────────────────────────────────────────────────
+ *
+ * There must ALWAYS be a way out from inside the app. And cancelling must not
+ * take away time already paid for: Lemon Squeezy stops future payments and sets
+ * ends_at to the end of the current period, which `subscriptionGrants` honours
+ * by ranking `cancelled` as granting.
+ */
+
+test("cancelling calls Lemon Squeezy's delete and reports when access stops", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    { externalId: "77001", status: "active", validUntil: new Date(Date.now() + 20 * 86_400_000) },
+  ]);
+
+  let url = "";
+  let method = "";
+  stubFetch(t, async (u: string, i: any) => {
+    url = u;
+    method = i.method;
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ data: { attributes: { ends_at: "2026-09-01T00:00:00.000Z" } } }),
+    };
+  });
+
+  const res = await request(app).post("/api/subscription/cancel").set(auth);
+
+  assert.equal(res.status, 202);
+  assert.equal(method, "DELETE");
+  assert.ok(url.endsWith("/v1/subscriptions/77001"), url);
+  assert.equal(res.body.endsAt, "2026-09-01T00:00:00.000Z", "so the UI can say when it stops");
+});
+
+test("the subscription to cancel comes from the token, never the request", async (t) => {
+  configured(t);
+  const finds = stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    { externalId: "77001", status: "active", validUntil: new Date(Date.now() + 86_400_000) },
+  ]);
+  stubFetch(t, async () => ({ ok: true, status: 200, json: async () => ({}) }));
+
+  await request(app).post("/api/subscription/cancel").set(auth).send({ subscriptionId: "99999" });
+
+  assert.equal(finds[0][0].where.userId, userId);
+});
+
+test("cancelling twice is refused rather than repeated", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    { externalId: "77001", status: "cancelled", validUntil: new Date(Date.now() + 86_400_000) },
+  ]);
+  stubFetch(t, async () => {
+    throw new Error("must not reach Lemon Squeezy");
+  });
+
+  const res = await request(app).post("/api/subscription/cancel").set(auth);
+
+  assert.equal(res.status, 409);
+});
+
+test("a cancelled subscription still reads as live, with its end date", async (t) => {
+  configured(t);
+  const endsAt = new Date(Date.now() + 12 * 86_400_000);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    {
+      status: "cancelled",
+      interval: "yearly",
+      validUntil: endsAt,
+      trialEndsAt: null,
+      renewsAt: null,
+      endsAt,
+    },
+  ]);
+
+  const res = await request(app).get("/api/subscription").set(auth);
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.subscription.status, "cancelled");
+  assert.equal(res.body.subscription.endsAt, endsAt.toISOString(), "when the access actually stops");
+  assert.equal(res.body.subscription.cancellable, false, "nothing left to cancel");
+});
+
+test("an account with only expired rows reports no subscription", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    {
+      status: "expired",
+      interval: "monthly",
+      validUntil: new Date(Date.now() - 86_400_000),
+      trialEndsAt: null,
+      renewsAt: null,
+      endsAt: new Date(Date.now() - 86_400_000),
+    },
+  ]);
+
+  const res = await request(app).get("/api/subscription").set(auth);
+
+  assert.equal(res.body.subscription, null);
+});

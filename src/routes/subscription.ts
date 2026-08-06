@@ -121,3 +121,134 @@ subscriptionRouter.post(
     res.status(202).json({ ok: true });
   }),
 );
+
+/**
+ * What this account is paying, so the settings screen can say it without
+ * guessing. Read-only; the money endpoints are below.
+ */
+subscriptionRouter.get(
+  "/",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const subs = await prisma.subscription.findMany({
+      where: { userId: req.user!.id, provider: PROVIDER },
+      select: {
+        status: true,
+        interval: true,
+        validUntil: true,
+        trialEndsAt: true,
+        renewsAt: true,
+        endsAt: true,
+      },
+      orderBy: { updatedAt: "desc" },
+    });
+
+    const now = new Date();
+    // The one that still grants, if any — an account can carry old expired rows
+    // and the settings screen must describe the live one, not the first one.
+    const live = subs.find((sub) => subscriptionGrants(sub, now)) ?? null;
+
+    res.json({
+      subscription: live && {
+        status: live.status,
+        interval: live.interval,
+        // Already cancelled: this is when it actually stops. Null otherwise.
+        endsAt: live.endsAt?.toISOString() ?? null,
+        renewsAt: live.renewsAt?.toISOString() ?? null,
+        trialEndsAt: live.trialEndsAt?.toISOString() ?? null,
+        validUntil: live.validUntil?.toISOString() ?? null,
+        // Whether "Cancel" should be offered at all. A row already cancelled is
+        // running out its grace period and has nothing left to cancel.
+        cancellable: live.status !== "cancelled",
+      },
+    });
+  }),
+);
+
+/**
+ * Cancel the subscription.
+ *
+ * WHAT CANCELLING MEANS HERE, because the word suggests something more abrupt
+ * than what happens: Lemon Squeezy stops future payments and sets `ends_at` to
+ * the end of the period ALREADY PAID FOR. The customer keeps everything until
+ * then — `subscriptionGrants` ranks `cancelled` as granting for exactly this
+ * reason — and the row flips to `expired` on its own afterwards, at which point
+ * the client's paywall takes over. Nobody loses time they have paid for, and
+ * nobody has to be refunded for the days they did not use.
+ *
+ * There is ALWAYS a way out. This endpoint exists so cancelling never depends
+ * on finding a portal link, remembering a password on a website, or writing to
+ * support — a subscription you cannot leave from inside the app is a
+ * subscription people are right not to start.
+ */
+subscriptionRouter.post(
+  "/cancel",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    if (!env.lemonSqueezyApiKey) {
+      console.error("[subscription] cannot cancel: no Lemon Squeezy API key");
+      throw badRequest("Billing is not available right now.");
+    }
+
+    const userId = req.user!.id;
+    const subs = await prisma.subscription.findMany({
+      where: { userId, provider: PROVIDER },
+      select: { externalId: true, status: true, validUntil: true },
+    });
+
+    const now = new Date();
+    // Same rule as everywhere else: found from the TOKEN, never named by the
+    // request. A subscription id in the body would let anyone cancel a
+    // stranger's plan.
+    const live = subs.find((sub) => subscriptionGrants(sub, now) && sub.status !== "cancelled");
+    if (!live) {
+      throw conflict("There is no active subscription to cancel on this account.");
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LS_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await fetch(`${env.lemonSqueezyApiBase}/v1/subscriptions/${live.externalId}`, {
+        method: "DELETE",
+        headers: {
+          Accept: "application/vnd.api+json",
+          "Content-Type": "application/vnd.api+json",
+          Authorization: `Bearer ${env.lemonSqueezyApiKey}`,
+        },
+        signal: controller.signal,
+      });
+    } catch (err) {
+      console.error(
+        "[subscription] Lemon Squeezy unreachable:",
+        err instanceof Error ? err.message : err,
+      );
+      throw badRequest("Could not reach the payment provider. Please try again.");
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!response.ok) {
+      console.error(
+        `[subscription] Lemon Squeezy refused to cancel ${live.externalId}: HTTP ${response.status}`,
+      );
+      throw badRequest("Could not cancel the subscription. Please try again.");
+    }
+
+    // When access actually stops, read from the response so the client can say
+    // it immediately rather than waiting for the webhook. Best-effort: the
+    // webhook is still the writer, and a shape we cannot read costs a sentence
+    // of copy, not the cancellation.
+    let endsAt: string | null = null;
+    try {
+      const body = (await response.json()) as {
+        data?: { attributes?: { ends_at?: string | null } };
+      };
+      endsAt = body.data?.attributes?.ends_at ?? null;
+    } catch {
+      /* the cancellation still happened */
+    }
+
+    res.status(202).json({ ok: true, endsAt });
+  }),
+);

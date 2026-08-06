@@ -189,6 +189,14 @@ export async function claimTrialOnSignup(
   opts: ClaimOptions = {},
 ): Promise<void> {
   if (!deviceId) return;
+  // The paid-trial model: a plan is CHOSEN at the paywall, and the trial that
+  // comes with it is card-backed. Minting a free one here as well would mean
+  // nobody ever has to choose, so the paywall would gate nothing.
+  //
+  // Deliberately here rather than inside `claimTrial`: the ledger is also the
+  // anti-farm record, and `POST /api/entitlement/trial` still writes it. Only
+  // the automatic grant at signup is switched off.
+  if (!env.signupTrialEnabled) return;
   try {
     await claimTrial(userId, deviceId, opts);
   } catch (err) {

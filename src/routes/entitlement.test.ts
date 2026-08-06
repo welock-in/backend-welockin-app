@@ -430,10 +430,10 @@ test("a client clock years out of step is recorded, not obeyed", async (t) => {
 /* ── the signup path ──────────────────────────────────────────────────── */
 
 /**
- * Registration claims too, because no shipped client knows about
- * `POST /api/entitlement/trial` yet — leaving the claim to that endpoint alone
- * would mean every account created by a current build resolved `expired` from
- * its first second.
+ * Registration used to mint a free 14-day window on the spot. It no longer
+ * does: the product sells a CARD-BACKED trial chosen at a paywall, and an
+ * account that also received free days on signup would never have to choose a
+ * plan — which makes the paywall decorative. See `signupTrialEnabled`.
  */
 function signupStubs(t: Ctx, newUserId: string) {
   stubMethod(t, prisma.user as any, "findUnique", async () => null); // email is free
@@ -446,7 +446,13 @@ function signupStubs(t: Ctx, newUserId: string) {
   }));
 }
 
-test("registering on a fresh Mac starts the trial without any client change", async (t) => {
+/*
+ * THE PAYWALL'S PRECONDITION. If signing up still handed out free days, a new
+ * account would resolve `trialing` on its first request — so the wall at the
+ * end of onboarding would admit everyone and gate nothing. This test is the one
+ * that keeps that from silently coming back.
+ */
+test("registering does NOT hand out a free window — a plan must be chosen", async (t) => {
   signupStubs(t, userId);
   const store = fakeLedger(t, []);
 
@@ -455,7 +461,25 @@ test("registering on a fresh Mac starts the trial without any client change", as
     .set(dev(MAC))
     .send({ email: "fresh@example.com", password: "hunter2hunter2" });
 
-  assert.equal(res.status, 201);
+  assert.equal(res.status, 201, "the account is created either way");
+  assert.equal(store.length, 0, "no claim, so the account starts with no access");
+});
+
+/* The switch back, for a change of mind that must not need a code change. */
+test("SIGNUP_TRIAL_ENABLED brings the cardless window back", async (t) => {
+  const before = env.signupTrialEnabled;
+  (env as any).signupTrialEnabled = true;
+  t.after(() => {
+    (env as any).signupTrialEnabled = before;
+  });
+  signupStubs(t, userId);
+  const store = fakeLedger(t, []);
+
+  await request(app)
+    .post("/api/auth/register")
+    .set(dev(MAC))
+    .send({ email: "fresh@example.com", password: "hunter2hunter2" });
+
   assert.equal(store.length, 1);
   assert.equal(store[0].trialDays, env.trialDays);
 });
@@ -465,6 +489,13 @@ test("registering on a fresh Mac starts the trial without any client change", as
  * the claim endpoint: a second account, a different email, the same Mac.
  */
 test("a second account on the same Mac gets no second window", async (t) => {
+  // With the flag ON, so this exercises the LEDGER's anti-farm rule rather than
+  // trivially passing because signup mints nothing at all now.
+  const before = env.signupTrialEnabled;
+  (env as any).signupTrialEnabled = true;
+  t.after(() => {
+    (env as any).signupTrialEnabled = before;
+  });
   signupStubs(t, otherUserId);
   const store = fakeLedger(t, [
     { deviceIdHash: ledgerHash(MAC), firstUserId: userId, endsAt: days(-30) },

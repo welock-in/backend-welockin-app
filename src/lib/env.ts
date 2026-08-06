@@ -258,6 +258,21 @@ export const env = {
    * How long a full trial lasts. Snapshotted onto each claim, so changing this
    * never moves the end date of a window someone is already inside.
    */
+  /**
+   * May SIGNING UP still mint a free cardless trial?
+   *
+   * FALSE by default, because the product now sells a card-backed trial chosen
+   * at a paywall (3 days monthly / 7 days yearly, via Lemon Squeezy). A machine
+   * that also received 14 free days on signup would never have to choose one,
+   * which makes the paywall decorative.
+   *
+   * Only MINTING is switched off. `computeEntitlement` still honours a claim
+   * that already exists, so nobody mid-trial loses the days they were promised
+   * — they meet the paywall when their window ends, like everyone else.
+   *
+   * Set "true" to bring the cardless trial back without a code change.
+   */
+  signupTrialEnabled: (process.env.SIGNUP_TRIAL_ENABLED ?? "false") === "true",
   trialDays: intFromEnv("TRIAL_DAYS", 14),
   /**
    * The shorter window given to a machine whose identity is resettable — a Mac

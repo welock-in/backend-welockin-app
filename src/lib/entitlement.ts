@@ -80,6 +80,22 @@ export interface EntitlementView {
    * patched binary can rewrite, this is the part it cannot.
    */
   receipt?: string | null;
+  /**
+   * Where this account should be sent to deal with money, or null when we do
+   * not know and the client should offer the plan picker instead.
+   *
+   * Lemon Squeezy mints a per-customer portal URL and refreshes it on every
+   * webhook (it is signed with an expiry). For anyone who already has a card on
+   * file it IS the right page — paying early, changing plan, updating the card
+   * and cancelling all live there, and none of them are a new checkout. Sending
+   * a trialing subscriber to a fresh checkout instead would sell them a SECOND
+   * subscription.
+   *
+   * Unsigned, unlike the receipt, and that is fine: it is a destination, not a
+   * verdict. The worst a tampered value does is send its own owner somewhere
+   * useless.
+   */
+  billingUrl?: string | null;
 }
 
 export interface EntitlementInputs {

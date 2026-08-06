@@ -74,7 +74,14 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     // grants is `subscriptionGrants`'s question, not this query's.
     prisma.subscription.findMany({
       where: { userId },
-      select: { status: true, validUntil: true },
+      select: {
+        status: true,
+        validUntil: true,
+        // For `billingUrl` below. Both are refreshed on every webhook because
+        // Lemon Squeezy signs them with an expiry.
+        customerPortalUrl: true,
+        updatePaymentUrl: true,
+      },
     }),
   ]);
 
@@ -126,11 +133,19 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   // past, and handing it to the receipt made the receipt expire on issue: a
   // customer locked out at the exact moment they paid. So the receipt is told
   // the window that GRANTS, which for a subscription trial is its validUntil.
+  // Where "Pay now" should send them. A live subscription means a card is
+  // already on file, so the portal is the page that can actually do something
+  // — a fresh checkout would sell them a second subscription. Null means "we
+  // have no subscription for you", and the client offers the plan picker.
+  const liveSub = subs.find((sub) => subscriptionGrants(sub, now));
+  const billingUrl = liveSub?.customerPortalUrl ?? liveSub?.updatePaymentUrl ?? null;
+
   const trialSub = subs.find((sub) => sub.status === "on_trial" && subscriptionGrants(sub, now));
   const grantingUntil = trialSub ? (trialSub.validUntil ?? null) : view.trialEndsAt ? new Date(view.trialEndsAt) : null;
 
   return {
     ...view,
+    billingUrl,
     receipt: issueReceipt({
       userId,
       deviceId,

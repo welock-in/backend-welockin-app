@@ -196,7 +196,11 @@ export const env = {
   // the App Store, so no store IAP is imposed and none is possible). iOS keeps
   // going through Adapty because Apple requires it there. Both land in the same
   // Purchase table, told apart by `provider`.
-  lemonSqueezyApiKey: process.env.LEMONSQUEEZY_API_KEY ?? "",
+  // LEMON_API_KEY is an alias, not a typo to clean up: it is the name the
+  // production dashboard has carried since the first integration, and code
+  // accepting both costs one line where a dashboard rename costs an outage
+  // window and a human remembering to do it. Canonical name first.
+  lemonSqueezyApiKey: process.env.LEMONSQUEEZY_API_KEY ?? process.env.LEMON_API_KEY ?? "",
   lemonSqueezyWebhookSecret: process.env.LEMONSQUEEZY_WEBHOOK_SECRET ?? "",
   lemonSqueezyStoreId: process.env.LEMONSQUEEZY_STORE_ID ?? "",
   /**
@@ -206,7 +210,11 @@ export const env = {
    * checks orders against it, and orders are still exactly one product. Unset
    * means SELL NOTHING, never sell everything.
    */
-  lemonSqueezyVariantId: process.env.LEMONSQUEEZY_VARIANT_ID ?? "",
+  // VARIANT_LIFETIME is frankly the better name (it says WHICH variant, where
+  // _ID says nothing) and it is what production carries; _ID stays canonical
+  // only because it shipped first in .env.example and in the boot checks.
+  lemonSqueezyVariantId:
+    process.env.LEMONSQUEEZY_VARIANT_ID ?? process.env.LEMONSQUEEZY_VARIANT_LIFETIME ?? "",
   /**
    * The two SUBSCRIPTION variants.
    *

@@ -98,3 +98,54 @@ test("enforcement with a working storefront is exactly what shipping looks like"
   assert.equal(v.enforcementSuppressed, false);
   assert.deepEqual(v.problems, []);
 });
+
+/*
+ * The production dashboard carries two historical names — LEMON_API_KEY and
+ * LEMONSQUEEZY_VARIANT_LIFETIME. The code accepts them as aliases because one
+ * line here is cheaper than a dashboard rename plus the outage window when the
+ * rename is forgotten. These tests pin both directions: the alias works, and
+ * the canonical name WINS when both are set.
+ */
+test("the Lemon Squeezy env aliases are read, and the canonical names win", async () => {
+  const before = {
+    canonicalKey: process.env.LEMONSQUEEZY_API_KEY,
+    aliasKey: process.env.LEMON_API_KEY,
+    canonicalVariant: process.env.LEMONSQUEEZY_VARIANT_ID,
+    aliasVariant: process.env.LEMONSQUEEZY_VARIANT_LIFETIME,
+  };
+  const half = {
+    secret: process.env.LEMONSQUEEZY_WEBHOOK_SECRET,
+    store: process.env.LEMONSQUEEZY_STORE_ID,
+  };
+  try {
+    // The boot-time "all four or none" guard throws on a half-configured store,
+    // so the two fields this test is NOT about must be present too.
+    process.env.LEMONSQUEEZY_WEBHOOK_SECRET = "whsec-x";
+    process.env.LEMONSQUEEZY_STORE_ID = "364783";
+    delete process.env.LEMONSQUEEZY_API_KEY;
+    process.env.LEMON_API_KEY = "alias-key";
+    delete process.env.LEMONSQUEEZY_VARIANT_ID;
+    process.env.LEMONSQUEEZY_VARIANT_LIFETIME = "1960881";
+    const aliased = await import(`./env?alias=${Date.now()}`);
+    assert.equal(aliased.env.lemonSqueezyApiKey, "alias-key");
+    assert.equal(aliased.env.lemonSqueezyVariantId, "1960881");
+
+    process.env.LEMONSQUEEZY_API_KEY = "canonical-key";
+    process.env.LEMONSQUEEZY_VARIANT_ID = "111";
+    const both = await import(`./env?both=${Date.now()}`);
+    assert.equal(both.env.lemonSqueezyApiKey, "canonical-key");
+    assert.equal(both.env.lemonSqueezyVariantId, "111");
+  } finally {
+    for (const [k, v] of Object.entries({
+      LEMONSQUEEZY_API_KEY: before.canonicalKey,
+      LEMON_API_KEY: before.aliasKey,
+      LEMONSQUEEZY_VARIANT_ID: before.canonicalVariant,
+      LEMONSQUEEZY_VARIANT_LIFETIME: before.aliasVariant,
+      LEMONSQUEEZY_WEBHOOK_SECRET: half.secret,
+      LEMONSQUEEZY_STORE_ID: half.store,
+    })) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});

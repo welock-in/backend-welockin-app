@@ -1082,3 +1082,27 @@ test("a replayed order never reassigns the licence's owner", async (t) => {
   assert.equal(arg.create.userId, USER, "ownership is decided at create");
   assert.ok(!("userId" in arg.update), "and never re-decided on a replay");
 });
+
+/*
+ * subscription_plan_changed is the dashboard's twelfth subscription event (it
+ * postdates the original list of eleven). A monthly <-> yearly switch must land
+ * as the new plan NOW — not at the next renewal, up to a year away — because
+ * the checkout guard and the profile screen both read the row's interval.
+ */
+test("a plan change is mirrored immediately, not at the next renewal", async (t) => {
+  configured(t);
+  const db = stubDb(t, { userFirst: async () => ({ id: USER }) });
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
+
+  const res = await deliver(
+    subBody({
+      meta: { event_name: "subscription_plan_changed" },
+      attributes: { status: "active", variant_id: 1986420 }, // switched to yearly
+    }),
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(finalStatus(db.eventMark), "processed", "not 'unhandled event'");
+  assert.equal(db.subCreate[0][0].data.variantId, "1986420");
+  assert.equal(db.subCreate[0][0].data.interval, "yearly", "the row says the NEW plan");
+});

@@ -41,6 +41,11 @@ export const SUBSCRIPTION_EVENTS = [
   "subscription_payment_failed",
   "subscription_payment_recovered",
   "subscription_payment_refunded",
+  // Fires on a monthly <-> yearly switch. Same payload shape as every other
+  // subscription event, so the one mirror-the-state handler takes it as is.
+  // Without it the switch would sit in "unhandled event" until the next
+  // renewal, and the row would keep saying the OLD plan for up to a year.
+  "subscription_plan_changed",
 ] as const;
 
 export const isSubscriptionEvent = (event: string): boolean =>

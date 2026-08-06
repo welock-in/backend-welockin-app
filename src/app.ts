@@ -20,6 +20,7 @@ import { breaksRouter } from "./routes/breaks";
 import { notificationsRouter } from "./routes/notifications";
 import { onboardingRouter } from "./routes/onboarding";
 import { checkoutRouter } from "./routes/checkout";
+import { subscriptionRouter } from "./routes/subscription";
 import { lemonSqueezyWebhookRouter } from "./routes/webhooks-lemonsqueezy";
 import { entitlementRouter } from "./routes/entitlement";
 import { purchasesRouter } from "./routes/purchases";
@@ -123,6 +124,9 @@ export function createApp(): Express {
   // here would break registration itself.
   app.use("/api/onboarding", requireAuth, requireCurrentSession, onboardingRouter);
   app.use("/api/checkout", gated, checkoutRouter);
+  // "Pay now" during a trial. Same gate as the checkout: this takes money, so
+  // it may not be reached by an account that has not proved its address.
+  app.use("/api/subscription", gated, subscriptionRouter);
   // Authenticated by the SENDER'S SIGNATURE, not by a bearer token —
   // deliberately outside the requireAuth surface. (This comment used to sit one
   // line higher, over the checkout mount, which it never described.)

@@ -5,6 +5,7 @@ import { subscriptionGrants } from "../lib/subscription";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { badRequest, conflict } from "../lib/http-error";
+import { readLemonSqueezyError } from "../lib/lemonsqueezy";
 
 export const subscriptionRouter = Router();
 
@@ -106,10 +107,12 @@ subscriptionRouter.post(
     }
 
     if (!response.ok) {
+      const why = await readLemonSqueezyError(response);
       console.error(
-        `[subscription] Lemon Squeezy refused to end trial ${trial.externalId}: HTTP ${response.status}`,
+        `[subscription] Lemon Squeezy refused to end trial ${trial.externalId}: ` +
+          `HTTP ${response.status} — ${why}`,
       );
-      throw badRequest("Could not take the payment. Please try again.");
+      throw badRequest(`Could not take the payment — ${why}`);
     }
 
     // Deliberately NOT writing the Subscription row here. The webhook is the one
@@ -229,10 +232,12 @@ subscriptionRouter.post(
     }
 
     if (!response.ok) {
+      const why = await readLemonSqueezyError(response);
       console.error(
-        `[subscription] Lemon Squeezy refused to cancel ${live.externalId}: HTTP ${response.status}`,
+        `[subscription] Lemon Squeezy refused to cancel ${live.externalId}: ` +
+          `HTTP ${response.status} — ${why}`,
       );
-      throw badRequest("Could not cancel the subscription. Please try again.");
+      throw badRequest(`Could not cancel the subscription — ${why}`);
     }
 
     // When access actually stops, read from the response so the client can say

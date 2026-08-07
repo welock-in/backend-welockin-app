@@ -314,3 +314,50 @@ test("a lifetime licence blocks every plan, subscriptions included", async (t) =
     assert.equal(res.status, 409, `expected 409 for ${plan}`);
   }
 });
+
+/*
+ * A refusal has to SAY why. Lemon Squeezy answers with JSON:API errors whose
+ * prose names the fix ("Variant not found", "…is not published"); throwing that
+ * away made every refusal read "Could not start the purchase. Please try again."
+ * — false comfort when the cause is a variant id that will still be wrong on the
+ * fifth try, and nothing anywhere to tell an operator which of key, store or
+ * variant was at fault.
+ */
+test("a refusal from Lemon Squeezy reports what Lemon Squeezy said", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubFetch(t, async () => ({
+    ok: false,
+    status: 404,
+    json: async () => ({
+      errors: [{ status: "404", title: "Not Found", detail: "No variant found with ID 1986420" }],
+    }),
+  }));
+
+  const res = await request(app).post("/api/checkout").set(auth).send({ plan: "yearly" });
+
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /No variant found with ID 1986420/);
+});
+
+test("an unreadable refusal still fails cleanly, without the API key", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubFetch(t, async () => ({
+    ok: false,
+    status: 502,
+    json: async () => {
+      throw new Error("not json");
+    },
+  }));
+
+  const res = await request(app).post("/api/checkout").set(auth).send({ plan: "yearly" });
+
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /HTTP 502/);
+  assert.ok(!JSON.stringify(res.body).includes("test-key"));
+});

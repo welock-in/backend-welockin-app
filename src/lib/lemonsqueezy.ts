@@ -430,3 +430,33 @@ export function isSellableOrder(order: ParsedOrder): SellableVerdict {
 export function isObjectId(value: string): boolean {
   return /^[0-9a-f]{24}$/i.test(value);
 }
+
+/**
+ * Read WHY Lemon Squeezy refused a request.
+ *
+ * Their errors are JSON:API: `{ errors: [{ status, title, detail }] }`. We were
+ * throwing that away and logging only the HTTP status, which made every refusal
+ * look identical from the outside — "Could not start the purchase", with nothing
+ * anywhere saying whether the variant was wrong, the store was wrong, or the key
+ * was a test key looking at live products. A payment path that cannot say why it
+ * failed costs an afternoon every time it does.
+ *
+ * SAFE TO SHOW A SIGNED-IN CALLER. The body is Lemon Squeezy's own prose about
+ * the request; the only secret in play travelled in a REQUEST header, and this
+ * reads the RESPONSE. Capped anyway, so a giant body cannot become the error
+ * message.
+ */
+export async function readLemonSqueezyError(response: Response): Promise<string> {
+  try {
+    const body = (await response.json()) as {
+      errors?: Array<{ title?: string; detail?: string }>;
+      message?: string;
+    };
+    const first = body.errors?.[0];
+    const text = [first?.title, first?.detail].filter(Boolean).join(" — ") || body.message;
+    if (text) return text.slice(0, 300);
+  } catch {
+    /* not JSON, or already consumed */
+  }
+  return `HTTP ${response.status}`;
+}

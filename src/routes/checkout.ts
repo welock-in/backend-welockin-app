@@ -3,6 +3,7 @@ import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { checkoutSchema } from "../validation/schemas";
 import { subscriptionGrants } from "../lib/subscription";
+import { readLemonSqueezyError } from "../lib/lemonsqueezy";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { accountGone, conflict, badRequest } from "../lib/http-error";
@@ -131,8 +132,17 @@ checkoutRouter.post(
     }
 
     if (!response.ok) {
-      console.error(`[checkout] Lemon Squeezy refused the checkout: HTTP ${response.status}`);
-      throw badRequest("Could not start the purchase. Please try again.");
+      const why = await readLemonSqueezyError(response);
+      // BOTH the log and the message. The log is for us; the message is for the
+      // person staring at a button that did not work, and "please try again" is
+      // false comfort when the cause is a variant id that will still be wrong on
+      // the fifth try. Their prose ("Variant not found", "…is not published")
+      // names the fix directly.
+      console.error(
+        `[checkout] Lemon Squeezy refused plan "${plan}" (variant ${variantId}, ` +
+          `store ${env.lemonSqueezyStoreId}): HTTP ${response.status} — ${why}`,
+      );
+      throw badRequest(`Could not start the purchase — ${why}`);
     }
 
     const payload = (await response.json()) as { data?: { attributes?: { url?: string } } };

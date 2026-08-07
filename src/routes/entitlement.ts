@@ -143,9 +143,16 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   const trialSub = subs.find((sub) => sub.status === "on_trial" && subscriptionGrants(sub, now));
   const grantingUntil = trialSub ? (trialSub.validUntil ?? null) : view.trialEndsAt ? new Date(view.trialEndsAt) : null;
 
+  // Anything that ever granted, or ever would have. `claim` covers the machine
+  // trial even when it has elapsed, which is precisely the case that must not
+  // read as "brand new".
+  const everHadAccess =
+    purchases.length > 0 || subs.length > 0 || claim != null || user.trialEndsAt != null;
+
   return {
     ...view,
     billingUrl,
+    everHadAccess,
     receipt: issueReceipt({
       userId,
       deviceId,

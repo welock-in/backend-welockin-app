@@ -96,6 +96,18 @@ export interface EntitlementView {
    * useless.
    */
   billingUrl?: string | null;
+  /**
+   * Has this account EVER held access — a purchase, a subscription, or a trial
+   * window that was actually claimed?
+   *
+   * Only the paywall's copy reads it, and only to avoid a lie. Someone who has
+   * just finished signing up has no plan, so the same `expired` status that
+   * describes a lapsed customer also describes them — and telling a brand-new
+   * user "your access has ended" is both false and the worst possible first
+   * sentence. False in the other direction is merely a missed nuance, which is
+   * why this defaults to false when we cannot tell.
+   */
+  everHadAccess?: boolean;
 }
 
 export interface EntitlementInputs {

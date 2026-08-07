@@ -361,3 +361,180 @@ test("an unreadable refusal still fails cleanly, without the API key", async (t)
   assert.match(res.body.error, /HTTP 502/);
   assert.ok(!JSON.stringify(res.body).includes("test-key"));
 });
+
+/*
+ * The failure that cost the most hours in this whole storefront, so it gets a
+ * test rather than a comment: three variant ids pasted from the LIVE dashboard
+ * into a deploy holding a TEST key. Test and live are separate object graphs,
+ * so every id is simply absent, every plan 404s at once, and Lemon Squeezy says
+ * only "The related resource does not exist" — which reads exactly like a typo
+ * and sends you checking the ids you just pasted, character by character.
+ *
+ * The store knows the answer. Ask it.
+ */
+function withTestMode(t: { after: (fn: () => void) => void }, on: boolean) {
+  const before = env.lemonSqueezyAllowTestMode;
+  (env as any).lemonSqueezyAllowTestMode = on;
+  t.after(() => {
+    (env as any).lemonSqueezyAllowTestMode = before;
+  });
+}
+
+/** A 404 on the checkout, and a catalogue that holds the real ids. */
+function stubGraphMismatch(t: { after: (fn: () => void) => void }) {
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubFetch(t, async (url: string) => {
+    if (String(url).includes("/v1/variants")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [
+            { id: 1987310, attributes: { is_subscription: true, interval: "month" } },
+            { id: 1987304, attributes: { is_subscription: true, interval: "year" } },
+            { id: 1987312, attributes: { is_subscription: false, interval: "year" } },
+          ],
+        }),
+      };
+    }
+    return {
+      ok: false,
+      status: 404,
+      json: async () => ({
+        errors: [{ status: "404", title: "Not Found", detail: "The related resource does not exist." }],
+      }),
+    };
+  });
+}
+
+test("a 404 names the variant id that would have worked", async (t) => {
+  configured(t);
+  withTestMode(t, true);
+  stubGraphMismatch(t);
+
+  const res = await request(app).post("/api/checkout").set(auth).send({ plan: "monthly" });
+
+  assert.equal(res.status, 400);
+  // The id, the variable to put it in, and the one that does not exist.
+  assert.match(res.body.error, /LEMONSQUEEZY_VARIANT_MONTHLY=1987310/);
+  assert.match(res.body.error, /1986433 does not exist/);
+});
+
+test("the yearly plan resolves to the yearly variant, not the monthly one", async (t) => {
+  configured(t);
+  withTestMode(t, true);
+  stubGraphMismatch(t);
+
+  const res = await request(app).post("/api/checkout").set(auth).send({ plan: "yearly" });
+
+  assert.match(res.body.error, /LEMONSQUEEZY_VARIANT_YEARLY=1987304/);
+});
+
+/*
+ * Shape is the only thing that identifies a plan — every single-variant product
+ * is called "Default" — and two candidates means a human has to choose. Picking
+ * one would decide which product a customer's money runs through, silently.
+ */
+test("an ambiguous match refuses to choose, and says so", async (t) => {
+  configured(t);
+  withTestMode(t, true);
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubFetch(t, async (url: string) => {
+    if (String(url).includes("/v1/variants")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [
+            { id: 1960836, attributes: { is_subscription: false, interval: "year" } },
+            { id: 1987312, attributes: { is_subscription: false, interval: "year" } },
+          ],
+        }),
+      };
+    }
+    return {
+      ok: false,
+      status: 404,
+      json: async () => ({ errors: [{ title: "Not Found", detail: "does not exist" }] }),
+    };
+  });
+
+  const res = await request(app).post("/api/checkout").set(auth).send({ plan: "lifetime" });
+
+  assert.match(res.body.error, /2 variants match/);
+  assert.match(res.body.error, /1960836, 1987312/);
+});
+
+/*
+ * A live storefront's 404 is read by a CUSTOMER. The name of an environment
+ * variable is meaningless to them and reads like the price is negotiable.
+ */
+test("the operator hint never reaches a live storefront", async (t) => {
+  configured(t);
+  withTestMode(t, false);
+  stubGraphMismatch(t);
+
+  const res = await request(app).post("/api/checkout").set(auth).send({ plan: "monthly" });
+
+  assert.equal(res.status, 400);
+  assert.ok(!res.body.error.includes("LEMONSQUEEZY_VARIANT_MONTHLY"), res.body.error);
+  // Lemon Squeezy's own prose still comes through, as it always has.
+  assert.match(res.body.error, /does not exist/);
+});
+
+/*
+ * If the configured id IS in the catalogue, the 404 was about the STORE, and a
+ * hint pointing at the variant would send someone to change a correct value.
+ */
+test("a present variant produces no hint", async (t) => {
+  configured(t);
+  withTestMode(t, true);
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubFetch(t, async (url: string) => {
+    if (String(url).includes("/v1/variants")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [{ id: 1986433, attributes: { is_subscription: true, interval: "month" } }],
+        }),
+      };
+    }
+    return {
+      ok: false,
+      status: 404,
+      json: async () => ({ errors: [{ title: "Not Found", detail: "does not exist" }] }),
+    };
+  });
+
+  const res = await request(app).post("/api/checkout").set(auth).send({ plan: "monthly" });
+
+  assert.ok(!res.body.error.includes("Set LEMONSQUEEZY"), res.body.error);
+});
+
+/* A hint that cannot be produced must never turn a clear 400 into a 500. */
+test("an unreachable catalogue still fails as a clean 400", async (t) => {
+  configured(t);
+  withTestMode(t, true);
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubFetch(t, async (url: string) => {
+    if (String(url).includes("/v1/variants")) throw new Error("network down");
+    return {
+      ok: false,
+      status: 404,
+      json: async () => ({ errors: [{ title: "Not Found", detail: "does not exist" }] }),
+    };
+  });
+
+  const res = await request(app).post("/api/checkout").set(auth).send({ plan: "monthly" });
+
+  assert.equal(res.status, 400);
+  assert.ok(!JSON.stringify(res.body).includes("test-key"));
+});

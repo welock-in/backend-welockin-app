@@ -3,7 +3,7 @@ import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { checkoutSchema } from "../validation/schemas";
 import { hideTestRows, subscriptionGrants } from "../lib/subscription";
-import { readLemonSqueezyError } from "../lib/lemonsqueezy";
+import { readLemonSqueezyError, suggestVariantForPlan } from "../lib/lemonsqueezy";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { accountGone, conflict, badRequest } from "../lib/http-error";
@@ -144,6 +144,22 @@ checkoutRouter.post(
 
     if (!response.ok) {
       const why = await readLemonSqueezyError(response);
+
+      // A 404 here means the key cannot see the variant, the store, or both —
+      // and Lemon Squeezy's own prose ("The related resource does not exist")
+      // names none of them. The store holds the answer and we already have the
+      // key, so ask, rather than leaving someone to diff two dashboards.
+      const hint =
+        response.status === 404
+          ? await suggestVariantForPlan(
+              plan,
+              variantId,
+              env.lemonSqueezyApiBase,
+              env.lemonSqueezyApiKey,
+              env.lemonSqueezyStoreId,
+            )
+          : null;
+
       // BOTH the log and the message. The log is for us; the message is for the
       // person staring at a button that did not work, and "please try again" is
       // false comfort when the cause is a variant id that will still be wrong on
@@ -151,9 +167,19 @@ checkoutRouter.post(
       // names the fix directly.
       console.error(
         `[checkout] Lemon Squeezy refused plan "${plan}" (variant ${variantId}, ` +
-          `store ${env.lemonSqueezyStoreId}): HTTP ${response.status} — ${why}`,
+          `store ${env.lemonSqueezyStoreId}): HTTP ${response.status} — ${why}` +
+          (hint ? ` — ${hint}` : ""),
       );
-      throw badRequest(`Could not start the purchase — ${why}`);
+
+      // The hint names an environment variable, so it goes no further than a
+      // deploy that is being exercised by us. On a live storefront the person
+      // reading this is a CUSTOMER, and an env var name is both meaningless to
+      // them and an invitation to think the price is negotiable.
+      throw badRequest(
+        hint && env.lemonSqueezyAllowTestMode
+          ? `Could not start the purchase — ${why} — ${hint}`
+          : `Could not start the purchase — ${why}`,
+      );
     }
 
     const payload = (await response.json()) as { data?: { attributes?: { url?: string } } };

@@ -460,3 +460,86 @@ export async function readLemonSqueezyError(response: Response): Promise<string>
   }
   return `HTTP ${response.status}`;
 }
+
+/** Which env var holds the id for a plan — named in the operator hint below. */
+const PLAN_ENV_VAR: Record<string, string> = {
+  monthly: "LEMONSQUEEZY_VARIANT_MONTHLY",
+  yearly: "LEMONSQUEEZY_VARIANT_YEARLY",
+  lifetime: "LEMONSQUEEZY_VARIANT_ID",
+};
+
+/**
+ * Ask the store which variant this plan SHOULD be, after a checkout 404.
+ *
+ * "Not Found - The related resource does not exist" is Lemon Squeezy's answer
+ * whenever a checkout names a variant the API KEY cannot see, and it never says
+ * which of store or variant was at fault, nor what would have worked. The cause
+ * in practice is almost always one thing: test and live are separate object
+ * graphs, so ids copied from the dashboard in one mode are simply ABSENT in the
+ * other, and every plan fails at once with prose that reads like a typo.
+ *
+ * The answer is one page away and we already hold the key, so fetch it rather
+ * than making someone go look. Shape is what identifies a plan here - price and
+ * name cannot, because every single-variant product is called "Default" - and
+ * the match must be UNIQUE: two candidates means a human has to choose, and
+ * guessing would silently sell through the wrong product.
+ *
+ * FAILURE PATH ONLY. One extra call, on a request that has already failed.
+ * Returns null rather than throwing: a hint that cannot be produced must never
+ * turn a clear 400 into a 500.
+ */
+export async function suggestVariantForPlan(
+  plan: string,
+  configuredId: string,
+  apiBase: string,
+  apiKey: string,
+  storeId: string,
+): Promise<string | null> {
+  let list: any[];
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8_000);
+    try {
+      const r = await fetch(`${apiBase}/v1/variants?page[size]=100`, {
+        headers: {
+          Accept: "application/vnd.api+json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        signal: controller.signal,
+      });
+      if (!r.ok) return null;
+      const body = (await r.json()) as any;
+      list = body?.data ?? [];
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    // Never echo the error: the request carried the key in a header.
+    return null;
+  }
+
+  // If the configured id IS there, the 404 was about something else entirely -
+  // the store, most likely - and pointing at the variant would misdirect.
+  if (list.some((v) => String(v.id) === configuredId)) return null;
+
+  const wants = (a: any): boolean =>
+    plan === "monthly"
+      ? a.is_subscription === true && a.interval === "month"
+      : plan === "yearly"
+        ? a.is_subscription === true && a.interval === "year"
+        : a.is_subscription === false;
+
+  const matches = list.filter((v) => wants(v.attributes ?? {})).map((v) => String(v.id));
+  const envVar = PLAN_ENV_VAR[plan] ?? "the variant id";
+
+  if (matches.length === 1) {
+    return `Set ${envVar}=${matches[0]} (store ${storeId}) and redeploy — ${configuredId} does not exist for this API key.`;
+  }
+  if (matches.length > 1) {
+    // Deliberately refuses to pick. Two one-off products at the same price is
+    // exactly the shape of an old duplicate left next to its replacement, and
+    // choosing for someone would decide which product their money runs through.
+    return `${configuredId} does not exist for this API key, and ${matches.length} variants match "${plan}" (${matches.join(", ")}). Set ${envVar} to the right one and redeploy.`;
+  }
+  return `${configuredId} does not exist for this API key, and no variant in store ${storeId} matches "${plan}". Check /api/health/lemonsqueezy.`;
+}

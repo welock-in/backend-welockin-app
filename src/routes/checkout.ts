@@ -98,19 +98,29 @@ checkoutRouter.post(
             custom: { user_id: userId },
           },
           product_options: {
-            // WHERE THE BROWSER LANDS AFTER PAYING. Without this the customer
-            // finishes on Lemon Squeezy's own storefront with nothing pointing
-            // back at the app they just bought — they paid, and the last thing
-            // they see is a shop. The desktop notices the payment on its own
-            // (focus + poll), but only if they think to switch back to it.
-            redirect_url: `${env.publicSiteUrl}/purchase-complete`,
-            receipt_link_url: `${env.publicSiteUrl}/purchase-complete`,
-            receipt_button_text: "Return to welock",
-            // NOT "has already unlocked". The webhook may still be in flight
-            // when this is read, and stating something has happened when it has
-            // not is how a working system comes to look broken.
+            // NO redirect_url, ON PURPOSE — the buyer stays on Lemon Squeezy's
+            // own confirmation page.
+            //
+            // An earlier version pointed both the redirect and the receipt
+            // button at a page on the marketing site. That page does not exist
+            // and is not going to, so the last thing a paying customer saw was
+            // a 404 — worse than sending them nowhere, and during a test
+            // purchase indistinguishable from a payment that failed, which
+            // sends you debugging a webhook that is working fine.
+            //
+            // Lemon Squeezy's page already confirms the payment and shows the
+            // amount, so the only thing missing is what to do next, and that is
+            // one sentence rather than a route. The desktop needs no help
+            // either way: it polls /entitlement while a checkout is open and
+            // syncs again on window focus, so it unlocks on its own.
+            //
+            // NOT "has already unlocked". This is read the instant the card
+            // clears, when the webhook may still be in flight, and stating
+            // something has happened when it has not is how a working system
+            // comes to look broken.
             receipt_thank_you_note:
-              "You can close this tab — welock unlocks by itself within a few seconds.",
+              "You can close this tab — switch back to welock and it unlocks by itself " +
+              "within a few seconds.",
           },
         },
         relationships: {

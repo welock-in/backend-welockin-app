@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { env } from "../lib/env";
+import { env, paymentConfig } from "../lib/env";
 
 export const healthLemonSqueezyRouter = Router();
 
@@ -27,6 +27,14 @@ const TIMEOUT_MS = 10_000;
  * is reported as a boolean by /api/health/config and not at all by this route.
  */
 healthLemonSqueezyRouter.get("/", async (_req, res) => {
+  // A half-configured storefront BLANKS all four values in memory (env.ts), so
+  // without this check the route would report "no API key" to an operator whose
+  // dashboard visibly carries one — a misleading answer from the one route that
+  // exists to explain checkout failures. Name the real cause instead.
+  if (paymentConfig.degraded) {
+    res.json({ ok: false, reason: paymentConfig.problems.join(" / ") });
+    return;
+  }
   if (!env.lemonSqueezyApiKey) {
     res.json({ ok: false, reason: "No LEMONSQUEEZY_API_KEY on this deployment." });
     return;

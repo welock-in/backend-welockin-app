@@ -98,7 +98,7 @@ function resolvePublicSiteUrl(): string {
  * minute count becomes an Invalid Date that either throws deep inside the
  * database driver or, worse, is stored and silently never compares true.
  */
-function intFromEnv(name: string, fallback: number): number {
+export function intFromEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
   const n = Number.parseInt(raw, 10);

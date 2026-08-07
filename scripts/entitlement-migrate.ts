@@ -24,6 +24,7 @@
  * then, you have moved the cliff, not removed it.
  */
 import { prisma } from "../src/lib/prisma";
+import { intFromEnv } from "../src/lib/env";
 
 /**
  * Create the indexes the ledger's guarantees rest on, before anything else.
@@ -102,7 +103,10 @@ async function ensureIndexes(): Promise<void> {
   }
 }
 
-const GRANDFATHER_DAYS = Number.parseInt(process.env.GRANDFATHER_DAYS ?? "30", 10);
+// `intFromEnv`, not a bare parseInt: a dashboard-created-but-blank variable is an
+// empty string, `??` does not catch it, and NaN days here would stamp an Invalid
+// Date onto the comp window of the ENTIRE grandfathered cohort.
+const GRANDFATHER_DAYS = intFromEnv("GRANDFATHER_DAYS", 30);
 const REASON = "beta-grandfather";
 /** A migration has no human actor. A valid 24-hex ObjectId, deliberately zero. */
 const SYSTEM_ACTOR = "000000000000000000000000";

@@ -193,9 +193,10 @@ export async function claimTrialOnSignup(
   // comes with it is card-backed. Minting a free one here as well would mean
   // nobody ever has to choose, so the paywall would gate nothing.
   //
-  // Deliberately here rather than inside `claimTrial`: the ledger is also the
-  // anti-farm record, and `POST /api/entitlement/trial` still writes it. Only
-  // the automatic grant at signup is switched off.
+  // Deliberately here rather than inside `claimTrial`: `claimTrial` is also
+  // what the admin surface and tests drive directly, and IT must keep working
+  // whatever the flag says. Both public mints — this one and
+  // `POST /api/entitlement/trial` — check the flag at their own door.
   if (!env.signupTrialEnabled) return;
   try {
     await claimTrial(userId, deviceId, opts);

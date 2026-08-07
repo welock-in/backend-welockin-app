@@ -206,7 +206,44 @@ test("a token whose account was deleted gets a machine-readable 404", async (t) 
 
 /* ── claiming ─────────────────────────────────────────────────────────── */
 
+/**
+ * Minting from the route sits behind the SAME flag as minting at signup — the
+ * card-backed paywall model. The claiming suite runs with it ON because what it
+ * pins is the ledger's behaviour once a mint is allowed; the flag's own OFF
+ * behaviour gets its dedicated test below.
+ */
+function trialMintingEnabled(t: Ctx) {
+  const original = env.signupTrialEnabled;
+  (env as any).signupTrialEnabled = true;
+  t.after(() => {
+    (env as any).signupTrialEnabled = original;
+  });
+}
+
+test("with the cardless trial retired, the route mints NOTHING", async (t) => {
+  account(t);
+  noPurchases(t);
+  const store = fakeLedger(t, []);
+  const original = env.signupTrialEnabled;
+  (env as any).signupTrialEnabled = false;
+  t.after(() => {
+    (env as any).signupTrialEnabled = original;
+  });
+
+  const res = await request(app)
+    .post("/api/entitlement/trial")
+    .set(auth)
+    .set(dev(MAC))
+    .send({ hardwareBacked: true });
+
+  // Same contract, no grant: the view reports the account as it is.
+  assert.equal(res.status, 200);
+  assert.equal(store.length, 0, "no free window while the paywall sells card-backed trials");
+  assert.notEqual(res.body.status, "trialing");
+});
+
 test("claiming starts a full window on a hardware-identified Mac", async (t) => {
+  trialMintingEnabled(t);
   account(t);
   noPurchases(t);
   const store = fakeLedger(t, []);
@@ -227,6 +264,7 @@ test("claiming starts a full window on a hardware-identified Mac", async (t) => 
 });
 
 test("claiming twice returns the same window, never a fresh one", async (t) => {
+  trialMintingEnabled(t);
   account(t);
   noPurchases(t);
   const store = fakeLedger(t, []);
@@ -247,6 +285,7 @@ test("claiming twice returns the same window, never a fresh one", async (t) => {
 });
 
 test("a claim that has already elapsed is NOT renewed by claiming again", async (t) => {
+  trialMintingEnabled(t);
   const elapsed = days(-30);
   account(t);
   noPurchases(t);
@@ -270,6 +309,7 @@ test("a claim that has already elapsed is NOT renewed by claiming again", async 
  * fortnight; the machine is what is scarce, so the machine is what is counted.
  */
 test("a brand-new account on a machine that already claimed gets NO fresh window", async (t) => {
+  trialMintingEnabled(t);
   const elapsed = days(-30);
   account(t);
   noPurchases(t);
@@ -293,6 +333,7 @@ test("a brand-new account on a machine that already claimed gets NO fresh window
  * that changes nothing: `firstUserId` is nulled, the row stays.
  */
 test("deleting the account and starting over lands on the same expired window", async (t) => {
+  trialMintingEnabled(t);
   const elapsed = days(-30);
   account(t);
   noPurchases(t);
@@ -316,6 +357,7 @@ test("deleting the account and starting over lands on the same expired window", 
  * one it cannot have.
  */
 test("a second Mac on the same account shares the account's window", async (t) => {
+  trialMintingEnabled(t);
   const endsAt = days(6);
   account(t);
   noPurchases(t);
@@ -340,6 +382,7 @@ test("a second Mac on the same account shares the account's window", async (t) =
  * converge on one window rather than both proceeding.
  */
 test("a concurrent claim for the same machine collides instead of resetting", async (t) => {
+  trialMintingEnabled(t);
   account(t);
   noPurchases(t);
   const store = fakeLedger(t, []);
@@ -366,6 +409,7 @@ test("a concurrent claim for the same machine collides instead of resetting", as
  * hardware lookup" the bypass.
  */
 test("a machine that could not prove its hardware gets a short, flagged window", async (t) => {
+  trialMintingEnabled(t);
   account(t);
   noPurchases(t);
   const store = fakeLedger(t, []);
@@ -389,6 +433,7 @@ test("a machine that could not prove its hardware gets a short, flagged window",
  * window per machine either way, so the benefit of the doubt costs nothing.
  */
 test("a client that never heard of hardwareBacked still gets a full window", async (t) => {
+  trialMintingEnabled(t);
   account(t);
   noPurchases(t);
   const store = fakeLedger(t, []);
@@ -410,6 +455,7 @@ test("claiming without a device id is refused", async (t) => {
 });
 
 test("a client clock years out of step is recorded, not obeyed", async (t) => {
+  trialMintingEnabled(t);
   account(t);
   noPurchases(t);
   const store = fakeLedger(t, []);

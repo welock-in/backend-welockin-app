@@ -232,20 +232,30 @@ entitlementRouter.post(
 
     const opts = startTrialSchema.parse(req.body ?? {});
 
-    // The hardware signals, which this route did not read before — and its whole
-    // job is to create claims. A claim written with no DeviceSignal rows is
-    // INVISIBLE to `matchClaimByFingerprint` for ever, so the machine can never
-    // be recognised again once its stored device id is wiped. The damage
-    // accumulated silently: every claim minted here widened the hole.
-    const fp = parseFingerprint(req);
-    await claimTrial(userId, deviceId, {
-      ...opts,
-      signals: fp.signals,
-      // Only when the client actually sent a fingerprint. Absent means "this
-      // client says nothing", which must stay distinct from "this client looked
-      // and failed" — see ClaimOptions.
-      ...(fp.signals.length > 0 ? { hardwareBacked: fp.hardwareBacked } : {}),
-    });
+    // The SAME switch the signup path honours, for the same reason: the product
+    // sells a card-backed trial chosen at the paywall, and a machine that can
+    // still curl itself a free fortnight here never has to choose one. Signup
+    // was gated when that decision landed; this route kept minting — which made
+    // it the one remaining free-licence tap, reachable by any authenticated
+    // account with a fresh device id. No shipped client calls this endpoint, so
+    // gating it breaks nobody; the response shape is unchanged (the view below
+    // simply reports the account as it is, claim or no claim).
+    if (env.signupTrialEnabled) {
+      // The hardware signals, which this route did not read before — and its whole
+      // job is to create claims. A claim written with no DeviceSignal rows is
+      // INVISIBLE to `matchClaimByFingerprint` for ever, so the machine can never
+      // be recognised again once its stored device id is wiped. The damage
+      // accumulated silently: every claim minted here widened the hole.
+      const fp = parseFingerprint(req);
+      await claimTrial(userId, deviceId, {
+        ...opts,
+        signals: fp.signals,
+        // Only when the client actually sent a fingerprint. Absent means "this
+        // client says nothing", which must stay distinct from "this client looked
+        // and failed" — see ClaimOptions.
+        ...(fp.signals.length > 0 ? { hardwareBacked: fp.hardwareBacked } : {}),
+      });
+    }
 
     res.json(await resolveAndCache(userId, deviceId));
   }),

@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
-import { subscriptionGrants } from "../lib/subscription";
+import { hideTestRows, subscriptionGrants } from "../lib/subscription";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { badRequest, conflict } from "../lib/http-error";
@@ -50,8 +50,12 @@ subscriptionRouter.post(
     }
 
     const userId = req.user!.id;
+    // Test rows are hidden here for the same reason the resolver hides them:
+    // once LEMONSQUEEZY_ALLOW_TEST_MODE goes off, a leftover test subscription
+    // must stop existing everywhere at once — and this endpoint in particular
+    // would otherwise try to INVOICE a test subscription through the live key.
     const subs = await prisma.subscription.findMany({
-      where: { userId, provider: PROVIDER },
+      where: { userId, provider: PROVIDER, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
       select: { externalId: true, status: true, validUntil: true, trialEndsAt: true },
     });
 
@@ -134,7 +138,11 @@ subscriptionRouter.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const subs = await prisma.subscription.findMany({
-      where: { userId: req.user!.id, provider: PROVIDER },
+      where: {
+        userId: req.user!.id,
+        provider: PROVIDER,
+        ...hideTestRows(env.lemonSqueezyAllowTestMode),
+      },
       select: {
         status: true,
         interval: true,
@@ -195,7 +203,7 @@ subscriptionRouter.post(
 
     const userId = req.user!.id;
     const subs = await prisma.subscription.findMany({
-      where: { userId, provider: PROVIDER },
+      where: { userId, provider: PROVIDER, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
       select: { externalId: true, status: true, validUntil: true },
     });
 

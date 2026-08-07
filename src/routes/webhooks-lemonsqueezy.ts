@@ -588,6 +588,14 @@ async function resolveSubscriptionUser(sub: ParsedSubscription): Promise<string 
   if (existing) return existing.userId;
 
   if (!sub.email) return null;
-  const byEmail = await prisma.user.findUnique({ where: { email: sub.email }, select: { id: true } });
+  // Case-insensitive, exactly like the ORDER path above. Registration lowercases
+  // addresses at the door, but Apple sign-in stores the token's email as
+  // received — an account carrying one capital letter would match for a lifetime
+  // order and silently fail for a subscription, and "the licence half-works
+  // depending on which product you bought" is a support ticket nobody can parse.
+  const byEmail = await prisma.user.findFirst({
+    where: { email: { equals: sub.email, mode: "insensitive" } },
+    select: { id: true },
+  });
   return byEmail?.id ?? null;
 }

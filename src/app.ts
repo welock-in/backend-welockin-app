@@ -4,6 +4,7 @@ import helmet from "helmet";
 import morgan from "morgan";
 import { env } from "./lib/env";
 import { healthRouter } from "./routes/health";
+import { healthLemonSqueezyRouter } from "./routes/health-lemonsqueezy";
 import { updatesRouter } from "./routes/updates";
 import { authRouter } from "./routes/auth";
 import { authEmailRouter } from "./routes/auth-email";
@@ -72,6 +73,10 @@ export function createApp(): Express {
 
   // Routes — everything under /api.
   app.use("/api/health", healthRouter);
+  // Asks Lemon Squeezy what THIS key can see. Public like the rest of /health:
+  // store names and variant ids ride in every checkout URL and every webhook,
+  // and the key itself is used, never echoed.
+  app.use("/api/health/lemonsqueezy", healthLemonSqueezyRouter);
   // Desktop auto-update manifest. PUBLIC like /api/health: a signed-out machine
   // must still be able to receive a fix.
   app.use("/api/updates", updatesRouter);

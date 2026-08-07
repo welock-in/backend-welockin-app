@@ -80,13 +80,32 @@ healthLemonSqueezyRouter.get("/", async (_req, res) => {
     name: s.attributes?.name ?? null,
   }));
 
-  const variantList = (variants.body?.data ?? []).map((v: any) => ({
-    id: String(v.id),
-    name: v.attributes?.name ?? null,
-    status: v.attributes?.status ?? null,
-    price: v.attributes?.price ?? null,
-    productId: v.attributes?.product_id != null ? String(v.attributes.product_id) : null,
-  }));
+  const variantList = (variants.body?.data ?? []).map((v: any) => {
+    const a = v.attributes ?? {};
+    return {
+      id: String(v.id),
+      name: a.name ?? null,
+      // "pending" means the product is not published yet. A pending variant
+      // exists — so it is not the "related resource does not exist" cause — but
+      // it is not something a customer can buy either, which is the next wall.
+      status: a.status ?? null,
+      // Cents, so 499 is EUR 4.99. The surest way to tell which plan a variant
+      // is when every one of them is called "Default".
+      price: a.price ?? null,
+      productId: a.product_id != null ? String(a.product_id) : null,
+      // Subscription or one-off, and on what cadence: this is what says which
+      // id belongs in MONTHLY, which in YEARLY, and which is the lifetime.
+      isSubscription: a.is_subscription ?? null,
+      interval: a.interval ?? null,
+      intervalCount: a.interval_count ?? null,
+      // Whether the trial the paywall promises is actually configured on the
+      // variant. A plan sold as "7 days free" whose variant carries no trial
+      // charges on day one.
+      hasFreeTrial: a.has_free_trial ?? null,
+      trialInterval: a.trial_interval ?? null,
+      trialIntervalCount: a.trial_interval_count ?? null,
+    };
+  });
 
   const findVariant = (id: string) => variantList.find((v: any) => v.id === id) ?? null;
 

@@ -94,6 +94,12 @@ test("a checkout carries the caller's own user id, not one the buyer chose", asy
   // from the token, before the payment page is created.
   assert.equal(sent.data.attributes.checkout_data.custom.user_id, userId);
   assert.equal(sent.data.relationships.variant.data.id, "1960881");
+  // The return path: the confirmation button and the receipt email both point
+  // at the bridge page that fires the desktop's welockin:// deep link. Pinned
+  // by a test because deleting this field would silently degrade every future
+  // purchase to "nothing happens after paying".
+  assert.equal(sent.data.attributes.product_options.redirect_url, `${env.publicSiteUrl}/thanks`);
+  assert.equal(sent.data.attributes.product_options.receipt_link_url, `${env.publicSiteUrl}/thanks`);
 });
 
 test("someone who already owns the licence is not sent to pay again", async (t) => {

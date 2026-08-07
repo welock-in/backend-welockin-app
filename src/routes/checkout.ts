@@ -98,28 +98,38 @@ checkoutRouter.post(
             custom: { user_id: userId },
           },
           product_options: {
-            // NO redirect_url, ON PURPOSE — the buyer stays on Lemon Squeezy's
-            // own confirmation page.
+            // The RETURN PATH. Lemon Squeezy's confirmation modal shows a
+            // "Continue" button pointing here — their docs are explicit that
+            // this is a button, never an automatic redirect — and /thanks is a
+            // bridge page on the marketing site that fires the desktop app's
+            // `welockin://` deep link: the app comes to the foreground and
+            // syncs its entitlement on the spot.
             //
-            // An earlier version pointed both the redirect and the receipt
-            // button at a page on the marketing site. That page does not exist
-            // and is not going to, so the last thing a paying customer saw was
-            // a 404 — worse than sending them nowhere, and during a test
-            // purchase indistinguishable from a payment that failed, which
-            // sends you debugging a webhook that is working fine.
+            // An earlier version pointed this at a page that DID NOT EXIST, so
+            // the last thing a paying customer saw was a 404; the version after
+            // that removed the redirect entirely and leaned on polling. The
+            // bridge page now ships together with this field — if /thanks ever
+            // moves, move it via PUBLIC_SITE_URL, not by deleting the field,
+            // because the desktop's deep-link handler is what makes the unlock
+            // feel instant.
             //
-            // Lemon Squeezy's page already confirms the payment and shows the
-            // amount, so the only thing missing is what to do next, and that is
-            // one sentence rather than a route. The desktop needs no help
-            // either way: it polls /entitlement while a checkout is open and
-            // syncs again on window focus, so it unlocks on its own.
-            //
+            // The deep link GRANTS NOTHING. It only wakes the app and triggers
+            // a sync; the licence still arrives exclusively via the signed
+            // webhook and the Ed25519 receipt, so a forged welockin:// link —
+            // or a stranger opening /thanks by hand — can at most cause one
+            // harmless refresh.
+            redirect_url: `${env.publicSiteUrl}/thanks`,
+            // The same bridge from the emailed receipt, for the customer who
+            // finds it hours later with the app closed: the deep link cold-
+            // starts the app, which syncs at boot.
+            receipt_link_url: `${env.publicSiteUrl}/thanks`,
+            receipt_button_text: "Open WeLockin",
             // NOT "has already unlocked". This is read the instant the card
             // clears, when the webhook may still be in flight, and stating
             // something has happened when it has not is how a working system
             // comes to look broken.
             receipt_thank_you_note:
-              "You can close this tab — switch back to welock and it unlocks by itself " +
+              "Press Continue to jump back into welock — it unlocks by itself " +
               "within a few seconds.",
           },
         },

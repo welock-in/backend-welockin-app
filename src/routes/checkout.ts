@@ -106,7 +106,11 @@ checkoutRouter.post(
             redirect_url: `${env.publicSiteUrl}/purchase-complete`,
             receipt_link_url: `${env.publicSiteUrl}/purchase-complete`,
             receipt_button_text: "Return to welock",
-            receipt_thank_you_note: "You can close this tab — welock has already unlocked.",
+            // NOT "has already unlocked". The webhook may still be in flight
+            // when this is read, and stating something has happened when it has
+            // not is how a working system comes to look broken.
+            receipt_thank_you_note:
+              "You can close this tab — welock unlocks by itself within a few seconds.",
           },
         },
         relationships: {

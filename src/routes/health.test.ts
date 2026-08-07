@@ -72,3 +72,18 @@ test("config reports the public ids verbatim, so a wrong paste is visible", asyn
 
   assert.equal(res.body.lemonSqueezy.storeId, "364783");
 });
+
+/*
+ * A half-configured storefront is deliberately BLANKED in env.ts so the deploy
+ * cannot sell. The cost is that this endpoint would otherwise report "no API
+ * key" for a deploy whose key is fine and whose real problem is one empty
+ * variant id — the exact wrong answer to give someone mid-way through swapping
+ * test ids for live ones. `degraded` + `problems` name the real cause.
+ */
+test("config says WHEN it is degraded, and which variable caused it", async () => {
+  const res = await request(app).get("/api/health/config");
+
+  assert.equal(res.status, 200);
+  assert.equal(typeof res.body.lemonSqueezy.degraded, "boolean");
+  assert.ok(Array.isArray(res.body.lemonSqueezy.problems));
+});

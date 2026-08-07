@@ -2,7 +2,7 @@ import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { ledgerHash } from "../lib/hash";
-import { subscriptionGrants } from "../lib/subscription";
+import { hideTestRows, subscriptionGrants } from "../lib/subscription";
 import { issueReceipt } from "../lib/entitlement-receipt";
 import { readDeviceId } from "../lib/device";
 import { parseFingerprint } from "../lib/fingerprint";
@@ -62,7 +62,12 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
         accessRevoked: true,
       },
     }),
-    prisma.purchase.findMany({ where: { userId }, select: { isRefunded: true } }),
+    prisma.purchase.findMany({
+      // Same filter as the subscriptions below and as the checkout guards: a
+      // test purchase must stop granting the moment test mode is shut.
+      where: { userId, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
+      select: { isRefunded: true },
+    }),
     // This machine's claim OR this account's, oldest first so a later row can
     // never rewind the window. Both legs matter, in opposite directions: the
     // device leg is what stops a second account on one Mac, and the account leg
@@ -73,7 +78,8 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     // customer who cancelled and resubscribed has two rows, and which of them
     // grants is `subscriptionGrants`'s question, not this query's.
     prisma.subscription.findMany({
-      where: { userId },
+      // Test rows stop granting the moment test mode is shut — see hideTestRows.
+      where: { userId, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
       select: {
         status: true,
         validUntil: true,

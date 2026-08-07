@@ -603,6 +603,22 @@ model Purchase {
   refundedAt  DateTime?
   /// Kept for support and for replaying a delivery we mishandled.
   rawEvent    Json?
+
+  /// Did this come from Lemon Squeezy TEST mode?
+  ///
+  /// Written from the payload the webhook already parsed, and it is the only
+  /// thing that can ever tell a test row from a real one afterwards: the ids,
+  /// the price and the shape are otherwise identical. Without it a test
+  /// purchase is a permanent, live-looking grant in the production billing
+  /// database — one that also 409s every later checkout on that account.
+  ///
+  /// OPTIONAL, not `@default(false)`. On MongoDB a default is applied at CREATE
+  /// only, so rows written before this column existed simply have no field —
+  /// and absent must read as "not known to be a test", which keeps every
+  /// existing grant working. Purge the known test rows before going live
+  /// rather than trusting the absence to mean anything.
+  testMode Boolean?
+
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
@@ -693,6 +709,21 @@ model Subscription {
   /// The last payload, verbatim. When a status transition surprises us, the only
   /// thing that settles it is what actually arrived.
   rawEvent Json?
+
+  /// Did this come from Lemon Squeezy TEST mode?
+  ///
+  /// Written from the payload the webhook already parsed, and it is the only
+  /// thing that can ever tell a test row from a real one afterwards: the ids,
+  /// the price and the shape are otherwise identical. Without it a test
+  /// purchase is a permanent, live-looking grant in the production billing
+  /// database — one that also 409s every later checkout on that account.
+  ///
+  /// OPTIONAL, not `@default(false)`. On MongoDB a default is applied at CREATE
+  /// only, so rows written before this column existed simply have no field —
+  /// and absent must read as "not known to be a test", which keeps every
+  /// existing grant working. Purge the known test rows before going live
+  /// rather than trusting the absence to mean anything.
+  testMode Boolean?
 
   /// Lemon Squeezy's own `updated_at` for the LAST event applied to this row —
   /// the ordering guard's clock. Their retries back off over hours, so an old

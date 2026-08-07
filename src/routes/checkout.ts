@@ -2,7 +2,7 @@ import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { checkoutSchema } from "../validation/schemas";
-import { subscriptionGrants } from "../lib/subscription";
+import { hideTestRows, subscriptionGrants } from "../lib/subscription";
 import { readLemonSqueezyError } from "../lib/lemonsqueezy";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
@@ -67,7 +67,7 @@ checkoutRouter.post(
     // makes every plan pointless — a second purchase buys nothing, and refunding
     // it afterwards costs us the fee and them the goodwill.
     const owned = await prisma.purchase.findFirst({
-      where: { userId, isRefunded: false },
+      where: { userId, isRefunded: false, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
       select: { id: true },
     });
     if (owned) throw conflict("You already own the lifetime licence.");
@@ -80,7 +80,7 @@ checkoutRouter.post(
     // holding two.
     if (plan !== "lifetime") {
       const subs = await prisma.subscription.findMany({
-        where: { userId },
+        where: { userId, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
         select: { status: true, validUntil: true },
       });
       if (subs.some((sub) => subscriptionGrants(sub, new Date()))) {
@@ -96,6 +96,17 @@ checkoutRouter.post(
             email: user.email,
             // The whole point of this endpoint. Read back verbatim by the webhook.
             custom: { user_id: userId },
+          },
+          product_options: {
+            // WHERE THE BROWSER LANDS AFTER PAYING. Without this the customer
+            // finishes on Lemon Squeezy's own storefront with nothing pointing
+            // back at the app they just bought — they paid, and the last thing
+            // they see is a shop. The desktop notices the payment on its own
+            // (focus + poll), but only if they think to switch back to it.
+            redirect_url: `${env.publicSiteUrl}/purchase-complete`,
+            receipt_link_url: `${env.publicSiteUrl}/purchase-complete`,
+            receipt_button_text: "Return to welock",
+            receipt_thank_you_note: "You can close this tab — welock has already unlocked.",
           },
         },
         relationships: {

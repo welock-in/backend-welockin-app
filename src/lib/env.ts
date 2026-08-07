@@ -406,7 +406,32 @@ export function checkPaymentConfig(input: {
   return { degraded, enforcementSuppressed, problems };
 }
 
-const paymentConfig = checkPaymentConfig(env);
+export const paymentConfig = checkPaymentConfig(env);
+
+/**
+ * The two ids the hard config check does NOT cover.
+ *
+ * `checkPaymentConfig` guards the four values a deploy cannot sell without at
+ * all, and the subscription variants cannot join that set: a lifetime-only
+ * deploy is legitimate and must not be degraded for lacking them. But silence
+ * is the wrong default when a key IS configured — a blank or stale
+ * subscription id is exactly the shape of the test/live graph swap, and its
+ * only symptom is one plan answering 400 while the others sell.
+ */
+if (process.env.LEMONSQUEEZY_API_KEY || process.env.LEMON_API_KEY) {
+  const missingPlans = [
+    ["LEMONSQUEEZY_VARIANT_MONTHLY", process.env.LEMONSQUEEZY_VARIANT_MONTHLY],
+    ["LEMONSQUEEZY_VARIANT_YEARLY", process.env.LEMONSQUEEZY_VARIANT_YEARLY],
+  ]
+    .filter(([, v]) => !v)
+    .map(([k]) => k);
+  if (missingPlans.length > 0) {
+    console.warn(
+      `[env] Lemon Squeezy is configured but ${missingPlans.join(" and ")} ` +
+        `${missingPlans.length > 1 ? "are" : "is"} empty — those plans will answer 400.`,
+    );
+  }
+}
 
 // A half-configured storefront is not a storefront. Blanking the keys is how that
 // is said to the rest of the process: `POST /api/checkout` already refuses

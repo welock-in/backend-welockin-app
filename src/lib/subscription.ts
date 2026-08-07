@@ -91,3 +91,27 @@ export function intervalForVariant(variantId: string, monthly: string, yearly: s
   if (variantId && variantId === yearly) return "yearly";
   return null;
 }
+
+/**
+ * The Prisma `where` fragment that hides TEST-mode rows once test mode is shut.
+ *
+ * Three places read billing rows to decide something — the entitlement
+ * resolver, and the checkout's two "you already have this" guards — and all
+ * three must agree about whether a test purchase counts. One fragment, so they
+ * cannot drift into a state where a row grants access but does not block a
+ * second purchase of it.
+ *
+ * While ALLOW_TEST_MODE is ON this is EMPTY, deliberately: a test purchase is
+ * the thing being tested, and hiding it would make the test prove nothing. The
+ * moment the flag goes off, every test row stops existing as far as access and
+ * checkout are concerned — which is what makes the switch to a live key safe
+ * without a database migration.
+ *
+ * `NOT: { testMode: true }` rather than `testMode: false`, because on MongoDB a
+ * column added after launch is ABSENT on older documents, not false — and
+ * `testMode: false` would silently exclude every row written before this
+ * existed, i.e. every real customer we already have.
+ */
+export function hideTestRows(allowTestMode: boolean): Record<string, unknown> {
+  return allowTestMode ? {} : { NOT: { testMode: true } };
+}

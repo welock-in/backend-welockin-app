@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma";
-import { env } from "../lib/env";
+import { env, paymentConfig } from "../lib/env";
 import { receiptsEnabled } from "../lib/entitlement-receipt";
 
 export const healthRouter = Router();
@@ -28,6 +28,14 @@ healthRouter.get("/config", (_req, res) => {
   res.json({
     commit: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) ?? null,
     lemonSqueezy: {
+      // DEGRADED FIRST, because everything under it lies while it is true.
+      // A half-configured storefront is deliberately BLANKED in env.ts so the
+      // deploy cannot sell — which means this endpoint would otherwise report
+      // "no API key" for a deploy whose API key is perfectly fine and whose
+      // real problem is one empty variant id. That is the exact wrong answer
+      // to give someone mid-way through swapping test ids for live ones.
+      degraded: paymentConfig.degraded,
+      problems: paymentConfig.problems,
       apiKey: Boolean(env.lemonSqueezyApiKey),
       webhookSecret: Boolean(env.lemonSqueezyWebhookSecret),
       storeId: env.lemonSqueezyStoreId || null,

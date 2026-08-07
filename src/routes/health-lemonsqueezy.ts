@@ -85,9 +85,12 @@ healthLemonSqueezyRouter.get("/", async (_req, res) => {
     return {
       id: String(v.id),
       name: a.name ?? null,
-      // "pending" means the product is not published yet. A pending variant
-      // exists — so it is not the "related resource does not exist" cause — but
-      // it is not something a customer can buy either, which is the next wall.
+      // "pending" is the NORMAL status of the single Default variant a product
+      // gets when it has no explicit variants, and it sells perfectly well so
+      // long as the PRODUCT is published. Lemon Squeezy's own sync example
+      // skips pending only when a product has several variants. An earlier
+      // comment here called it unsellable; that was wrong, and acting on it
+      // would have sent someone hunting a publish button they did not need.
       status: a.status ?? null,
       // Cents, so 499 is EUR 4.99. The surest way to tell which plan a variant
       // is when every one of them is called "Default".
@@ -109,8 +112,26 @@ healthLemonSqueezyRouter.get("/", async (_req, res) => {
 
   const findVariant = (id: string) => variantList.find((v: any) => v.id === id) ?? null;
 
+  const configuredIds = [
+    env.lemonSqueezyVariantId,
+    env.lemonSqueezyVariantMonthly,
+    env.lemonSqueezyVariantYearly,
+  ].filter(Boolean);
+  const missing = configuredIds.filter((id) => !variantList.some((v: any) => v.id === id));
+
   res.json({
     ok: true,
+    // The sentence someone can act on, rather than three nulls to interpret.
+    // Every configured id absent from a store that otherwise matches is the
+    // signature of a test/live graph mismatch, and nothing else looks like it.
+    summary:
+      configuredIds.length > 0 && missing.length === configuredIds.length
+        ? "None of the configured variant ids exist for this API key. Test and live are " +
+          "separate object graphs — these ids almost certainly come from the other mode. " +
+          "Copy the ids listed below."
+        : missing.length > 0
+          ? `Configured but not visible to this key: ${missing.join(", ")}.`
+          : "Every configured id exists for this key.",
     // Which store the key belongs to, versus the one we are configured to sell
     // from. A mismatch here explains every "related resource does not exist".
     storeConfigured: env.lemonSqueezyStoreId || null,

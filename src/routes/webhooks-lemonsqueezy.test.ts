@@ -824,8 +824,9 @@ test("the real order_refunded revokes even though test mode is closed", async (t
 test("the real refund converges even if its order_created was never seen", async (t) => {
   // The deliveries can arrive in any order across serverless instances, and a
   // refund for an order we never recorded must still make the later (replayed)
-  // creation unable to grant.
-  configured(t);
+  // creation unable to grant. The fixture is a TEST order, so test mode has to
+  // be open for it to be minted at all — see the pair of tests below.
+  configured(t, { lemonSqueezyAllowTestMode: true });
   const db = stubDb(t, {
     purchaseFind: async () => null,
     userFind: async (args: any) =>
@@ -839,6 +840,61 @@ test("the real refund converges even if its order_created was never seen", async
   const created = db.purchaseCreate[0][0].data;
   assert.equal(created.userId, REAL_USER_ID);
   assert.equal(created.isRefunded, true, "born revoked, so a replayed creation cannot resurrect it");
+  assert.equal(created.testMode, true, "and marked, so it can be excluded once test mode is shut");
+});
+
+/*
+ * The mint-from-unseen branch CREATES a row, so it needs the same test-mode
+ * gate the grant path has — otherwise a test refund for an order this deploy
+ * never recorded writes a permanent test-graph Purchase into the production
+ * table: a row for a sale that never happened here. Revoking an EXISTING row
+ * stays ungated, which is the whole point of the asymmetry.
+ */
+test("a test-mode refund for an unseen order mints nothing on a live backend", async (t) => {
+  configured(t); // allowTestMode: false
+  const db = stubDb(t, { purchaseFind: async () => null });
+
+  const res = await deliver(REAL_ORDER_REFUNDED);
+
+  assert.equal(res.status, 200);
+  assert.equal(db.purchaseCreate.length, 0);
+  assert.equal(finalStatus(db.eventMark), "skipped");
+});
+
+test("but a test-mode refund still REVOKES a row we already have", async (t) => {
+  configured(t); // allowTestMode: false — revoking is never gated
+  const db = stubDb(t, { purchaseFind: async () => ({ id: "purchase-9090213" }) });
+
+  await deliver(REAL_ORDER_REFUNDED);
+
+  assert.equal(
+    db.purchaseUpdate.filter((c) => c[0]?.data?.isRefunded === true).length,
+    1,
+    "taking access away must never wait for a flag",
+  );
+});
+
+/* Every granted row is marked, so the live switch can exclude them. */
+test("a granted purchase records which mode it came from", async (t) => {
+  configured(t, { lemonSqueezyAllowTestMode: true });
+  const db = stubDb(t, {
+    userFind: async (args: any) =>
+      args?.where?.id === REAL_USER_ID ? { id: REAL_USER_ID } : null,
+  });
+
+  await deliver(REAL_ORDER_CREATED);
+
+  assert.equal(db.purchaseUpsert[0][0].create.testMode, true);
+});
+
+test("a subscription records which mode it came from", async (t) => {
+  configured(t);
+  const db = stubDb(t, { userFirst: async () => ({ id: USER }) });
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
+
+  await deliver(subBody({ attributes: { test_mode: true, status: "expired" } }));
+
+  assert.equal(db.subCreate[0][0].data.testMode, true);
 });
 
 /*

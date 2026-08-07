@@ -217,6 +217,8 @@ async function handle(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
       purchasedAt: order.purchasedAt,
       isRefunded: false,
       rawEvent: body as Prisma.InputJsonValue,
+      // Parsed all along and thrown away until now. See schema.prisma.
+      testMode: order.testMode,
     },
     // `isRefunded` is deliberately absent: a replayed order_created arriving
     // after a refund must not resurrect the licence. `userId` is absent too —
@@ -296,6 +298,15 @@ async function refund(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
     };
   }
 
+  // Same test-mode gate the grant path uses, and for the mirror reason. This
+  // branch MINTS a row; the revocation of an existing row above stays ungated
+  // exactly as documented. Without this, a test refund for an order the live
+  // deploy never recorded writes a permanent test-graph Purchase into the
+  // production table — a row for a sale that never happened here.
+  if (order.testMode && !env.lemonSqueezyAllowTestMode) {
+    return { status: "skipped", reason: "test-mode refund for an order we never saw created" };
+  }
+
   // A FULL refund is recorded born-revoked, so the later (or replayed) creation
   // cannot grant what has already been given back.
   const userId = await resolveUserId(order);
@@ -314,6 +325,8 @@ async function refund(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
       isRefunded: true,
       refundedAt: order.refundedAt ?? new Date(),
       rawEvent: body as Prisma.InputJsonValue,
+      // Marked like every other row we mint, so the live switch can exclude it.
+      testMode: order.testMode,
     },
   });
   return { status: "processed", reason: "refund recorded for an order we never saw created" };
@@ -486,6 +499,7 @@ async function handleSubscription(
     updatePaymentUrl: sub.updatePaymentUrl,
     customerPortalUrl: sub.customerPortalUrl,
     rawEvent: body as Prisma.InputJsonValue,
+    testMode: sub.testMode,
     ...(sub.updatedAt ? { providerUpdatedAt: sub.updatedAt } : {}),
   };
 
@@ -553,7 +567,13 @@ async function handleSubscription(
  * stop tracking a paying customer.
  */
 async function resolveSubscriptionUser(sub: ParsedSubscription): Promise<string | null> {
-  if (sub.customUserId) {
+  // Validated BEFORE it reaches Prisma, exactly as the order path does. On
+  // MongoDB a malformed id raises P2023 rather than returning null, and the
+  // throw here would skip the two fallbacks below and turn every delivery for
+  // that subscription into a retry loop. Reachable because a Lemon Squeezy
+  // hosted-checkout URL accepts `checkout[custom][user_id]` as a query
+  // parameter — so custom data is only OURS on checkouts we minted.
+  if (sub.customUserId && isObjectId(sub.customUserId)) {
     const byId = await prisma.user.findUnique({
       where: { id: sub.customUserId },
       select: { id: true },

@@ -269,8 +269,80 @@ export async function recordPaidOrder(
   // The tombstone that outlives the account. Idempotent, and only on the first
   // write (existing===null): a replay of a live order finds its Purchase and
   // skips this. Never deleted, never cascaded — that is the whole point.
-  if (!existing) await markOrderConsumed(order.orderId, "order");
+  if (!existing) {
+    await markOrderConsumed(order.orderId, "order");
+    // `recordPaidOrder` is only ever reached for the LIFETIME variant (the
+    // webhook's isSellableOrder and /confirm's variant branch both gate on it),
+    // so a new Purchase here means this account just bought lifetime. If they
+    // were paying monthly/yearly, that subscription must stop — otherwise they
+    // pay every month ON TOP of a licence they already own for ever. Done on the
+    // SERVER, once (guarded by existing===null), so it happens even if the app
+    // never reopens. Best-effort: a failed cancel must not undo the grant.
+    await cancelSubscriptionsForLifetimeBuyer(userId);
+  }
   return "written";
+}
+
+/**
+ * Cancel every still-granting subscription this account holds, because it just
+ * bought the lifetime licence.
+ *
+ * Cancel, not delete-our-row: Lemon Squeezy keeps a cancelled subscription valid
+ * to the end of the period already paid for, and `subscriptionGrants` already
+ * treats `cancelled` as granting — so the customer loses nothing they paid for
+ * and simply stops renewing. The webhook that the cancel triggers writes the row.
+ */
+async function cancelSubscriptionsForLifetimeBuyer(userId: string): Promise<void> {
+  if (!env.lemonSqueezyApiKey) return;
+  let subs: { externalId: string; status: string; validUntil: Date | null }[];
+  try {
+    subs = await prisma.subscription.findMany({
+      where: { userId, provider: PROVIDER },
+      select: { externalId: true, status: true, validUntil: true },
+    });
+  } catch (e) {
+    console.error("[lemonsqueezy] lifetime buyer: could not read subscriptions:", e);
+    return;
+  }
+  const now = new Date();
+  for (const sub of subs) {
+    // Only ones that are actually live and not already cancelled — no point
+    // poking an expired row, and cancelling a cancelled one is a wasted call.
+    if (sub.status === "cancelled" || sub.status === "expired") continue;
+    if (!subscriptionGrants(sub, now)) continue;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10_000);
+      try {
+        const r = await fetch(`${env.lemonSqueezyApiBase}/v1/subscriptions/${sub.externalId}`, {
+          method: "DELETE",
+          headers: {
+            Accept: "application/vnd.api+json",
+            "Content-Type": "application/vnd.api+json",
+            Authorization: `Bearer ${env.lemonSqueezyApiKey}`,
+          },
+          signal: controller.signal,
+        });
+        if (!r.ok && r.status !== 404) {
+          console.error(
+            `[lemonsqueezy] lifetime buyer ${userId}: cancel of ${sub.externalId} returned HTTP ${r.status}`,
+          );
+        } else {
+          console.info(`[lemonsqueezy] lifetime buyer ${userId}: cancelled subscription ${sub.externalId}`);
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (e) {
+      // Never echo the error (the request carried the key); never throw (the
+      // grant already landed). A stranded subscription is a support ticket, not
+      // a reason to fail the purchase.
+      console.error(
+        `[lemonsqueezy] lifetime buyer ${userId}: cancel of ${sub.externalId} failed:`,
+        e instanceof Error ? e.message : e,
+      );
+    }
+  }
 }
 
 /** Record that an order/subscription has been turned into a grant, once, for ever. */

@@ -201,6 +201,51 @@ for (const [plan, variantId] of [
   });
 }
 
+/* ── One free trial per account (skip_trial) ────────────────────────────── */
+
+test("a first-time subscriber gets the trial (no skip_trial in the checkout)", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  // No prior subscription rows.
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  let sent: any = null;
+  stubFetch(t, async (_url: string, init: any) => {
+    sent = JSON.parse(init.body);
+    return { ok: true, status: 201, json: async () => ({ data: { attributes: { url: "https://x/c" } } }) };
+  });
+
+  await request(app).post("/api/checkout").set(auth).send({ plan: "monthly" });
+
+  assert.ok(
+    !sent.data.attributes.checkout_options,
+    "a first-time subscriber must be offered the trial the paywall promised",
+  );
+});
+
+test("a returning account whose subscription lapsed gets NO second trial", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  // An expired subscription row exists — they have subscribed (and trialed) before.
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    { status: "expired", validUntil: new Date(Date.now() - 86_400_000) },
+  ]);
+  let sent: any = null;
+  stubFetch(t, async (_url: string, init: any) => {
+    sent = JSON.parse(init.body);
+    return { ok: true, status: 201, json: async () => ({ data: { attributes: { url: "https://x/c" } } }) };
+  });
+
+  await request(app).post("/api/checkout").set(auth).send({ plan: "monthly" });
+
+  assert.equal(
+    sent.data.attributes.checkout_options.skip_trial,
+    true,
+    "the trial is a first-time offer, not a renewable one",
+  );
+});
+
 test("a variant id supplied by the caller is ignored", async (t) => {
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));

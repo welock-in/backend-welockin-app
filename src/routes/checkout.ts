@@ -3,7 +3,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { checkoutConfirmSchema, checkoutSchema } from "../validation/schemas";
-import { hideTestRows, subscriptionGrants } from "../lib/subscription";
+import { hideTestRows, subscriptionGrants, variantForPlan } from "../lib/subscription";
 import {
   parseOrderEvent,
   parseSubscriptionEvent,
@@ -47,16 +47,15 @@ checkoutRouter.post(
   asyncHandler(async (req, res) => {
     const { plan } = checkoutSchema.parse(req.body ?? {});
 
-    // The NAME becomes an id here and nowhere else. A caller can ask for
-    // "monthly"; it can never ask for a variant of its choosing — not a €0 test
-    // variant, not another store's, not one belonging to a different product.
-    // What is purchasable is fixed at deploy time, not at request time.
-    const variantId =
-      plan === "monthly"
-        ? env.lemonSqueezyVariantMonthly
-        : plan === "yearly"
-          ? env.lemonSqueezyVariantYearly
-          : env.lemonSqueezyVariantId;
+    // The NAME becomes an id here and nowhere else — via the shared helper, so
+    // checkout and change-plan can never disagree about what "monthly" is. A
+    // caller can ask for "monthly"; it can never ask for a variant of its
+    // choosing. What is purchasable is fixed at deploy time, not at request time.
+    const variantId = variantForPlan(plan, {
+      monthly: env.lemonSqueezyVariantMonthly,
+      yearly: env.lemonSqueezyVariantYearly,
+      lifetime: env.lemonSqueezyVariantId,
+    });
 
     if (!env.lemonSqueezyApiKey || !env.lemonSqueezyStoreId || !variantId) {
       // Configuration, not user error — and worth being loud about, because the
@@ -96,6 +95,20 @@ checkoutRouter.post(
     // between monthly and yearly is a Lemon Squeezy operation on the existing
     // subscription, not a new checkout — sending them here would leave them
     // holding two.
+    // ONE FREE TRIAL PER ACCOUNT. Lemon Squeezy applies the variant's trial to
+    // EVERY checkout for it — their docs are explicit that repeat-trial
+    // prevention is the merchant's job (there is no built-in block), and an
+    // account whose subscription lapsed would otherwise get a fresh free window
+    // every time it re-subscribed. So: if this account has EVER had a
+    // subscription row (any status — a lapsed or cancelled one counts), the new
+    // checkout skips the trial and charges immediately. The trial is a
+    // first-time offer, not a renewable one.
+    //
+    // This does NOT stop a brand-new EMAIL from farming trials — that needs a
+    // signal LS owns (the card) and its fraud detection, not something we can
+    // see at checkout. It closes the per-account case, which is the one asked
+    // for and the one entirely in our hands.
+    let skipTrial = false;
     if (plan !== "lifetime") {
       const subs = await prisma.subscription.findMany({
         where: { userId, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
@@ -104,6 +117,8 @@ checkoutRouter.post(
       if (subs.some((sub) => subscriptionGrants(sub, new Date()))) {
         throw conflict("You already have an active subscription.");
       }
+      // A row exists at all → this account has subscribed before → no second trial.
+      skipTrial = subs.length > 0;
     }
 
     const body = {
@@ -158,6 +173,11 @@ checkoutRouter.post(
               "Press Continue to jump back into welock — it unlocks by itself " +
               "within a few seconds.",
           },
+          // Only ever present to REMOVE a trial (one-per-account, above); it can
+          // never add one, so it is a no-op on the lifetime variant. Omitted
+          // entirely for a first-time subscriber so they get the trial the
+          // paywall promised.
+          ...(skipTrial ? { checkout_options: { skip_trial: true } } : {}),
         },
         relationships: {
           store: { data: { type: "stores", id: env.lemonSqueezyStoreId } },

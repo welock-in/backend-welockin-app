@@ -93,6 +93,24 @@ export function intervalForVariant(variantId: string, monthly: string, yearly: s
 }
 
 /**
+ * The inverse: a plan NAME to the variant id it maps to.
+ *
+ * THE SECURITY BOUNDARY, in one place. A caller names a plan; it can never name a
+ * variant of its own choosing — not a €0 test variant, not another store's. What
+ * is purchasable (or switchable-to) is fixed at deploy time. Checkout and
+ * change-plan both go through here so the two can never disagree about what
+ * "monthly" means, which is exactly the drift that rotates a price into the wrong
+ * product. Returns "" for a plan whose id is unset — every caller must treat
+ * that as "not configured", never as a valid variant.
+ */
+export function variantForPlan(
+  plan: "monthly" | "yearly" | "lifetime",
+  ids: { monthly: string; yearly: string; lifetime: string },
+): string {
+  return plan === "monthly" ? ids.monthly : plan === "yearly" ? ids.yearly : ids.lifetime;
+}
+
+/**
  * The Prisma `where` fragment that hides TEST-mode rows once test mode is shut.
  *
  * Three places read billing rows to decide something — the entitlement

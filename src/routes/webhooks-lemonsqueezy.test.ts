@@ -87,6 +87,9 @@ function stubDb(t: Ctx, overrides: Record<string, (...args: any[]) => any> = {})
     // row matched. Baseline mirrors "nothing exists yet": count 0, create lands.
     subWrite: stubMethod(t, prisma.subscription as any, "updateMany", pick("subWrite", async () => ({ count: 0 }))),
     subFind: stubMethod(t, prisma.subscription as any, "findUnique", pick("subFind", async () => null)),
+    // A lifetime purchase cancels the buyer's live subscription
+    // (cancelSubscriptionsForLifetimeBuyer). Baseline: none to cancel.
+    subFindMany: stubMethod(t, prisma.subscription as any, "findMany", pick("subFindMany", async () => [])),
     subCreate: stubMethod(t, prisma.subscription as any, "create", pick("subCreate", async () => ({}))),
     purchaseUpsert: stubMethod(t, prisma.purchase as any, "upsert", pick("purchaseUpsert", async () => ({}))),
     purchaseFind: stubMethod(t, prisma.purchase as any, "findUnique", pick("purchaseFind", async () => null)),
@@ -216,6 +219,41 @@ test("a paid order for our variant grants the licence to the account the checkou
   // First grant records the consumed-order tombstone so it can never mint twice.
   assert.equal(db.consumedUpsert.length, 1);
   assert.equal(db.consumedUpsert[0][0].create.externalId, "9001");
+});
+
+/*
+ * Buying lifetime while paying monthly must STOP the monthly billing — otherwise
+ * the customer pays every month on top of a licence they now own for ever. The
+ * webhook cancels the live subscription at Lemon Squeezy (DELETE), server-side,
+ * so it happens even if the app never reopens.
+ */
+test("a lifetime purchase cancels the buyer's live subscription", async (t) => {
+  // The API key is what lets the cancel call go out (the webhook itself needs
+  // only the signing secret).
+  configured(t, { lemonSqueezyApiKey: "test-key" });
+  const db = stubDb(t, {
+    subFindMany: async () => [
+      { externalId: "sub-77001", status: "active", validUntil: new Date(Date.now() + 20 * 86_400_000) },
+    ],
+  });
+  let cancelled = "";
+  let method = "";
+  const originalFetch = globalThis.fetch;
+  (globalThis as any).fetch = async (u: string, i: any) => {
+    method = i?.method ?? "GET";
+    cancelled = String(u);
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  t.after(() => {
+    (globalThis as any).fetch = originalFetch;
+  });
+
+  const res = await deliver(orderBody());
+
+  assert.equal(res.status, 200);
+  assert.equal(db.purchaseUpsert.length, 1, "the lifetime licence is still recorded");
+  assert.equal(method, "DELETE");
+  assert.ok(cancelled.endsWith("/v1/subscriptions/sub-77001"), cancelled);
 });
 
 /*

@@ -528,6 +528,17 @@ export const checkoutSchema = z.object({
 });
 
 /**
+ * `POST /api/subscription/change-plan`. Only the two SUBSCRIPTION plans — moving
+ * TO lifetime is a one-off purchase (a checkout), not a variant swap on the
+ * existing subscription, so "lifetime" is deliberately absent here. As with
+ * checkout, a NAME and never a variant id: the caller cannot switch to a variant
+ * of its choosing.
+ */
+export const changePlanSchema = z.object({
+  plan: z.enum(["monthly", "yearly"]),
+});
+
+/**
  * `POST /api/checkout/confirm`. The order id arrives via Lemon Squeezy's
  * `[order_id]` link variable → the /thanks bridge → the app's deep link, so it
  * has crossed two URLs a user can edit: shape-checked here, verified against

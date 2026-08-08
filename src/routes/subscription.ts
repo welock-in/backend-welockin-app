@@ -1,11 +1,12 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
-import { hideTestRows, subscriptionGrants } from "../lib/subscription";
+import { hideTestRows, subscriptionGrants, variantForPlan } from "../lib/subscription";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { badRequest, conflict } from "../lib/http-error";
 import { readLemonSqueezyError } from "../lib/lemonsqueezy";
+import { changePlanSchema } from "../validation/schemas";
 
 export const subscriptionRouter = Router();
 
@@ -363,5 +364,134 @@ subscriptionRouter.post(
     }
 
     res.status(202).json({ ok: true, renewsAt });
+  }),
+);
+
+/**
+ * Change plan between monthly and yearly on the EXISTING subscription.
+ *
+ * WHY A PATCH, NOT A CHECKOUT. Switching the variant is one operation on the
+ * subscription the customer already has; a second checkout would leave them
+ * holding two (the exact trap checkout.ts guards against). Moving TO lifetime is
+ * the opposite — a one-off purchase, not a subscription state — so it is NOT
+ * handled here: the client sends it through checkout, and the webhook then
+ * cancels this subscription (see recordPaidOrder) so nobody pays both.
+ *
+ * THE on_trial RULE. Refused while the subscription is on trial, on purpose: no
+ * money has moved yet, so there is nothing to prorate against and Lemon
+ * Squeezy's behaviour for a variant swap mid-trial is undefined. The honest path
+ * is "pay now, then change" — POST /subscription/end-trial exists for the first
+ * half. A change is allowed once the subscription is `active` (or `past_due`).
+ *
+ * PRORATION. An UPGRADE (monthly→yearly) is a price rise, charged pro rata
+ * immediately (`invoice_immediately`) — it takes money, so the client confirms
+ * first. A DOWNGRADE (yearly→monthly) does not bill now: `disable_prorations`
+ * switches the plan and simply bills the new price at the next renewal, so
+ * nobody is charged for downgrading and no confusing credit is minted.
+ *
+ * The webhook remains the sole writer of the row (subscription_updated re-derives
+ * variantId + interval); this only asks Lemon Squeezy and refreshes.
+ */
+subscriptionRouter.post(
+  "/change-plan",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    if (!env.lemonSqueezyApiKey) {
+      console.error("[subscription] cannot change plan: no Lemon Squeezy API key");
+      throw badRequest("Billing is not available right now.");
+    }
+
+    const { plan } = changePlanSchema.parse(req.body ?? {});
+    // The NAME → variant id, through the SAME shared helper checkout uses. A
+    // caller names "monthly"/"yearly"; it can never name a variant of its own.
+    const targetVariant = variantForPlan(plan, {
+      monthly: env.lemonSqueezyVariantMonthly,
+      yearly: env.lemonSqueezyVariantYearly,
+      lifetime: env.lemonSqueezyVariantId,
+    });
+    if (!targetVariant) {
+      console.error(`[subscription] change-plan: no variant configured for "${plan}"`);
+      throw badRequest("That plan is not available right now.");
+    }
+
+    const userId = req.user!.id;
+    const subs = await prisma.subscription.findMany({
+      where: { userId, provider: PROVIDER, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
+      select: { externalId: true, status: true, validUntil: true, variantId: true },
+    });
+
+    const now = new Date();
+    // Found from the TOKEN, never named by the request — like every money action.
+    const live = subs.find((sub) => subscriptionGrants(sub, now) && sub.status !== "cancelled");
+    if (!live) {
+      throw conflict("There is no active subscription to change.");
+    }
+    if (live.status === "on_trial") {
+      throw conflict("End your trial before changing plan.");
+    }
+    if (live.variantId === targetVariant) {
+      throw conflict("You are already on that plan.");
+    }
+
+    // Upgrade = to the yearly (dearer) plan; downgrade = to monthly. The variant
+    // ids decide, not the price, so this stays correct if the prices move.
+    const isUpgrade = plan === "yearly";
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LS_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await fetch(`${env.lemonSqueezyApiBase}/v1/subscriptions/${live.externalId}`, {
+        method: "PATCH",
+        headers: {
+          Accept: "application/vnd.api+json",
+          "Content-Type": "application/vnd.api+json",
+          Authorization: `Bearer ${env.lemonSqueezyApiKey}`,
+        },
+        body: JSON.stringify({
+          data: {
+            type: "subscriptions",
+            id: String(live.externalId),
+            attributes: {
+              variant_id: Number(targetVariant),
+              // Upgrade: charge the prorated difference now. Downgrade: no charge
+              // now, just the new price next renewal (disable_prorations overrides
+              // invoice_immediately, so the two are mutually exclusive by design).
+              ...(isUpgrade ? { invoice_immediately: true } : { disable_prorations: true }),
+            },
+          },
+        }),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      console.error("[subscription] Lemon Squeezy unreachable:", err instanceof Error ? err.message : err);
+      throw badRequest("Could not reach the payment provider. Please try again.");
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!response.ok) {
+      const why = await readLemonSqueezyError(response);
+      console.error(
+        `[subscription] Lemon Squeezy refused to change ${live.externalId} to ${plan}: ` +
+          `HTTP ${response.status} — ${why}`,
+      );
+      throw badRequest(`Could not change the plan — ${why}`);
+    }
+
+    // Best-effort read of the new renewal date so the UI can say when the change
+    // lands (immediately for an upgrade, at renews_at for a downgrade). The
+    // webhook is still the writer.
+    let renewsAt: string | null = null;
+    try {
+      const body = (await response.json()) as {
+        data?: { attributes?: { renews_at?: string | null } };
+      };
+      renewsAt = body.data?.attributes?.renews_at ?? null;
+    } catch {
+      /* the change still happened */
+    }
+
+    res.status(202).json({ ok: true, plan, immediate: isUpgrade, renewsAt });
   }),
 );

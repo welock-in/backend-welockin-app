@@ -368,3 +368,116 @@ test("GET /subscription flags a cancelled-but-live row as reactivatable", async 
   assert.equal(res.body.subscription.reactivatable, true);
   assert.equal(res.body.subscription.cancellable, false);
 });
+
+/* ── Change plan (monthly ↔ yearly) ─────────────────────────────────────── */
+
+const liveMonthly = {
+  externalId: "77001",
+  status: "active",
+  validUntil: new Date(Date.now() + 20 * 86_400_000),
+  variantId: "1986433", // env.lemonSqueezyVariantMonthly (configured() sets this)
+};
+const liveYearly = {
+  externalId: "77002",
+  status: "active",
+  validUntil: new Date(Date.now() + 300 * 86_400_000),
+  variantId: "1986420", // env.lemonSqueezyVariantYearly
+};
+
+function configuredVariants(t: Ctx) {
+  configured(t, {
+    lemonSqueezyApiKey: "test-key",
+    lemonSqueezyVariantMonthly: "1986433",
+    lemonSqueezyVariantYearly: "1986420",
+    lemonSqueezyVariantId: "1960881",
+  });
+}
+
+test("upgrading monthly→yearly PATCHes the new variant and charges now", async (t) => {
+  configuredVariants(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [liveMonthly]);
+  let init: any = null;
+  let url = "";
+  stubFetch(t, async (u: string, i: any) => {
+    url = u;
+    init = i;
+    return { ok: true, status: 200, json: async () => ({ data: { attributes: { renews_at: "2027-01-01T00:00:00.000Z" } } }) };
+  });
+
+  const res = await request(app).post("/api/subscription/change-plan").set(auth).send({ plan: "yearly" });
+
+  assert.equal(res.status, 202);
+  assert.equal(init.method, "PATCH");
+  assert.ok(url.endsWith("/v1/subscriptions/77001"), url);
+  const sent = JSON.parse(init.body);
+  assert.equal(sent.data.attributes.variant_id, 1986420);
+  assert.equal(sent.data.attributes.invoice_immediately, true, "an upgrade charges the prorated difference now");
+  assert.ok(!("disable_prorations" in sent.data.attributes), "upgrade must not disable prorations");
+  assert.equal(res.body.immediate, true);
+});
+
+test("downgrading yearly→monthly switches at renewal without charging now", async (t) => {
+  configuredVariants(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [liveYearly]);
+  let init: any = null;
+  stubFetch(t, async (_u: string, i: any) => {
+    init = i;
+    return { ok: true, status: 200, json: async () => ({}) };
+  });
+
+  const res = await request(app).post("/api/subscription/change-plan").set(auth).send({ plan: "monthly" });
+
+  assert.equal(res.status, 202);
+  const sent = JSON.parse(init.body);
+  assert.equal(sent.data.attributes.variant_id, 1986433);
+  assert.equal(sent.data.attributes.disable_prorations, true, "a downgrade bills the new price next renewal, no charge now");
+  assert.ok(!("invoice_immediately" in sent.data.attributes), "downgrade must not invoice immediately");
+  assert.equal(res.body.immediate, false);
+});
+
+test("changing plan is refused while on trial (pay now first)", async (t) => {
+  configuredVariants(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    { externalId: "77001", status: "on_trial", validUntil: new Date(Date.now() + 3 * 86_400_000), variantId: "1986433" },
+  ]);
+  let called = false;
+  stubFetch(t, async () => {
+    called = true;
+    return { ok: true, status: 200, json: async () => ({}) };
+  });
+
+  const res = await request(app).post("/api/subscription/change-plan").set(auth).send({ plan: "yearly" });
+
+  assert.equal(res.status, 409);
+  assert.equal(called, false, "Lemon Squeezy is never called for an on-trial change");
+});
+
+test("changing to the plan you already have is refused", async (t) => {
+  configuredVariants(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [liveMonthly]);
+  stubFetch(t, async () => ({ ok: true, status: 200, json: async () => ({}) }));
+
+  const res = await request(app).post("/api/subscription/change-plan").set(auth).send({ plan: "monthly" });
+
+  assert.equal(res.status, 409);
+});
+
+test("changing plan comes from the token, never the request body", async (t) => {
+  configuredVariants(t);
+  const finds = stubMethod(t, prisma.subscription as any, "findMany", async () => [liveMonthly]);
+  stubFetch(t, async () => ({ ok: true, status: 200, json: async () => ({}) }));
+
+  await request(app).post("/api/subscription/change-plan").set(auth).send({ plan: "yearly", subscriptionId: "99999" });
+
+  assert.equal(finds[0][0].where.userId, userId);
+});
+
+test("change-plan rejects a plan that is not monthly or yearly (no lifetime here)", async (t) => {
+  configuredVariants(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [liveMonthly]);
+  stubFetch(t, async () => ({ ok: true, status: 200, json: async () => ({}) }));
+
+  const res = await request(app).post("/api/subscription/change-plan").set(auth).send({ plan: "lifetime" });
+
+  assert.equal(res.status, 400, "lifetime is a checkout, not a variant swap");
+});

@@ -70,6 +70,14 @@ export type SignedTransaction = {
   originalPurchaseDate?: number;
   type?: string;
   environment?: string;
+  /** Auto-renewable subscriptions only: when the paid/trial period ends, ms
+   *  epoch on Apple's clock. Each renewal arrives as a new transaction whose
+   *  `expiresDate` is one period later — the server's `validUntil` follows it. */
+  expiresDate?: number;
+  /** Present when a discount governed THIS period. 1 = introductory offer —
+   *  which for our products can only be the free trial configured in App Store
+   *  Connect, so `offerType === 1` is what "on trial" looks like on the wire. */
+  offerType?: number;
   /** Present when Apple has refunded/revoked it; access must stop. */
   revocationDate?: number;
   revocationReason?: number;
@@ -176,6 +184,8 @@ export function verifySignedTransaction(jws: string, now = new Date()): SignedTr
     originalPurchaseDate: num("originalPurchaseDate"),
     type: str("type"),
     environment: str("environment"),
+    expiresDate: num("expiresDate"),
+    offerType: num("offerType"),
     revocationDate: num("revocationDate"),
     revocationReason: num("revocationReason"),
   };

@@ -14,9 +14,9 @@ import {
 } from "../lib/http-error";
 import {
   APP_STORE,
-  LIFETIME_PRODUCT_ID,
-  TRIAL_PRODUCT_ID,
+  KNOWN_PRODUCT_IDS,
   purchaseEffect,
+  type SubscriptionInterval,
 } from "../lib/entitlement";
 import { InvalidTransaction, verifySignedTransaction } from "../lib/apple-jws";
 import { assertCanWrite } from "../lib/purchase-providers";
@@ -101,9 +101,7 @@ purchasesRouter.post(
 
     // Someone else's app, or a transaction lifted from another bundle.
     if (tx.bundleId !== env.appleBundleId) throw transactionForeign();
-    if (tx.productId !== TRIAL_PRODUCT_ID && tx.productId !== LIFETIME_PRODUCT_ID) {
-      throw transactionUnknownProduct();
-    }
+    if (!KNOWN_PRODUCT_IDS.has(tx.productId)) throw transactionUnknownProduct();
 
     // A SANDBOX transaction is signed by the same Apple chain as a real one, and
     // carries the real bundle id and the real product id — every check above
@@ -132,6 +130,8 @@ purchasesRouter.post(
         productId: tx.productId,
         purchaseDate: tx.purchaseDate,
         revoked: tx.revocationDate != null,
+        expiresDate: tx.expiresDate,
+        offerType: tx.offerType,
       },
       env.trialDays,
     );
@@ -140,6 +140,8 @@ purchasesRouter.post(
       await recordLifetime(userId, tx, effect.refunded, effect.plan);
     } else if (effect.kind === "trial") {
       await claimTrial(userId, tx.originalTransactionId, deviceId, idfv, effect);
+    } else if (effect.kind === "subscription") {
+      await recordSubscription(userId, tx, effect);
     }
 
     // One resolver for every path, so this response and the one the client gets
@@ -187,6 +189,95 @@ async function recordLifetime(
   // Denormalized mirror for the desktop clients and GET /api/me, which have always
   // read `plan`. Best-effort: the Purchase row above is the authority.
   await prisma.user.update({ where: { id: userId }, data: { plan } }).catch(() => {});
+}
+
+/**
+ * Record (or advance) an Apple auto-renewable subscription.
+ *
+ * ONE row per Apple subscription, keyed on `originalTransactionId` — Apple keeps
+ * it constant across every renewal, so a renewal is an UPDATE that moves
+ * `validUntil` one period forward, not a second row. `@@unique([provider,
+ * externalId])` is both the idempotency key and the concurrency lock.
+ *
+ * FORWARD-ONLY, with one exception. StoreKit replays every unfinished
+ * transaction on every launch, and Restore replays the whole history — so this
+ * function routinely sees transactions OLDER than the row (the original trial
+ * transaction arriving after three renewals). Writing those would rewind
+ * `validUntil` and resurrect `on_trial`, so a non-revoked write only lands when
+ * its `validUntil` is strictly ahead of the row's. The exception is a
+ * REVOCATION (refund): it arrives as a replay of a transaction we have already
+ * seen, its dates prove nothing, and it must always win — `expired` is the one
+ * status `subscriptionGrants` never grants on.
+ *
+ * The row keeps its FIRST owner. A second account restoring the same Apple ID's
+ * subscription updates the shared row's dates but never reassigns it — exactly
+ * how the lifetime `Purchase` behaves, and for the same reason: letting a
+ * replay move a licence between accounts would let one paid Apple ID serve any
+ * number of accounts in turn.
+ */
+async function recordSubscription(
+  userId: string,
+  tx: { originalTransactionId: string; productId: string; purchaseDate: number },
+  effect: {
+    interval: SubscriptionInterval;
+    status: "on_trial" | "active" | "expired";
+    validUntil: Date | null;
+  },
+): Promise<void> {
+  const change = {
+    status: effect.status,
+    validUntil: effect.validUntil,
+    interval: effect.interval,
+    variantId: tx.productId,
+    // Apple's own clock for the transaction that produced this state — the
+    // support-facing ordering hint, same role providerUpdatedAt plays for
+    // Lemon Squeezy webhooks.
+    providerUpdatedAt: new Date(tx.purchaseDate),
+    // The two informational date columns, kept in step with validUntil so a
+    // support reading of the row matches what the resolver will do.
+    trialEndsAt: effect.status === "on_trial" ? effect.validUntil : null,
+    renewsAt: effect.status === "active" ? effect.validUntil : null,
+  };
+
+  try {
+    await prisma.subscription.create({
+      data: {
+        userId,
+        provider: APP_STORE,
+        externalId: tx.originalTransactionId,
+        ...change,
+      },
+    });
+    return;
+  } catch (err) {
+    // The row exists — a replay, a renewal, or the concurrent twin of this very
+    // request. Fall through to the guarded update; anything else is real.
+    if (!isDuplicateKey(err)) throw err;
+  }
+
+  if (effect.status === "expired") {
+    // Revocation always lands. No date guard: a refund's replay carries the
+    // same old dates as the purchase it refunds.
+    await prisma.subscription.updateMany({
+      where: { provider: APP_STORE, externalId: tx.originalTransactionId },
+      data: change,
+    });
+    return;
+  }
+
+  await prisma.subscription.updateMany({
+    where: {
+      provider: APP_STORE,
+      externalId: tx.originalTransactionId,
+      // Strictly-forward: a replayed old transaction must never rewind the
+      // window or resurrect `on_trial` after a paid renewal. A row already
+      // marked expired by a revocation has validUntil in the past, so a
+      // genuinely NEWER period (Apple re-subscribing the same original id)
+      // still advances it — which is the correct outcome for a re-subscribe.
+      OR: [{ validUntil: null }, { validUntil: { lt: effect.validUntil ?? new Date(0) } }],
+    },
+    data: change,
+  });
 }
 
 /**

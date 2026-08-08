@@ -91,3 +91,79 @@ test("precedence: active purchase beats comp beats trial", () => {
   );
   assert.equal(v.status, "active");
 });
+
+/* ── purchaseEffect: the Apple subscriptions ─────────────────────────────── */
+
+// Imported lazily here so the block above keeps its original imports untouched.
+import {
+  MONTHLY_PRODUCT_ID,
+  YEARLY_PRODUCT_ID,
+  purchaseEffect,
+} from "./entitlement";
+
+const T0 = Date.parse("2026-08-01T10:00:00.000Z");
+const T3D = Date.parse("2026-08-04T10:00:00.000Z");
+const T1Y = Date.parse("2027-08-01T10:00:00.000Z");
+
+test("monthly transaction under an introductory offer → on_trial until expiresDate", () => {
+  const e = purchaseEffect(
+    { productId: MONTHLY_PRODUCT_ID, purchaseDate: T0, revoked: false, expiresDate: T3D, offerType: 1 },
+    14,
+  );
+  assert.deepEqual(e, {
+    kind: "subscription",
+    interval: "monthly",
+    status: "on_trial",
+    validUntil: new Date(T3D),
+  });
+});
+
+test("yearly renewal (no offer) → active until expiresDate", () => {
+  const e = purchaseEffect(
+    { productId: YEARLY_PRODUCT_ID, purchaseDate: T0, revoked: false, expiresDate: T1Y },
+    14,
+  );
+  assert.deepEqual(e, {
+    kind: "subscription",
+    interval: "yearly",
+    status: "active",
+    validUntil: new Date(T1Y),
+  });
+});
+
+test("a revoked subscription is expired even though its period is still ahead", () => {
+  // A refund arrives as a replay of the same transaction with revocationDate set.
+  // Its expiresDate may be months away; access must stop anyway — `expired` is
+  // the one status subscriptionGrants never grants on, whatever the date.
+  const e = purchaseEffect(
+    { productId: YEARLY_PRODUCT_ID, purchaseDate: T0, revoked: true, expiresDate: T1Y },
+    14,
+  );
+  assert.equal(e.kind, "subscription");
+  assert.equal((e as { status: string }).status, "expired");
+});
+
+test("a subscription with no expiresDate carries a null window (grants until corrected)", () => {
+  // Should not happen on a real Apple payload, but the shape is optional — and
+  // lib/subscription.ts already decides null validUntil grants, pending the next
+  // replay. The effect must pass that decision through, not invent a date.
+  const e = purchaseEffect(
+    { productId: MONTHLY_PRODUCT_ID, purchaseDate: T0, revoked: false },
+    14,
+  );
+  assert.equal(e.kind, "subscription");
+  assert.equal((e as { validUntil: Date | null }).validUntil, null);
+});
+
+test("an active Apple subscription resolves active/isPro; on trial resolves trialing", () => {
+  const active = computeEntitlement(base({ hasActiveSubscription: true }));
+  assert.equal(active.status, "active");
+  assert.equal(active.isPro, true);
+  assert.equal(active.canStartTrial, false);
+
+  const trialing = computeEntitlement(
+    base({ hasActiveSubscription: true, subscriptionOnTrial: true }),
+  );
+  assert.equal(trialing.status, "trialing");
+  assert.equal(trialing.isPro, true);
+});

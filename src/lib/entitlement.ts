@@ -27,6 +27,32 @@
  *  IMMUTABLE — Apple never lets a Product ID change after creation. */
 export const LIFETIME_PRODUCT_ID = "in.welock.app.lifetime";
 export const TRIAL_PRODUCT_ID = "in.welock.app.trial14";
+/** The two auto-renewable subscriptions (one App Store Connect subscription
+ *  group). Their free trials — 3 days monthly, 7 days yearly — are Apple
+ *  introductory offers configured in ASC, not server state: Apple enforces
+ *  one intro offer per Apple ID per group, which is stronger than anything
+ *  we could ledger ourselves. */
+export const MONTHLY_PRODUCT_ID = "in.welock.app.monthly";
+export const YEARLY_PRODUCT_ID = "in.welock.app.yearly";
+
+export type SubscriptionInterval = "monthly" | "yearly";
+
+/** productId → interval, and the ONLY list that decides whether a product id is
+ *  one of our subscriptions. `Subscription.interval` is written from it. */
+export const APPLE_SUBSCRIPTION_INTERVALS: Readonly<Record<string, SubscriptionInterval>> = {
+  [MONTHLY_PRODUCT_ID]: "monthly",
+  [YEARLY_PRODUCT_ID]: "yearly",
+};
+
+/** Every product id POST /api/purchases may accept. Anything else is
+ *  TRANSACTION_UNKNOWN_PRODUCT — including products we once sold and dropped,
+ *  which must keep verifying here if they ever granted anything. */
+export const KNOWN_PRODUCT_IDS: ReadonlySet<string> = new Set([
+  TRIAL_PRODUCT_ID,
+  LIFETIME_PRODUCT_ID,
+  MONTHLY_PRODUCT_ID,
+  YEARLY_PRODUCT_ID,
+]);
 
 /**
  * `User.plan` values. This column is a DENORMALIZED MIRROR, never the authority:
@@ -96,6 +122,21 @@ export interface EntitlementView {
    * useless.
    */
   billingUrl?: string | null;
+  /**
+   * What is GRANTING right now: `lifetime` for a live one-time purchase,
+   * `monthly` / `yearly` for a live subscription, null for everything else
+   * (machine trial, comp, or no access). The client renders its badge and its
+   * plan-aware copy from this — never from productId, which predates plans.
+   */
+  plan?: SubscriptionInterval | "lifetime" | null;
+  /**
+   * When the granting subscription's CURRENT period ends (trial or paid), ISO on
+   * the server clock. Null for lifetime/comp/machine-trial. The client's offline
+   * clock counts down against it exactly as it does against `trialEndsAt`: a
+   * cached "active" subscription must NOT outlive its paid period just because
+   * the phone stayed offline — see the app's lib/entitlement-clock.ts.
+   */
+  validUntil?: string | null;
   /**
    * Has this account EVER held access — a purchase, a subscription, or a trial
    * window that was actually claimed?
@@ -205,6 +246,10 @@ export type PurchaseFacts = {
   /** Apple's clock, ms epoch. Never the phone's. */
   purchaseDate: number;
   revoked: boolean;
+  /** Subscriptions only: when this transaction's period ends, ms epoch. */
+  expiresDate?: number;
+  /** Subscriptions only: 1 = introductory offer = our free trial. */
+  offerType?: number;
 };
 
 export type PurchaseEffect =
@@ -214,6 +259,16 @@ export type PurchaseEffect =
   /** The Tier-0 trial. Becomes a `TrialClaim`; the window comes from APPLE's
    *  purchase date, so a phone with a wound-forward clock gains nothing. */
   | { kind: "trial"; startedAt: Date; endsAt: Date }
+  /** Monthly/yearly auto-renewable. Becomes (or advances) a `Subscription` row;
+   *  `validUntil` is APPLE's `expiresDate`, so access ends when the paid period
+   *  does regardless of what the phone's clock claims. `status` speaks
+   *  lib/subscription.ts's vocabulary so `subscriptionGrants` needs no new case. */
+  | {
+      kind: "subscription";
+      interval: SubscriptionInterval;
+      status: "on_trial" | "active" | "expired";
+      validUntil: Date | null;
+    }
   /** A product we do not sell, or a revoked trial — record nothing at all. */
   | { kind: "ignored" };
 
@@ -234,6 +289,19 @@ export function purchaseEffect(facts: PurchaseFacts, trialDays: number): Purchas
       kind: "lifetime",
       refunded: facts.revoked,
       plan: facts.revoked ? PLAN.refunded : PLAN.lifetime,
+    };
+  }
+  const interval = APPLE_SUBSCRIPTION_INTERVALS[facts.productId];
+  if (interval) {
+    return {
+      kind: "subscription",
+      interval,
+      // A refund/revocation arrives as a REPLAY of the same transaction carrying
+      // `revocationDate` — it must kill access even though its `expiresDate` may
+      // still be ahead, and `expired` is the one status subscriptionGrants never
+      // grants on, whatever the date says.
+      status: facts.revoked ? "expired" : facts.offerType === 1 ? "on_trial" : "active",
+      validUntil: facts.expiresDate != null ? new Date(facts.expiresDate) : null,
     };
   }
   if (facts.productId !== TRIAL_PRODUCT_ID) return { kind: "ignored" };

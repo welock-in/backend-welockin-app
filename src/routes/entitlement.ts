@@ -15,6 +15,7 @@ import {
   LIFETIME_PRODUCT_ID,
   computeEntitlement,
   type EntitlementView,
+  type SubscriptionInterval,
 } from "../lib/entitlement";
 
 /* ─────────────────────────────────────────────────────────────
@@ -83,6 +84,9 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
       select: {
         status: true,
         validUntil: true,
+        // "monthly" | "yearly" — written by both the Lemon Squeezy webhook and
+        // POST /api/purchases, read back as the view's `plan`.
+        interval: true,
         // For `billingUrl` below. Both are refreshed on every webhook because
         // Lemon Squeezy signs them with an expiry.
         customerPortalUrl: true,
@@ -98,9 +102,11 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     user.compActive === true &&
     (user.compedUntil == null || user.compedUntil.getTime() > now.getTime());
 
+  const hasLifetime = purchases.some((p) => !p.isRefunded);
+
   const view = computeEntitlement({
     now,
-    hasActivePurchase: purchases.some((p) => !p.isRefunded),
+    hasActivePurchase: hasLifetime,
     hasActiveSubscription: subs.some((sub) => subscriptionGrants(sub, now)),
     // Only when the granting one is the trial. A customer with a live paid
     // subscription AND an old lapsed trial row must not read as trialing.
@@ -146,6 +152,18 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   const liveSub = subs.find((sub) => subscriptionGrants(sub, now));
   const billingUrl = liveSub?.customerPortalUrl ?? liveSub?.updatePaymentUrl ?? null;
 
+  // What actually GRANTS, mirroring the resolver's precedence: the lifetime
+  // purchase outranks a live subscription, and a subscription's window only
+  // binds the client's offline countdown when the subscription is the granter.
+  // A comped or machine-trial user has no plan and no validUntil — their
+  // window is `trialEndsAt`, which the client already counts down against.
+  const grantingSub = view.isPro && !hasLifetime ? liveSub : null;
+  const plan: SubscriptionInterval | "lifetime" | null = !view.isPro
+    ? null
+    : hasLifetime
+      ? "lifetime"
+      : ((grantingSub?.interval as SubscriptionInterval | null | undefined) ?? null);
+
   const trialSub = subs.find((sub) => sub.status === "on_trial" && subscriptionGrants(sub, now));
   const grantingUntil = trialSub ? (trialSub.validUntil ?? null) : view.trialEndsAt ? new Date(view.trialEndsAt) : null;
 
@@ -157,6 +175,8 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
 
   return {
     ...view,
+    plan,
+    validUntil: grantingSub?.validUntil?.toISOString() ?? null,
     billingUrl,
     everHadAccess,
     receipt: issueReceipt({

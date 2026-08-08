@@ -205,7 +205,12 @@ async function handle(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
     return { status: "failed", reason: `no account matches order ${order.orderId}` };
   }
 
-  await recordPaidOrder(order, userId, body as Prisma.InputJsonValue);
+  const wrote = await recordPaidOrder(order, userId, body as Prisma.InputJsonValue);
+  if (wrote === "already-consumed") {
+    // Terminal, not retryable: this order was already turned into a grant once
+    // and the account that held it is gone. Redelivering it changes nothing.
+    return { status: "skipped", reason: `order ${order.orderId} was already consumed` };
+  }
   return { status: "processed" };
 }
 
@@ -214,12 +219,30 @@ async function handle(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
  * POST /api/checkout/confirm for the same reason `mirrorSubscriptionState` is:
  * two activation paths writing the same row must write it the same way, or
  * whichever runs second corrupts what the first recorded.
+ *
+ * Returns "already-consumed" when this order has been turned into a grant before
+ * but no live Purchase exists for it — i.e. the buyer deleted their account and
+ * the row cascaded away. An order can be owned once, ever (see ConsumedOrder):
+ * without this, whoever next takes over the freed email could re-confirm it for
+ * a free licence.
  */
 export async function recordPaidOrder(
   order: ParsedOrder,
   userId: string,
   rawEvent: Prisma.InputJsonValue,
-): Promise<void> {
+): Promise<"written" | "already-consumed"> {
+  const existing = await prisma.purchase.findUnique({
+    where: { provider_externalId: { provider: PROVIDER, externalId: order.orderId } },
+    select: { id: true },
+  });
+  if (!existing) {
+    const consumed = await prisma.consumedOrder.findUnique({
+      where: { provider_externalId: { provider: PROVIDER, externalId: order.orderId } },
+      select: { id: true },
+    });
+    if (consumed) return "already-consumed";
+  }
+
   await prisma.purchase.upsert({
     where: { provider_externalId: { provider: PROVIDER, externalId: order.orderId } },
     create: {
@@ -242,6 +265,25 @@ export async function recordPaidOrder(
     // MOVE the licence to another account. Same rule as the subscription upsert.
     update: { priceUsd: order.priceUsd, rawEvent },
   });
+
+  // The tombstone that outlives the account. Idempotent, and only on the first
+  // write (existing===null): a replay of a live order finds its Purchase and
+  // skips this. Never deleted, never cascaded — that is the whole point.
+  if (!existing) await markOrderConsumed(order.orderId, "order");
+  return "written";
+}
+
+/** Record that an order/subscription has been turned into a grant, once, for ever. */
+async function markOrderConsumed(externalId: string, kind: "order" | "subscription"): Promise<void> {
+  await prisma.consumedOrder
+    .upsert({
+      where: { provider_externalId: { provider: PROVIDER, externalId } },
+      create: { provider: PROVIDER, externalId, kind },
+      update: {},
+    })
+    // Best-effort: the grant itself has already landed. A missing tombstone only
+    // re-opens the narrow post-deletion re-mint window, and is logged loudly.
+    .catch((e) => console.error(`[lemonsqueezy] could not record consumed ${kind} ${externalId}:`, e));
 }
 
 /**
@@ -504,6 +546,13 @@ async function handleSubscription(
     // the same question again and get the same answer.
     return { status: "skipped", reason: "stale event — a newer state is already recorded" };
   }
+  if (wrote === "already-consumed") {
+    // This subscription was mirrored before and the account that held it is gone
+    // (deleted). A later event arriving now — a renewal on the original card,
+    // say — must not silently re-create the row under whoever inherited the
+    // email. Terminal: an ended account is not a customer.
+    return { status: "skipped", reason: `subscription ${sub.subscriptionId} was already consumed` };
+  }
   return { status: "processed" };
 }
 
@@ -521,7 +570,7 @@ export async function mirrorSubscriptionState(
   sub: ParsedSubscription,
   userId: string,
   rawEvent: Prisma.InputJsonValue,
-): Promise<"written" | "stale"> {
+): Promise<"written" | "stale" | "already-consumed"> {
   const validUntil = validUntilFrom(sub);
   const data = {
     status: sub.status,
@@ -567,12 +616,23 @@ export async function mirrorSubscriptionState(
       select: { id: true },
     });
     if (existing) return "stale";
+    // About to CREATE a fresh row. If this subscription was already mirrored once
+    // and its row is gone, the account that owned it was deleted — do not re-mint
+    // it for whoever now holds the email. An order/subscription is owned once.
+    const consumed = await prisma.consumedOrder.findUnique({
+      where: { provider_externalId: { provider: PROVIDER, externalId: sub.subscriptionId } },
+      select: { id: true },
+    });
+    if (consumed) return "already-consumed";
     try {
       // `userId` is set HERE and never in an update: a later event whose custom
       // data named a different account must not MOVE the subscription.
       await prisma.subscription.create({
         data: { userId, provider: PROVIDER, externalId: sub.subscriptionId, ...data },
       });
+      // The tombstone that outlives the account (see ConsumedOrder). Only on the
+      // create path — updates find the row and never reach here.
+      await markOrderConsumed(sub.subscriptionId, "subscription");
     } catch (err) {
       // A racing instance created the row between our updateMany and create.
       // Re-run the conditional update once, against the row that now exists,

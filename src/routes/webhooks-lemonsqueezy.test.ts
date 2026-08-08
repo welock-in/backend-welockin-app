@@ -86,11 +86,18 @@ function stubDb(t: Ctx, overrides: Record<string, (...args: any[]) => any> = {})
     // The subscription write path: conditional updateMany, then create when no
     // row matched. Baseline mirrors "nothing exists yet": count 0, create lands.
     subWrite: stubMethod(t, prisma.subscription as any, "updateMany", pick("subWrite", async () => ({ count: 0 }))),
+    subFind: stubMethod(t, prisma.subscription as any, "findUnique", pick("subFind", async () => null)),
     subCreate: stubMethod(t, prisma.subscription as any, "create", pick("subCreate", async () => ({}))),
     purchaseUpsert: stubMethod(t, prisma.purchase as any, "upsert", pick("purchaseUpsert", async () => ({}))),
     purchaseFind: stubMethod(t, prisma.purchase as any, "findUnique", pick("purchaseFind", async () => null)),
     purchaseUpdate: stubMethod(t, prisma.purchase as any, "update", pick("purchaseUpdate", async () => ({}))),
     purchaseCreate: stubMethod(t, prisma.purchase as any, "create", pick("purchaseCreate", async () => ({}))),
+    // The consumed-order tombstone (recordPaidOrder / mirrorSubscriptionState):
+    // baseline = "never consumed before", so the grant proceeds and the upsert
+    // is a no-op recorder. A test that wants the re-mint-refused path overrides
+    // consumedFind to return a row.
+    consumedFind: stubMethod(t, prisma.consumedOrder as any, "findUnique", pick("consumedFind", async () => null)),
+    consumedUpsert: stubMethod(t, prisma.consumedOrder as any, "upsert", pick("consumedUpsert", async () => ({}))),
     userFind: stubMethod(t, prisma.user as any, "findUnique", pick("userFind", async () => ({ id: USER }))),
     userFirst: stubMethod(t, prisma.user as any, "findFirst", pick("userFirst", async () => null)),
   };
@@ -206,6 +213,32 @@ test("a paid order for our variant grants the licence to the account the checkou
   // A replayed order_created must not resurrect a refunded licence.
   assert.ok(!("isRefunded" in arg.update));
   assert.equal(finalStatus(db.eventMark), "processed");
+  // First grant records the consumed-order tombstone so it can never mint twice.
+  assert.equal(db.consumedUpsert.length, 1);
+  assert.equal(db.consumedUpsert[0][0].create.externalId, "9001");
+});
+
+/*
+ * The recycled-email re-mint the audit found (2026-08-08): a buyer deletes their
+ * account (Purchase cascades away), the email is freed, and a webhook redelivery
+ * — or the /confirm path — would otherwise mint the licence again for whoever
+ * now holds the email. The ConsumedOrder tombstone survives the deletion, so a
+ * grant with no live Purchase for a spent order is refused, terminally.
+ */
+test("a spent order is never re-minted after its account was deleted", async (t) => {
+  configured(t);
+  const db = stubDb(t, {
+    // The purchase row is gone (account deleted)…
+    purchaseFind: async () => null,
+    // …but the consumption tombstone remains.
+    consumedFind: async () => ({ id: "consumed-9001" }),
+  });
+
+  const res = await deliver(orderBody());
+
+  assert.equal(res.status, 200, "still 200 — Lemon Squeezy must not retry forever");
+  assert.equal(db.purchaseUpsert.length, 0, "no new grant is written");
+  assert.equal(finalStatus(db.eventMark), "skipped");
 });
 
 /*

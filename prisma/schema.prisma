@@ -741,6 +741,32 @@ model Subscription {
   @@index([userId, status])
 }
 
+/// A payment we have ALREADY turned into a grant — recorded so it can never
+/// mint a second one, even after the account that made it is gone.
+///
+/// WHY IT EXISTS, and why it is NOT just the Purchase/Subscription row. Those
+/// carry a `userId` and cascade-delete with the account (schema onDelete:
+/// Cascade + the explicit sweep in routes/me.ts). So after a paying customer
+/// deletes their account, the `(provider, externalId)` uniqueness that stopped
+/// a second grant is GONE with the row — and because `EMAIL_VERIFICATION_ENFORCED`
+/// can be off, whoever next takes over that freed email can re-`/confirm` the
+/// old order and mint a fresh free licence (audit 2026-08-08, MEDIUM). This
+/// ledger has NO user relation, so `prisma.user.delete` never touches it: the
+/// consumption outlives the account, and a re-confirm of a spent order is
+/// refused. An order can be owned once, ever.
+model ConsumedOrder {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  provider   String
+  /// The storefront's order/subscription id — the same value Purchase/Subscription
+  /// key on, so the two agree on what "this order" means.
+  externalId String
+  /// "order" | "subscription" — for support, never for logic.
+  kind       String
+  consumedAt DateTime @default(now())
+
+  @@unique([provider, externalId])
+}
+
 /// The anti-abuse ledger: one free trial per MACHINE, forever.
 ///
 /// This model exists because the previous answer — stamping `User.trialEndsAt`

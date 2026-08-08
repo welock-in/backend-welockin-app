@@ -64,6 +64,37 @@ meRouter.delete(
       .updateMany({ where: { firstUserId: userId }, data: { firstUserId: null } })
       .catch(() => undefined);
 
+    // Same asymmetry for PAID orders. The Purchase/Subscription rows carry the
+    // buyer's identity and cascade away with the account below — but a payment,
+    // once turned into a grant, must never mint a second one, and after deletion
+    // the (provider, externalId) uniqueness that guaranteed that is gone with the
+    // row. So before the cascade, leave an identity-free tombstone keyed on the
+    // order id: whoever next takes over this freed email cannot re-confirm the
+    // old order for a free licence (audit 2026-08-08). New grants already write
+    // this at purchase time; this covers the rows that predate the ledger.
+    const [oldPurchases, oldSubs] = await Promise.all([
+      prisma.purchase.findMany({ where: { userId }, select: { provider: true, externalId: true } }),
+      prisma.subscription.findMany({ where: { userId }, select: { provider: true, externalId: true } }),
+    ]);
+    for (const p of oldPurchases) {
+      await prisma.consumedOrder
+        .upsert({
+          where: { provider_externalId: { provider: p.provider, externalId: p.externalId } },
+          create: { provider: p.provider, externalId: p.externalId, kind: "order" },
+          update: {},
+        })
+        .catch(() => undefined);
+    }
+    for (const s of oldSubs) {
+      await prisma.consumedOrder
+        .upsert({
+          where: { provider_externalId: { provider: s.provider, externalId: s.externalId } },
+          create: { provider: s.provider, externalId: s.externalId, kind: "subscription" },
+          update: {},
+        })
+        .catch(() => undefined);
+    }
+
     // Break has NO User back-relation, so nothing cascades it: its deletion must
     // actually succeed, or a transient failure would leave rows orphaned to a
     // deleted user — a data-deletion gap. Fail loud (→ 500 → the client retries;

@@ -275,3 +275,96 @@ test("an account with only expired rows reports no subscription", async (t) => {
 
   assert.equal(res.body.subscription, null);
 });
+
+/*
+ * Reactivate = un-cancel during the paid-through window (the gap the audit and
+ * the subscription-map both flagged). It must PATCH cancelled:false at Lemon
+ * Squeezy, work only on a cancelled-but-still-granting row, and be found from
+ * the token like every other money action.
+ */
+test("reactivating a cancelled-but-live subscription patches cancelled:false", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    { externalId: "77001", status: "cancelled", validUntil: new Date(Date.now() + 10 * 86_400_000), endsAt: new Date(Date.now() + 10 * 86_400_000) },
+  ]);
+
+  let url = "";
+  let method = "";
+  let sentBody: any = null;
+  stubFetch(t, async (u: string, i: any) => {
+    url = u;
+    method = i.method;
+    sentBody = JSON.parse(i.body);
+    return { ok: true, status: 200, json: async () => ({ data: { attributes: { renews_at: "2026-10-01T00:00:00.000Z" } } }) };
+  });
+
+  const res = await request(app).post("/api/subscription/reactivate").set(auth);
+
+  assert.equal(res.status, 202);
+  assert.equal(method, "PATCH");
+  assert.ok(url.endsWith("/v1/subscriptions/77001"), url);
+  assert.equal(sentBody.data.attributes.cancelled, false);
+  assert.equal(res.body.renewsAt, "2026-10-01T00:00:00.000Z");
+});
+
+test("the subscription to reactivate comes from the token, never the request", async (t) => {
+  configured(t);
+  const finds = stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    { externalId: "77001", status: "cancelled", validUntil: new Date(Date.now() + 86_400_000), endsAt: new Date(Date.now() + 86_400_000) },
+  ]);
+  stubFetch(t, async () => ({ ok: true, status: 200, json: async () => ({}) }));
+
+  await request(app).post("/api/subscription/reactivate").set(auth).send({ subscriptionId: "99999" });
+
+  assert.equal(finds[0][0].where.userId, userId);
+});
+
+test("there is nothing to reactivate on an account with no cancelled subscription", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    { externalId: "77001", status: "active", validUntil: new Date(Date.now() + 86_400_000), endsAt: null },
+  ]);
+  let called = false;
+  stubFetch(t, async () => {
+    called = true;
+    return { ok: true, status: 200, json: async () => ({}) };
+  });
+
+  const res = await request(app).post("/api/subscription/reactivate").set(auth);
+
+  assert.equal(res.status, 409);
+  assert.equal(called, false, "Lemon Squeezy is never called when there is nothing to resume");
+});
+
+test("an already-expired subscription cannot be reactivated (start a new plan instead)", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    { externalId: "77001", status: "cancelled", validUntil: new Date(Date.now() - 86_400_000), endsAt: new Date(Date.now() - 86_400_000) },
+  ]);
+  stubFetch(t, async () => ({ ok: true, status: 200, json: async () => ({}) }));
+
+  const res = await request(app).post("/api/subscription/reactivate").set(auth);
+
+  // Past ends_at the row no longer grants, so subscriptionGrants filters it out
+  // and there is nothing resumable — a clean 409, not a provider error.
+  assert.equal(res.status, 409);
+});
+
+test("GET /subscription flags a cancelled-but-live row as reactivatable", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    {
+      status: "cancelled",
+      interval: "yearly",
+      validUntil: new Date(Date.now() + 5 * 86_400_000),
+      trialEndsAt: null,
+      renewsAt: null,
+      endsAt: new Date(Date.now() + 5 * 86_400_000),
+    },
+  ]);
+
+  const res = await request(app).get("/api/subscription").set(auth);
+
+  assert.equal(res.body.subscription.reactivatable, true);
+  assert.equal(res.body.subscription.cancellable, false);
+});

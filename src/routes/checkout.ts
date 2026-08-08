@@ -11,11 +11,11 @@ import {
   suggestVariantForPlan,
   type LemonSqueezyWebhook,
 } from "../lib/lemonsqueezy";
-import { consumeRateLimit } from "../lib/rate-limit";
+import { clientIp, consumeRateLimit } from "../lib/rate-limit";
 import { readDeviceId } from "../lib/device";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
-import { accountGone, conflict, badRequest, forbidden, notFound } from "../lib/http-error";
+import { accountGone, conflict, badRequest, notFound } from "../lib/http-error";
 import { mirrorSubscriptionState, recordPaidOrder } from "./webhooks-lemonsqueezy";
 import { resolveAndCache } from "./entitlement";
 
@@ -68,6 +68,13 @@ checkoutRouter.post(
     }
 
     const userId = req.user!.id;
+    // Minting a checkout is an authenticated outbound LS call; without a cap a
+    // loop here drains the shared API-key quota and self-DoSes the payment path.
+    // Generous enough that a human clicking Buy never meets it; the IP leg is the
+    // anti-farm cap since accounts are cheap.
+    await consumeRateLimit(`checkout:${userId}`, 30, 5 * 60_000);
+    await consumeRateLimit(`checkout:ip:${clientIp(req)}`, 60, 5 * 60_000);
+
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: { email: true },
@@ -292,7 +299,10 @@ checkoutRouter.post(
     // Bounded: every hit is 1-2 outbound LS calls, the desktop retries for a
     // minute by design, and LS rate-limits our key — 60/5min absorbs the whole
     // retry burst several times over without letting a loop drain the quota.
+    // The IP leg is the anti-farm cap: accounts are cheap, so a per-user limit
+    // alone lets one host multiply the outbound rate by spinning up accounts.
     await consumeRateLimit(`checkout-confirm:${userId}`, 60, 5 * 60_000);
+    await consumeRateLimit(`checkout-confirm:ip:${clientIp(req)}`, 120, 5 * 60_000);
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -323,9 +333,32 @@ checkoutRouter.post(
     } as LemonSqueezyWebhook);
     if (!order) throw badRequest("Could not read that order.");
 
-    // Same wording as a true 404 ON PURPOSE: confirming that an id exists in
-    // someone else's store is information a guesser did not have.
-    if (order.storeId !== env.lemonSqueezyStoreId) throw notFound("We can't find that order.");
+    // ── The ownership gate comes FIRST, and everything below it can only ever
+    // describe the CALLER'S OWN order ──────────────────────────────────────
+    //
+    // Two checks, one answer. A guesser probing sequential order ids must not be
+    // able to tell "your order, unpaid" from "someone else's paid order" from
+    // "no such order" — that trio is an existence-and-revenue oracle. So BOTH a
+    // foreign store AND an email that is not the caller's collapse to the exact
+    // same 404 as a nonexistent order, and they are checked BEFORE the
+    // informative test-mode / status branches. The result: those helpful errors
+    // are only ever returned about an order the caller genuinely owns.
+    //
+    // The checkout prefilled the account email, so a real buyer always matches.
+    // The rare legit miss — a buyer who typed a different email over the prefill
+    // — is distinguished only in the LOG (for support), never in the response.
+    const caller = user.email.trim().toLowerCase();
+    const mine = order.storeId === env.lemonSqueezyStoreId && !!order.email && order.email === caller;
+    if (!mine) {
+      if (order.storeId === env.lemonSqueezyStoreId && order.email && order.email !== caller) {
+        console.warn(
+          `[checkout-confirm] order ${orderId} belongs to a different email than account ${userId} ` +
+            `— returning 404 (support can attach it manually)`,
+        );
+      }
+      throw notFound("We can't find that order.");
+    }
+
     if (order.testMode && !env.lemonSqueezyAllowTestMode) {
       throw badRequest("That order was made in test mode.");
     }
@@ -339,24 +372,15 @@ checkoutRouter.post(
       );
     }
 
-    // The binding. The checkout prefilled the ACCOUNT email, so in the flow we
-    // built this always matches. When it does not — someone typed a different
-    // email over the prefill, or someone is probing order ids — nothing is
-    // written, and the honest path is a human at support, not a guess here.
-    const caller = user.email.trim().toLowerCase();
-    if (!order.email || order.email !== caller) {
-      console.warn(`[checkout-confirm] order ${orderId} email does not match account ${userId}`);
-      throw forbidden(
-        "That order was paid with a different email address. Write to hello@welock.in and we'll attach it to your account.",
-      );
-    }
-
     if (order.variantId && order.variantId === env.lemonSqueezyVariantId) {
       // The lifetime licence. Refunded is checked HERE because recordPaidOrder
       // mints isRefunded:false — the webhook never meets this case (its refund
       // events revoke), but this endpoint can be called about an old order.
       if (order.refunded) throw conflict("That order was refunded.");
-      await recordPaidOrder(order, userId, orderBody as Prisma.InputJsonValue);
+      const wrote = await recordPaidOrder(order, userId, orderBody as Prisma.InputJsonValue);
+      if (wrote === "already-consumed") {
+        throw conflict("That order has already been used to activate an account.");
+      }
     } else {
       // A subscription order: the grantable object is the subscription it
       // created, so fetch THAT and mirror it — state, dates, portal URLs —
@@ -404,7 +428,10 @@ checkoutRouter.post(
       if (sub.testMode && !env.lemonSqueezyAllowTestMode) {
         throw badRequest("That order was made in test mode.");
       }
-      await mirrorSubscriptionState(sub, userId, subData as Prisma.InputJsonValue);
+      const wrote = await mirrorSubscriptionState(sub, userId, subData as Prisma.InputJsonValue);
+      if (wrote === "already-consumed") {
+        throw conflict("That subscription has already been used to activate an account.");
+      }
     }
 
     // The whole answer, receipt included, so the caller's very next paint can

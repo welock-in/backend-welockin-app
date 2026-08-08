@@ -34,6 +34,7 @@ import { adminReleasesRouter } from "./routes/admin-releases";
 import { adminNotificationsRouter } from "./routes/admin-notifications";
 import { errorHandler, notFoundHandler } from "./middleware/error";
 import { requireAuth, requireCurrentSession, requireVerifiedAccount } from "./middleware/auth";
+import { requireAdmin } from "./middleware/admin-auth";
 
 export function createApp(): Express {
   const app = express();
@@ -73,10 +74,6 @@ export function createApp(): Express {
 
   // Routes — everything under /api.
   app.use("/api/health", healthRouter);
-  // Asks Lemon Squeezy what THIS key can see. Public like the rest of /health:
-  // store names and variant ids ride in every checkout URL and every webhook,
-  // and the key itself is used, never echoed.
-  app.use("/api/health/lemonsqueezy", healthLemonSqueezyRouter);
   // Desktop auto-update manifest. PUBLIC like /api/health: a signed-out machine
   // must still be able to receive a fix.
   app.use("/api/updates", updatesRouter);
@@ -118,6 +115,13 @@ export function createApp(): Express {
   // below; a JSON API for the separate admin-dashboard app, gated by an env-cred
   // admin JWT rather than User.isAdmin, hence no `gated` here.
   app.use("/api/admin", adminRouter);
+  // Operator diagnostics: asks Lemon Squeezy what THIS key can actually see
+  // (store + variant existence — the test/live graph-swap detector). Behind the
+  // admin gate rather than public: each hit fires two AUTHENTICATED outbound LS
+  // calls, so an unauthenticated public mount was an amplification vector that
+  // could drain the shared API-key quota and fail real checkouts. Mounted under
+  // /api/admin so the admin console reaches it through its existing proxy.
+  app.use("/api/admin/health/lemonsqueezy", requireAdmin, healthLemonSqueezyRouter);
   // Addiction protection: the curated list + partner-OTP / dated lock (client),
   // and the admin CRUD + active-protection panel.
   app.use("/api/addiction-protection", addictionProtectionRouter);

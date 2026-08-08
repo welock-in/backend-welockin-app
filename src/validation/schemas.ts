@@ -292,6 +292,16 @@ export const adminLoginSchema = z.object({
 
 export const adminSetPlanSchema = z.object({
   plan: z.string().trim().min(1, "plan is required"),
+  // Optional so the existing admin UI keeps working, but recorded in the audit
+  // row when present — a plan change with a stated reason is a change someone can
+  // explain six months later.
+  reason: z.string().trim().max(500).optional(),
+});
+
+/** Suspend / unsuspend / hard-delete / cancel — every mutating admin write now
+ *  carries an optional reason that lands in the audit row. */
+export const adminActionSchema = z.object({
+  reason: z.string().trim().max(500).optional(),
 });
 
 // ── addiction protection ─────────────────────────────────────────────────────
@@ -485,6 +495,13 @@ export const adminCompSchema = z.object({
 });
 
 export const adminRevokeSchema = z.object({ reason: adminReason });
+
+export const adminCancelSubscriptionSchema = z.object({
+  reason: adminReason,
+  /** The Lemon Squeezy subscription id to cancel; verified to belong to the
+   *  account in the path so a wrong id can never cancel a stranger's plan. */
+  externalId: z.string().trim().min(1, "externalId is required"),
+});
 
 export const adminTrialResetSchema = z.object({
   reason: adminReason,

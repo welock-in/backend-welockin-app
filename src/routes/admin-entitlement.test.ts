@@ -192,10 +192,96 @@ test("a trial reset on an account with no claim is a no-op, not an error", async
   assert.equal(db.claimDelete.length, 0);
 });
 
+/* ── Admin cancel-subscription ───────────────────────────────────────── */
+
+function stubFetch(t: Ctx, impl: (...a: any[]) => any) {
+  const original = globalThis.fetch;
+  (globalThis as any).fetch = impl;
+  t.after(() => {
+    (globalThis as any).fetch = original;
+  });
+}
+
+test("admin cancel-subscription deletes at Lemon Squeezy and audits it", async (t) => {
+  const db = stubDb(t);
+  const ORIGINAL_KEY = env.lemonSqueezyApiKey;
+  (env as any).lemonSqueezyApiKey = "test-key";
+  t.after(() => {
+    (env as any).lemonSqueezyApiKey = ORIGINAL_KEY;
+  });
+  stubMethod(t, prisma.subscription as any, "findFirst", async () => ({
+    externalId: "77001",
+    status: "active",
+  }));
+  let method = "";
+  let url = "";
+  stubFetch(t, async (u: string, i: any) => {
+    method = i.method;
+    url = u;
+    return { ok: true, status: 200, json: async () => ({ data: { attributes: { ends_at: "2026-09-01T00:00:00.000Z" } } }) };
+  });
+
+  const res = await request(app)
+    .post(`/api/admin/users/${USER}/cancel-subscription`)
+    .set(auth)
+    .send({ reason: "customer asked support to cancel", externalId: "77001" });
+
+  assert.equal(res.status, 202);
+  assert.equal(method, "DELETE");
+  assert.ok(url.endsWith("/v1/subscriptions/77001"), url);
+  assert.equal(res.body.endsAt, "2026-09-01T00:00:00.000Z");
+  assert.equal(db.audit[0][0].data.action, "cancel_subscription");
+});
+
+test("admin cancel-subscription refuses an id that is not the account's", async (t) => {
+  stubDb(t);
+  const ORIGINAL_KEY = env.lemonSqueezyApiKey;
+  (env as any).lemonSqueezyApiKey = "test-key";
+  t.after(() => {
+    (env as any).lemonSqueezyApiKey = ORIGINAL_KEY;
+  });
+  // The ownership scope is in the WHERE: findFirst({userId, externalId}) misses.
+  const finds = stubMethod(t, prisma.subscription as any, "findFirst", async () => null);
+  let called = false;
+  stubFetch(t, async () => {
+    called = true;
+    return { ok: true, status: 200, json: async () => ({}) };
+  });
+
+  const res = await request(app)
+    .post(`/api/admin/users/${USER}/cancel-subscription`)
+    .set(auth)
+    .send({ reason: "wrong id on purpose", externalId: "99999" });
+
+  assert.equal(res.status, 404);
+  assert.equal(called, false, "Lemon Squeezy is never called for a non-owned id");
+  assert.equal(finds[0][0].where.userId, USER, "ownership is scoped in the query");
+});
+
+/* ── Audited writes ──────────────────────────────────────────────────── */
+
+test("set-plan is audited with before/after", async (t) => {
+  const db = stubDb(t, { userFind: async () => ({ ...USER_ROW, plan: "trial" }) });
+
+  const res = await request(app)
+    .post(`/api/admin/users/${USER}/plan`)
+    .set(auth)
+    .send({ plan: "lifetime", reason: "granted after a support call" });
+
+  assert.equal(res.status, 200);
+  assert.equal(db.audit.length, 1);
+  assert.equal(db.audit[0][0].data.action, "set_plan");
+  assert.equal(db.audit[0][0].data.after.plan, "lifetime");
+});
+
 /* ── Auth ────────────────────────────────────────────────────────────── */
 
 test("none of these are reachable without an admin token", async () => {
-  for (const path of [`/api/admin/users/${USER}/comp`, `/api/admin/users/${USER}/revoke`]) {
+  for (const path of [
+    `/api/admin/users/${USER}/comp`,
+    `/api/admin/users/${USER}/revoke`,
+    `/api/admin/users/${USER}/cancel-subscription`,
+  ]) {
     const res = await request(app).post(path).send({ reason: "no token" });
     assert.equal(res.status, 401, path);
   }

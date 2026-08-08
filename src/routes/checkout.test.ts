@@ -579,6 +579,12 @@ function confirmStubs(t: { after: (fn: () => void) => void }) {
   stubMethod(t, prisma.purchase as any, "findMany", async () => []);
   stubMethod(t, prisma.trialClaim as any, "findFirst", async () => null);
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  // The shared writers (recordPaidOrder / mirrorSubscriptionState) read the
+  // existing row + the consumed-order tombstone before writing. Baseline: no
+  // prior row, never consumed → the grant proceeds; the upsert just records it.
+  stubMethod(t, prisma.purchase as any, "findUnique", async () => null);
+  stubMethod(t, prisma.consumedOrder as any, "findUnique", async () => null);
+  stubMethod(t, prisma.consumedOrder as any, "upsert", async () => ({}));
 }
 
 function lsOrder(over: Record<string, unknown> = {}) {
@@ -670,7 +676,7 @@ test("confirming a paid lifetime order records the purchase", async (t) => {
  * crossed two user-editable URLs; the only thing binding it to the caller is
  * the buyer email Lemon Squeezy recorded, checked server-side.
  */
-test("someone else's order id is refused and writes nothing", async (t) => {
+test("someone else's order id reads as not found and writes nothing (no oracle)", async (t) => {
   confirmStubs(t);
   const upserts = stubMethod(t, prisma.purchase as any, "upsert", async (args: any) => args.create);
   const created = stubMethod(t, prisma.subscription as any, "create", async (args: any) => args.data);
@@ -682,9 +688,25 @@ test("someone else's order id is refused and writes nothing", async (t) => {
 
   const res = await request(app).post("/api/checkout/confirm").set(auth).send({ orderId: "777" });
 
-  assert.equal(res.status, 403);
+  // 404, identical to a nonexistent order: a not-yours order must be
+  // indistinguishable from no order at all, or /confirm is an enumeration oracle.
+  assert.equal(res.status, 404);
   assert.equal(upserts.length, 0);
   assert.equal(created.length, 0);
+});
+
+test("a spent order cannot be re-confirmed after its account was deleted", async (t) => {
+  confirmStubs(t);
+  // Purchase gone (account deleted), but the consumption tombstone remains.
+  stubMethod(t, prisma.purchase as any, "findUnique", async () => null);
+  stubMethod(t, prisma.consumedOrder as any, "findUnique", async () => ({ id: "consumed-777" }));
+  const upserts = stubMethod(t, prisma.purchase as any, "upsert", async (args: any) => args.create);
+  stubFetch(t, async () => ({ ok: true, status: 200, json: async () => lsOrder() }));
+
+  const res = await request(app).post("/api/checkout/confirm").set(auth).send({ orderId: "777" });
+
+  assert.equal(res.status, 409);
+  assert.equal(upserts.length, 0, "no fresh licence is minted for a spent order");
 });
 
 test("a pending order answers 409 so the app's bounded retry keeps trying", async (t) => {

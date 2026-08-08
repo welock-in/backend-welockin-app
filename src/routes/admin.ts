@@ -6,8 +6,12 @@ import { asyncHandler } from "../middleware/async-handler";
 import { requireAdmin } from "../middleware/admin-auth";
 import { signAdminToken } from "../lib/admin-jwt";
 import { toPublicUser } from "../lib/user";
-import { notFound, unauthorized, HttpError } from "../lib/http-error";
+import { notFound, unauthorized, badRequest, conflict, HttpError } from "../lib/http-error";
+import { clientIp, consumeRateLimit } from "../lib/rate-limit";
+import { readLemonSqueezyError } from "../lib/lemonsqueezy";
 import {
+  adminActionSchema,
+  adminCancelSubscriptionSchema,
   adminCompSchema,
   adminLoginSchema,
   adminRevokeSchema,
@@ -22,6 +26,9 @@ import {
 } from "../services/admin-stats";
 
 export const adminRouter = Router();
+
+/** A hung outbound call on a serverless function bills until it is killed. */
+const LS_TIMEOUT_MS = 10_000;
 
 /** Constant-time-ish string compare (length may leak, acceptable for creds). */
 function safeEqual(a: string, b: string): boolean {
@@ -41,6 +48,16 @@ adminRouter.post(
       // No password configured → admin console is disabled (never allow blank).
       throw new HttpError(503, "Admin console is not configured");
     }
+    // Brute-force cap BEFORE the compare. The admin token grants comp/revoke/
+    // plan/delete over EVERY account, so a grindable password is a grindable
+    // route to hijacking any licence — the audit's top revocation-control risk.
+    // Two legs: per-IP for the common case, and a coarse global leg because
+    // clientIp reads spoofable headers and a distributed/rotating-IP attempt
+    // would otherwise slip the per-IP cap. Counted on every attempt (a wrong
+    // password still consumes budget); a correct login within budget is fine.
+    await consumeRateLimit(`admin-login:ip:${clientIp(req)}`, 10, 15 * 60_000);
+    await consumeRateLimit(`admin-login:global`, 100, 15 * 60_000);
+
     const { username, password } = adminLoginSchema.parse(req.body);
     const ok =
       safeEqual(username, env.adminUsername) && safeEqual(password, env.adminPassword);
@@ -116,25 +133,49 @@ adminRouter.get(
     const user = await prisma.user.findUnique({ where: { id } });
     if (!user) throw notFound("User not found");
 
-    const [devices, snapshot, live, recentEvents, stats] = await Promise.all([
-      prisma.device.findMany({ where: { userId: id }, orderBy: { lastSeenAt: "desc" } }),
-      prisma.syncSnapshot.findUnique({ where: { userId: id } }),
-      prisma.liveSession.findMany({
-        where: { userId: id, ...liveSessionWhere() },
-        orderBy: { lastHeartbeatAt: "desc" },
-      }),
-      prisma.focusEvent.findMany({
-        where: { userId: id },
-        orderBy: { startedAt: "desc" },
-        take: 25,
-      }),
-      computeUserStats(id),
-    ]);
+    const [devices, snapshot, live, recentEvents, stats, purchases, subscriptions] =
+      await Promise.all([
+        prisma.device.findMany({ where: { userId: id }, orderBy: { lastSeenAt: "desc" } }),
+        prisma.syncSnapshot.findUnique({ where: { userId: id } }),
+        prisma.liveSession.findMany({
+          where: { userId: id, ...liveSessionWhere() },
+          orderBy: { lastHeartbeatAt: "desc" },
+        }),
+        prisma.focusEvent.findMany({
+          where: { userId: id },
+          orderBy: { startedAt: "desc" },
+          take: 25,
+        }),
+        computeUserStats(id),
+        // The real payment record, so an operator can see WHO PAID FOR WHAT
+        // rather than inferring it from the entitlement cache. Test rows are
+        // shown too (with the flag) — hiding them here would hide exactly what
+        // an operator is checking before going live.
+        prisma.purchase.findMany({
+          where: { userId: id },
+          orderBy: { purchasedAt: "desc" },
+          select: {
+            id: true, provider: true, externalId: true, productId: true,
+            priceUsd: true, purchasedAt: true, isRefunded: true, refundedAt: true, testMode: true,
+          },
+        }),
+        prisma.subscription.findMany({
+          where: { userId: id },
+          orderBy: { updatedAt: "desc" },
+          select: {
+            id: true, provider: true, externalId: true, variantId: true, interval: true,
+            status: true, validUntil: true, trialEndsAt: true, renewsAt: true, endsAt: true,
+            testMode: true, updatedAt: true,
+          },
+        }),
+      ]);
 
     res.json({
       user: toPublicUser(user),
       devices,
       stats,
+      purchases,
+      subscriptions,
       snapshot: snapshot
         ? {
             blocklists: snapshot.blocklists,
@@ -182,11 +223,13 @@ adminRouter.post(
   "/users/:id/suspend",
   requireAdmin,
   asyncHandler(async (req, res) => {
-    await getUserOr404(req.params.id);
+    const before = await getUserOr404(req.params.id);
+    const { reason } = adminActionSchema.parse(req.body ?? {});
     const user = await prisma.user.update({
       where: { id: req.params.id },
       data: { status: "suspended" },
     });
+    await audit(req, "suspend", user.id, reason ?? "", { status: before.status }, { status: "suspended" });
     res.json({ user: toPublicUser(user) });
   }),
 );
@@ -195,11 +238,13 @@ adminRouter.post(
   "/users/:id/unsuspend",
   requireAdmin,
   asyncHandler(async (req, res) => {
-    await getUserOr404(req.params.id);
+    const before = await getUserOr404(req.params.id);
+    const { reason } = adminActionSchema.parse(req.body ?? {});
     const user = await prisma.user.update({
       where: { id: req.params.id },
       data: { status: "active" },
     });
+    await audit(req, "unsuspend", user.id, reason ?? "", { status: before.status }, { status: "active" });
     res.json({ user: toPublicUser(user) });
   }),
 );
@@ -208,12 +253,13 @@ adminRouter.post(
   "/users/:id/plan",
   requireAdmin,
   asyncHandler(async (req, res) => {
-    await getUserOr404(req.params.id);
-    const { plan } = adminSetPlanSchema.parse(req.body);
+    const before = await getUserOr404(req.params.id);
+    const { plan, reason } = adminSetPlanSchema.parse(req.body);
     const user = await prisma.user.update({
       where: { id: req.params.id },
       data: { plan },
     });
+    await audit(req, "set_plan", user.id, reason ?? "", { plan: before.plan }, { plan });
     res.json({ user: toPublicUser(user) });
   }),
 );
@@ -222,9 +268,23 @@ adminRouter.delete(
   "/users/:id",
   requireAdmin,
   asyncHandler(async (req, res) => {
-    await getUserOr404(req.params.id);
+    const before = await getUserOr404(req.params.id);
+    const { reason } = adminActionSchema.parse(req.body ?? {});
+    // Audit BEFORE the cascade: the delete erases the user and every row keyed
+    // to it, so a row written afterwards would have nothing to point at. Snapshot
+    // the identity that is about to vanish.
+    await audit(
+      req,
+      "delete_user",
+      before.id,
+      reason ?? "",
+      { email: before.email, plan: before.plan, createdAt: before.createdAt },
+      { deleted: true },
+    );
     // Relations (devices, focusEvents, snapshot, authProviders, liveSessions)
-    // all cascade on delete in the schema.
+    // all cascade on delete in the schema. ConsumedOrder does NOT — it has no
+    // user relation on purpose, so a paid order stays spent after the account
+    // is gone (see schema.prisma + the audit's recycled-email finding).
     await prisma.user.delete({ where: { id: req.params.id } });
     res.json({ deleted: true });
   }),
@@ -241,6 +301,7 @@ adminRouter.post(
       where: { id: req.params.id },
       data: { forceEnd: true },
     });
+    await audit(req, "force_end_session", row.userId, "", { forceEnd: row.forceEnd }, { forceEnd: true });
     res.json({ liveSession: updated });
   }),
 );
@@ -250,8 +311,10 @@ adminRouter.delete(
   "/live-sessions/:id",
   requireAdmin,
   asyncHandler(async (req, res) => {
+    const row = await prisma.liveSession.findUnique({ where: { id: req.params.id } });
     const result = await prisma.liveSession.deleteMany({ where: { id: req.params.id } });
     if (result.count === 0) throw notFound("Live session not found");
+    if (row) await audit(req, "delete_session", row.userId, "", { id: row.id }, { deleted: true });
     res.json({ deleted: true });
   }),
 );
@@ -451,5 +514,87 @@ adminRouter.post(
     }, { claimsDeleted: ids.length });
 
     res.json({ user: toPublicUser(updated), claimsDeleted: ids.length });
+  }),
+);
+
+/**
+ * Cancel a customer's subscription FROM THE ADMIN CONSOLE — the operator-side
+ * mirror of the in-app cancel.
+ *
+ * Same contract as the user's own cancel (routes/subscription.ts): Lemon Squeezy
+ * stops future payments and keeps the customer valid until the end of the period
+ * already paid for, then the row flips to `expired` on its own. The WEBHOOK
+ * remains the sole writer of the Subscription row — this call only asks Lemon
+ * Squeezy to cancel and records the intent; the state change lands via
+ * subscription_updated/cancelled seconds later.
+ *
+ * The subscription is named by its externalId in the body AND verified to belong
+ * to the account in the path, so a fat-fingered id cannot cancel a stranger's
+ * plan. To take access away outright and immediately, use /revoke instead — this
+ * is the graceful, refund-nothing path.
+ */
+adminRouter.post(
+  "/users/:id/cancel-subscription",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const user = await getUserOr404(req.params.id);
+    const { reason, externalId } = adminCancelSubscriptionSchema.parse(req.body);
+
+    if (!env.lemonSqueezyApiKey) {
+      throw new HttpError(503, "Billing is not configured on this deployment");
+    }
+
+    // Named by id, but ownership is proven against the account in the path — the
+    // id in the body can never reach a subscription that is not this user's.
+    const sub = await prisma.subscription.findFirst({
+      where: { userId: user.id, provider: "lemonsqueezy", externalId },
+      select: { externalId: true, status: true },
+    });
+    if (!sub) throw notFound("No such subscription on this account");
+    if (sub.status === "cancelled" || sub.status === "expired") {
+      throw conflict(`Subscription is already ${sub.status}`);
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LS_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await fetch(`${env.lemonSqueezyApiBase}/v1/subscriptions/${sub.externalId}`, {
+        method: "DELETE",
+        headers: {
+          Accept: "application/vnd.api+json",
+          "Content-Type": "application/vnd.api+json",
+          Authorization: `Bearer ${env.lemonSqueezyApiKey}`,
+        },
+        signal: controller.signal,
+      });
+    } catch (err) {
+      // Never echo the failure verbatim: the request carried the API key.
+      console.error("[admin] Lemon Squeezy unreachable:", err instanceof Error ? err.message : err);
+      throw badRequest("Could not reach the payment provider. Please try again.");
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!response.ok) {
+      const why = await readLemonSqueezyError(response);
+      console.error(`[admin] cancel ${sub.externalId} failed: HTTP ${response.status} — ${why}`);
+      throw badRequest(`Could not cancel the subscription — ${why}`);
+    }
+
+    let endsAt: string | null = null;
+    try {
+      const body = (await response.json()) as { data?: { attributes?: { ends_at?: string | null } } };
+      endsAt = body.data?.attributes?.ends_at ?? null;
+    } catch {
+      /* the cancellation still happened */
+    }
+
+    await audit(req, "cancel_subscription", user.id, reason, { externalId, status: sub.status }, {
+      status: "cancelled",
+      endsAt,
+    });
+
+    res.status(202).json({ ok: true, endsAt });
   }),
 );

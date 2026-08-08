@@ -171,6 +171,11 @@ subscriptionRouter.get(
         // Whether "Cancel" should be offered at all. A row already cancelled is
         // running out its grace period and has nothing left to cancel.
         cancellable: live.status !== "cancelled",
+        // Whether "Reactivate" should be offered: a cancelled subscription still
+        // inside its paid-through window can be un-cancelled (POST /reactivate).
+        // `live` is already the granting row, so being cancelled here means
+        // cancelled-but-not-yet-expired — exactly the resumable window.
+        reactivatable: live.status === "cancelled",
       },
     });
   }),
@@ -263,5 +268,100 @@ subscriptionRouter.post(
     }
 
     res.status(202).json({ ok: true, endsAt });
+  }),
+);
+
+/**
+ * Reactivate (un-cancel) a subscription that is still inside its grace period.
+ *
+ * The mirror of /cancel, and the gap the audit + the subscription-map both
+ * flagged: once cancelled, a customer who changes their mind during the paid-
+ * through window had NO in-app way back — only the Lemon Squeezy portal. Lemon
+ * Squeezy supports it directly: PATCH the subscription with `cancelled: false`
+ * WHILE it is `cancelled` and BEFORE `ends_at`; the status returns to active and
+ * `ends_at` clears. After `ends_at` the subscription is `expired` and there is
+ * nothing to resume — the customer starts a fresh checkout instead.
+ *
+ * Found from the TOKEN, never named by the request, exactly like /cancel. The
+ * webhook remains the sole writer of the row; this only asks LS to resume and
+ * reports the new renews_at so the client can repaint immediately.
+ */
+subscriptionRouter.post(
+  "/reactivate",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    if (!env.lemonSqueezyApiKey) {
+      console.error("[subscription] cannot reactivate: no Lemon Squeezy API key");
+      throw badRequest("Billing is not available right now.");
+    }
+
+    const userId = req.user!.id;
+    const subs = await prisma.subscription.findMany({
+      where: { userId, provider: PROVIDER, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
+      select: { externalId: true, status: true, validUntil: true, endsAt: true },
+    });
+
+    const now = new Date();
+    // Resumable = cancelled AND still granting (before ends_at). A row already
+    // expired cannot be resumed — Lemon Squeezy would refuse, and the honest
+    // answer is "start a new plan", not a confusing provider error.
+    const resumable = subs.find(
+      (sub) => sub.status === "cancelled" && subscriptionGrants(sub, now),
+    );
+    if (!resumable) {
+      throw conflict("There is no cancelled subscription to reactivate on this account.");
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LS_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await fetch(`${env.lemonSqueezyApiBase}/v1/subscriptions/${resumable.externalId}`, {
+        method: "PATCH",
+        headers: {
+          Accept: "application/vnd.api+json",
+          "Content-Type": "application/vnd.api+json",
+          Authorization: `Bearer ${env.lemonSqueezyApiKey}`,
+        },
+        body: JSON.stringify({
+          data: {
+            type: "subscriptions",
+            id: String(resumable.externalId),
+            // The whole operation: un-cancel. LS clears ends_at and returns the
+            // subscription to active on its own.
+            attributes: { cancelled: false },
+          },
+        }),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      console.error("[subscription] Lemon Squeezy unreachable:", err instanceof Error ? err.message : err);
+      throw badRequest("Could not reach the payment provider. Please try again.");
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!response.ok) {
+      const why = await readLemonSqueezyError(response);
+      console.error(
+        `[subscription] Lemon Squeezy refused to reactivate ${resumable.externalId}: ` +
+          `HTTP ${response.status} — ${why}`,
+      );
+      throw badRequest(`Could not reactivate the subscription — ${why}`);
+    }
+
+    // Best-effort read of the new renewal date, like /cancel reads ends_at. The
+    // webhook is still the writer; this just lets the client say it now.
+    let renewsAt: string | null = null;
+    try {
+      const body = (await response.json()) as {
+        data?: { attributes?: { renews_at?: string | null } };
+      };
+      renewsAt = body.data?.attributes?.renews_at ?? null;
+    } catch {
+      /* the reactivation still happened */
+    }
+
+    res.status(202).json({ ok: true, renewsAt });
   }),
 );

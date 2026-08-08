@@ -6,6 +6,20 @@ export const healthLemonSqueezyRouter = Router();
 const TIMEOUT_MS = 10_000;
 
 /**
+ * Short-lived memo of the last answer, so a burst (an operator refreshing, or
+ * the admin UI polling) collapses to ONE pair of outbound LS calls rather than
+ * one pair per request. The data — which store/variants the key can see — moves
+ * only when the env or the dashboard changes, so 30s of staleness is invisible
+ * to a human and cheap insurance for the shared API quota.
+ */
+let memo: { at: number; body: unknown } | null = null;
+const MEMO_MS = 30_000;
+/** Test-only reset so the memo never leaks between cases. */
+export function __resetHealthLemonMemo(): void {
+  memo = null;
+}
+
+/**
  * Ask Lemon Squeezy, with the key this deploy actually holds, and report what it
  * can see.
  *
@@ -40,6 +54,12 @@ healthLemonSqueezyRouter.get("/", async (_req, res) => {
     return;
   }
 
+  // Serve the memo if fresh — one pair of outbound calls per 30s, not per hit.
+  if (memo && Date.now() - memo.at < MEMO_MS) {
+    res.json(memo.body);
+    return;
+  }
+
   const call = async (path: string): Promise<{ ok: boolean; body: any; status: number }> => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -62,6 +82,14 @@ healthLemonSqueezyRouter.get("/", async (_req, res) => {
     }
   };
 
+  // Memoize whatever we are about to answer, so the next burst is served without
+  // another outbound pair. Applied to every post-fetch answer, including a bad
+  // key, so a wrong key is not re-hammered either.
+  const answer = (body: unknown) => {
+    memo = { at: Date.now(), body };
+    res.json(body);
+  };
+
   const [stores, variants] = await Promise.all([
     call("/v1/stores"),
     // 100 is the page ceiling; nobody sells enough plans for this to truncate,
@@ -71,7 +99,7 @@ healthLemonSqueezyRouter.get("/", async (_req, res) => {
   ]);
 
   if (!stores.ok) {
-    res.json({
+    answer({
       ok: false,
       // A 401 here is the whole answer: the key is wrong or revoked, and every
       // checkout will fail whatever the ids say.
@@ -127,7 +155,7 @@ healthLemonSqueezyRouter.get("/", async (_req, res) => {
   ].filter(Boolean);
   const missing = configuredIds.filter((id) => !variantList.some((v: any) => v.id === id));
 
-  res.json({
+  answer({
     ok: true,
     // The sentence someone can act on, rather than three nulls to interpret.
     // Every configured id absent from a store that otherwise matches is the

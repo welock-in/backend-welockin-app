@@ -1,12 +1,23 @@
 import { Router } from "express";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
-import { checkoutSchema } from "../validation/schemas";
+import { checkoutConfirmSchema, checkoutSchema } from "../validation/schemas";
 import { hideTestRows, subscriptionGrants } from "../lib/subscription";
-import { readLemonSqueezyError, suggestVariantForPlan } from "../lib/lemonsqueezy";
+import {
+  parseOrderEvent,
+  parseSubscriptionEvent,
+  readLemonSqueezyError,
+  suggestVariantForPlan,
+  type LemonSqueezyWebhook,
+} from "../lib/lemonsqueezy";
+import { consumeRateLimit } from "../lib/rate-limit";
+import { readDeviceId } from "../lib/device";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
-import { accountGone, conflict, badRequest } from "../lib/http-error";
+import { accountGone, conflict, badRequest, forbidden, notFound } from "../lib/http-error";
+import { mirrorSubscriptionState, recordPaidOrder } from "./webhooks-lemonsqueezy";
+import { resolveAndCache } from "./entitlement";
 
 export const checkoutRouter = Router();
 
@@ -113,16 +124,24 @@ checkoutRouter.post(
             // because the desktop's deep-link handler is what makes the unlock
             // feel instant.
             //
-            // The deep link GRANTS NOTHING. It only wakes the app and triggers
-            // a sync; the licence still arrives exclusively via the signed
-            // webhook and the Ed25519 receipt, so a forged welockin:// link —
-            // or a stranger opening /thanks by hand — can at most cause one
-            // harmless refresh.
-            redirect_url: `${env.publicSiteUrl}/thanks`,
+            // `[order_id]` is a Lemon Squeezy LINK VARIABLE (docs: Link
+            // Variables), substituted with the real order id when the button
+            // renders. The bridge page threads it into the app's deep link and
+            // the app hands it to POST /checkout/confirm, which verifies the
+            // order against Lemon Squeezy's API with OUR key — so activation
+            // works even when webhook delivery is broken or late.
+            //
+            // The deep link GRANTS NOTHING, order id included. It names an
+            // order to VERIFY, server-side, against the caller's own account;
+            // a forged welockin:// link — or a stranger opening /thanks by
+            // hand — can at most cause one harmless verification of an order
+            // that is not theirs, refused. The licence still arrives
+            // exclusively via server-side writes and the Ed25519 receipt.
+            redirect_url: `${env.publicSiteUrl}/thanks?order_id=[order_id]`,
             // The same bridge from the emailed receipt, for the customer who
             // finds it hours later with the app closed: the deep link cold-
-            // starts the app, which syncs at boot.
-            receipt_link_url: `${env.publicSiteUrl}/thanks`,
+            // starts the app, which confirms at boot.
+            receipt_link_url: `${env.publicSiteUrl}/thanks?order_id=[order_id]`,
             receipt_button_text: "Open WeLockin",
             // NOT "has already unlocked". This is read the instant the card
             // clears, when the webhook may still be in flight, and stating
@@ -214,5 +233,182 @@ checkoutRouter.post(
     }
 
     res.status(201).json({ url });
+  }),
+);
+
+/** GET against the Lemon Squeezy API with our key, bounded like every LS call here. */
+async function lemonFetch(path: string): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CHECKOUT_TIMEOUT_MS);
+  try {
+    return await fetch(`${env.lemonSqueezyApiBase}${path}`, {
+      headers: {
+        Accept: "application/vnd.api+json",
+        Authorization: `Bearer ${env.lemonSqueezyApiKey}`,
+      },
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Confirm a purchase the moment the buyer comes back — the ACTIVE half of
+ * fulfilment, next to the webhook's passive half.
+ *
+ * WHY THIS EXISTS. The docs' own words on the confirmation button are
+ * "customers might not click… use webhooks for fulfilling" — and the first
+ * field test showed the mirror problem: a webhook can be misconfigured,
+ * unregistered in one of the two mode graphs, or simply late, and then a paid
+ * customer sits in front of a wall that says "unlocking…" for ever. So the
+ * return path carries Lemon Squeezy's own `[order_id]` link variable, and this
+ * endpoint VERIFIES it at the source: it asks the Lemon Squeezy API — with OUR
+ * key, over TLS, server-side — what that order is, and only then writes,
+ * through the exact same idempotent writers the webhook uses. Neither path
+ * needs the other; whichever runs second finds nothing left to do.
+ *
+ * WHAT THE CALLER'S ORDER ID IS WORTH: nothing, and the design assumes it. It
+ * crossed two user-editable URLs, so it is a CLAIM — "order N is mine" — and
+ * every part of that claim is checked against Lemon Squeezy's record: the
+ * order must belong to OUR store, be PAID, not be refunded, respect the
+ * test-mode gate, and carry the CALLER'S OWN account email (the checkout
+ * prefilled it; the webhook's custom user_id remains the strong key for the
+ * path that has it). A stranger's order id names an order whose email is not
+ * yours: refused, logged, nothing written.
+ */
+checkoutRouter.post(
+  "/confirm",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { orderId } = checkoutConfirmSchema.parse(req.body ?? {});
+
+    if (!env.lemonSqueezyApiKey || !env.lemonSqueezyStoreId) {
+      console.error("[checkout-confirm] Lemon Squeezy is not configured");
+      throw badRequest("Purchasing is not available right now.");
+    }
+
+    const userId = req.user!.id;
+    // Bounded: every hit is 1-2 outbound LS calls, the desktop retries for a
+    // minute by design, and LS rate-limits our key — 60/5min absorbs the whole
+    // retry burst several times over without letting a loop drain the quota.
+    await consumeRateLimit(`checkout-confirm:${userId}`, 60, 5 * 60_000);
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { email: true },
+    });
+    if (!user) throw accountGone();
+
+    const orderRes = await lemonFetch(`/v1/orders/${orderId}`).catch((err) => {
+      console.error(
+        "[checkout-confirm] Lemon Squeezy unreachable:",
+        err instanceof Error ? err.message : err,
+      );
+      throw badRequest("Could not reach the payment provider. Please try again.");
+    });
+    if (orderRes.status === 404) throw notFound("We can't find that order.");
+    if (!orderRes.ok) {
+      const why = await readLemonSqueezyError(orderRes);
+      console.error(`[checkout-confirm] order ${orderId} lookup failed: HTTP ${orderRes.status} — ${why}`);
+      throw badRequest("Could not verify the purchase. Please try again.");
+    }
+
+    const orderBody = (await orderRes.json()) as { data?: unknown };
+    // The API order carries the same attribute names as the webhook's order
+    // payload, so the webhook's own parser reads it — one parser, one shape.
+    const order = parseOrderEvent({
+      meta: { event_name: "api_order_lookup" },
+      data: orderBody?.data,
+    } as LemonSqueezyWebhook);
+    if (!order) throw badRequest("Could not read that order.");
+
+    // Same wording as a true 404 ON PURPOSE: confirming that an id exists in
+    // someone else's store is information a guesser did not have.
+    if (order.storeId !== env.lemonSqueezyStoreId) throw notFound("We can't find that order.");
+    if (order.testMode && !env.lemonSqueezyAllowTestMode) {
+      throw badRequest("That order was made in test mode.");
+    }
+    // "pending" settles on its own and the desktop retries; everything else
+    // (failed, fraudulent) will never become a licence.
+    if (order.status !== "paid") {
+      throw conflict(
+        order.status === "pending"
+          ? "The payment hasn't settled yet — trying again in a few seconds usually does it."
+          : "That order was not paid.",
+      );
+    }
+
+    // The binding. The checkout prefilled the ACCOUNT email, so in the flow we
+    // built this always matches. When it does not — someone typed a different
+    // email over the prefill, or someone is probing order ids — nothing is
+    // written, and the honest path is a human at support, not a guess here.
+    const caller = user.email.trim().toLowerCase();
+    if (!order.email || order.email !== caller) {
+      console.warn(`[checkout-confirm] order ${orderId} email does not match account ${userId}`);
+      throw forbidden(
+        "That order was paid with a different email address. Write to hello@welock.in and we'll attach it to your account.",
+      );
+    }
+
+    if (order.variantId && order.variantId === env.lemonSqueezyVariantId) {
+      // The lifetime licence. Refunded is checked HERE because recordPaidOrder
+      // mints isRefunded:false — the webhook never meets this case (its refund
+      // events revoke), but this endpoint can be called about an old order.
+      if (order.refunded) throw conflict("That order was refunded.");
+      await recordPaidOrder(order, userId, orderBody as Prisma.InputJsonValue);
+    } else {
+      // A subscription order: the grantable object is the subscription it
+      // created, so fetch THAT and mirror it — state, dates, portal URLs —
+      // exactly as a subscription_updated webhook would.
+      const subsRes = await lemonFetch(
+        `/v1/subscriptions?filter[order_id]=${orderId}&page[size]=10`,
+      ).catch((err) => {
+        console.error(
+          "[checkout-confirm] Lemon Squeezy unreachable:",
+          err instanceof Error ? err.message : err,
+        );
+        throw badRequest("Could not reach the payment provider. Please try again.");
+      });
+      if (!subsRes.ok) {
+        const why = await readLemonSqueezyError(subsRes);
+        console.error(
+          `[checkout-confirm] subscriptions for order ${orderId} failed: HTTP ${subsRes.status} — ${why}`,
+        );
+        throw badRequest("Could not verify the subscription. Please try again.");
+      }
+      const subsBody = (await subsRes.json()) as { data?: Array<{ attributes?: { store_id?: number } }> };
+      const subData =
+        (subsBody.data ?? []).find(
+          (d) => String(d?.attributes?.store_id ?? "") === env.lemonSqueezyStoreId,
+        ) ?? null;
+      if (!subData) {
+        // Right after payment the subscription can trail the order by a
+        // moment; the desktop's bounded retry absorbs that. If it never
+        // appears, the order bought something that is neither the lifetime
+        // variant nor a subscription — config drift worth a loud log.
+        console.warn(
+          `[checkout-confirm] order ${orderId} (variant ${order.variantId ?? "?"}) has no subscription yet`,
+        );
+        throw conflict("The subscription is still being set up — try again in a few seconds.");
+      }
+      // Read through the webhook's own parser: the API subscription object
+      // carries the same attribute names as a subscription event's payload.
+      // "subscription_updated" because that is semantically what this is — the
+      // subscription's current state, fetched instead of delivered.
+      const sub = parseSubscriptionEvent({
+        meta: { event_name: "subscription_updated", webhook_id: `confirm-${orderId}` },
+        data: subData,
+      } as LemonSqueezyWebhook);
+      if (!sub) throw badRequest("Could not read the subscription.");
+      if (sub.testMode && !env.lemonSqueezyAllowTestMode) {
+        throw badRequest("That order was made in test mode.");
+      }
+      await mirrorSubscriptionState(sub, userId, subData as Prisma.InputJsonValue);
+    }
+
+    // The whole answer, receipt included, so the caller's very next paint can
+    // be the unlocked app rather than a second round trip.
+    res.json(await resolveAndCache(userId, readDeviceId(req)));
   }),
 );

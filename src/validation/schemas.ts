@@ -509,3 +509,17 @@ export const adminTrialResetSchema = z.object({
 export const checkoutSchema = z.object({
   plan: z.enum(["monthly", "yearly", "lifetime"]),
 });
+
+/**
+ * `POST /api/checkout/confirm`. The order id arrives via Lemon Squeezy's
+ * `[order_id]` link variable → the /thanks bridge → the app's deep link, so it
+ * has crossed two URLs a user can edit: shape-checked here, verified against
+ * Lemon Squeezy's own API in the route. Their ids are numeric; 20 digits is
+ * far above anything real without admitting garbage.
+ */
+export const checkoutConfirmSchema = z.object({
+  orderId: z
+    .union([z.number().int().nonnegative(), z.string()])
+    .transform((v) => String(v).trim())
+    .refine((v) => /^\d{1,20}$/.test(v), "orderId must be a numeric Lemon Squeezy order id"),
+});

@@ -95,11 +95,19 @@ test("a checkout carries the caller's own user id, not one the buyer chose", asy
   assert.equal(sent.data.attributes.checkout_data.custom.user_id, userId);
   assert.equal(sent.data.relationships.variant.data.id, "1960881");
   // The return path: the confirmation button and the receipt email both point
-  // at the bridge page that fires the desktop's welockin:// deep link. Pinned
-  // by a test because deleting this field would silently degrade every future
-  // purchase to "nothing happens after paying".
-  assert.equal(sent.data.attributes.product_options.redirect_url, `${env.publicSiteUrl}/thanks`);
-  assert.equal(sent.data.attributes.product_options.receipt_link_url, `${env.publicSiteUrl}/thanks`);
+  // at the bridge page that fires the desktop's welockin:// deep link, and
+  // `[order_id]` is Lemon Squeezy's link variable — substituted at render, it
+  // is what lets POST /checkout/confirm verify the purchase at the source.
+  // Pinned by a test because deleting either field would silently degrade
+  // every future purchase to "nothing happens after paying".
+  assert.equal(
+    sent.data.attributes.product_options.redirect_url,
+    `${env.publicSiteUrl}/thanks?order_id=[order_id]`,
+  );
+  assert.equal(
+    sent.data.attributes.product_options.receipt_link_url,
+    `${env.publicSiteUrl}/thanks?order_id=[order_id]`,
+  );
 });
 
 test("someone who already owns the licence is not sent to pay again", async (t) => {
@@ -543,4 +551,194 @@ test("an unreachable catalogue still fails as a clean 400", async (t) => {
 
   assert.equal(res.status, 400);
   assert.ok(!JSON.stringify(res.body).includes("test-key"));
+});
+
+/* ── POST /api/checkout/confirm — the active half of fulfilment ─────────── */
+
+/**
+ * The confirm route asks Lemon Squeezy about the order, writes through the
+ * webhook's own writers, then answers with the resolved entitlement. These
+ * stubs cover that whole span: the route's user read + the resolver's reads.
+ */
+function confirmStubs(t: { after: (fn: () => void) => void }) {
+  configured(t);
+  withTestMode(t, true);
+  const beforeRl = env.authRateLimitDisabled;
+  (env as any).authRateLimitDisabled = true;
+  t.after(() => {
+    (env as any).authRateLimitDisabled = beforeRl;
+  });
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({
+    email: "user@example.com",
+    trialEndsAt: null,
+    compActive: false,
+    compedUntil: null,
+    accessRevoked: false,
+  }));
+  stubMethod(t, prisma.user as any, "update", async () => ({}));
+  stubMethod(t, prisma.purchase as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findFirst", async () => null);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+}
+
+function lsOrder(over: Record<string, unknown> = {}) {
+  return {
+    data: {
+      type: "orders",
+      id: "777",
+      attributes: {
+        store_id: 364783,
+        user_email: "user@example.com",
+        status: "paid",
+        refunded: false,
+        total_usd: 7499,
+        created_at: "2026-08-08T10:00:00Z",
+        test_mode: true,
+        first_order_item: { product_id: 1254414, variant_id: 1960881 },
+        ...over,
+      },
+    },
+  };
+}
+
+function lsSubList(over: Record<string, unknown> = {}) {
+  return {
+    data: [
+      {
+        type: "subscriptions",
+        id: "555",
+        attributes: {
+          store_id: 364783,
+          user_email: "user@example.com",
+          status: "on_trial",
+          variant_id: 1986433,
+          product_id: 1270398,
+          trial_ends_at: "2026-08-11T10:00:00Z",
+          renews_at: "2026-08-11T10:00:00Z",
+          ends_at: null,
+          urls: { update_payment_method: "https://x/upm", customer_portal: "https://x/portal" },
+          updated_at: "2026-08-08T10:00:05Z",
+          test_mode: true,
+          ...over,
+        },
+      },
+    ],
+  };
+}
+
+test("confirming a paid subscription order mirrors the subscription and answers 200", async (t) => {
+  confirmStubs(t);
+  stubMethod(t, prisma.subscription as any, "updateMany", async () => ({ count: 0 }));
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
+  const created = stubMethod(t, prisma.subscription as any, "create", async (args: any) => args.data);
+  stubFetch(t, async (url: string) => {
+    if (String(url).includes("/v1/subscriptions")) {
+      return { ok: true, status: 200, json: async () => lsSubList() };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () =>
+        lsOrder({ first_order_item: { product_id: 1270398, variant_id: 1986433 } }),
+    };
+  });
+
+  const res = await request(app).post("/api/checkout/confirm").set(auth).send({ orderId: "777" });
+
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(created.length, 1, "the subscription row is written");
+  assert.equal(created[0][0].data.externalId, "555");
+  assert.equal(created[0][0].data.userId, userId, "bound to the CALLER, not to anything client-sent");
+  assert.equal(created[0][0].data.status, "on_trial");
+});
+
+test("confirming a paid lifetime order records the purchase", async (t) => {
+  confirmStubs(t);
+  const upserts = stubMethod(t, prisma.purchase as any, "upsert", async (args: any) => args.create);
+  stubFetch(t, async () => ({ ok: true, status: 200, json: async () => lsOrder() }));
+
+  const res = await request(app).post("/api/checkout/confirm").set(auth).send({ orderId: 777 });
+
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(upserts.length, 1);
+  assert.equal(upserts[0][0].where.provider_externalId.externalId, "777");
+  assert.equal(upserts[0][0].create.userId, userId);
+});
+
+/*
+ * THE trust boundary of this endpoint. An order id is a guessable integer that
+ * crossed two user-editable URLs; the only thing binding it to the caller is
+ * the buyer email Lemon Squeezy recorded, checked server-side.
+ */
+test("someone else's order id is refused and writes nothing", async (t) => {
+  confirmStubs(t);
+  const upserts = stubMethod(t, prisma.purchase as any, "upsert", async (args: any) => args.create);
+  const created = stubMethod(t, prisma.subscription as any, "create", async (args: any) => args.data);
+  stubFetch(t, async () => ({
+    ok: true,
+    status: 200,
+    json: async () => lsOrder({ user_email: "someone.else@example.com" }),
+  }));
+
+  const res = await request(app).post("/api/checkout/confirm").set(auth).send({ orderId: "777" });
+
+  assert.equal(res.status, 403);
+  assert.equal(upserts.length, 0);
+  assert.equal(created.length, 0);
+});
+
+test("a pending order answers 409 so the app's bounded retry keeps trying", async (t) => {
+  confirmStubs(t);
+  stubFetch(t, async () => ({
+    ok: true,
+    status: 200,
+    json: async () => lsOrder({ status: "pending" }),
+  }));
+
+  const res = await request(app).post("/api/checkout/confirm").set(auth).send({ orderId: "777" });
+
+  assert.equal(res.status, 409);
+});
+
+test("a test-mode order is refused while the test gate is closed", async (t) => {
+  confirmStubs(t);
+  withTestMode(t, false);
+  const upserts = stubMethod(t, prisma.purchase as any, "upsert", async (args: any) => args.create);
+  stubFetch(t, async () => ({ ok: true, status: 200, json: async () => lsOrder() }));
+
+  const res = await request(app).post("/api/checkout/confirm").set(auth).send({ orderId: "777" });
+
+  assert.equal(res.status, 400);
+  assert.equal(upserts.length, 0);
+});
+
+/* Same words as a true 404: an id in someone else's store must not be confirmable as existing. */
+test("an order from a foreign store reads as not found", async (t) => {
+  confirmStubs(t);
+  stubFetch(t, async () => ({
+    ok: true,
+    status: 200,
+    json: async () => lsOrder({ store_id: 999999 }),
+  }));
+
+  const res = await request(app).post("/api/checkout/confirm").set(auth).send({ orderId: "777" });
+
+  assert.equal(res.status, 404);
+});
+
+test("a non-numeric order id never reaches Lemon Squeezy", async (t) => {
+  confirmStubs(t);
+  let fetched = 0;
+  stubFetch(t, async () => {
+    fetched += 1;
+    return { ok: true, status: 200, json: async () => lsOrder() };
+  });
+
+  const res = await request(app)
+    .post("/api/checkout/confirm")
+    .set(auth)
+    .send({ orderId: "777; DROP TABLE" });
+
+  assert.equal(res.status, 400);
+  assert.equal(fetched, 0);
 });

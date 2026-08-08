@@ -205,6 +205,21 @@ async function handle(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
     return { status: "failed", reason: `no account matches order ${order.orderId}` };
   }
 
+  await recordPaidOrder(order, userId, body as Prisma.InputJsonValue);
+  return { status: "processed" };
+}
+
+/**
+ * Record a PAID lifetime order — the ONE writer for Purchase rows, shared with
+ * POST /api/checkout/confirm for the same reason `mirrorSubscriptionState` is:
+ * two activation paths writing the same row must write it the same way, or
+ * whichever runs second corrupts what the first recorded.
+ */
+export async function recordPaidOrder(
+  order: ParsedOrder,
+  userId: string,
+  rawEvent: Prisma.InputJsonValue,
+): Promise<void> {
   await prisma.purchase.upsert({
     where: { provider_externalId: { provider: PROVIDER, externalId: order.orderId } },
     create: {
@@ -216,7 +231,7 @@ async function handle(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
       priceUsd: order.priceUsd,
       purchasedAt: order.purchasedAt,
       isRefunded: false,
-      rawEvent: body as Prisma.InputJsonValue,
+      rawEvent,
       // Parsed all along and thrown away until now. See schema.prisma.
       testMode: order.testMode,
     },
@@ -225,9 +240,8 @@ async function handle(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
     // ownership is decided once, at create; a replay whose custom data resolved
     // differently (an email that changed hands, a stale-claim re-run) must not
     // MOVE the licence to another account. Same rule as the subscription upsert.
-    update: { priceUsd: order.priceUsd, rawEvent: body as Prisma.InputJsonValue },
+    update: { priceUsd: order.priceUsd, rawEvent },
   });
-  return { status: "processed" };
 }
 
 /**
@@ -483,6 +497,31 @@ async function handleSubscription(
     return { status: "failed", reason: `no account matches subscription ${sub.subscriptionId}` };
   }
 
+  const wrote = await mirrorSubscriptionState(sub, userId, body as Prisma.InputJsonValue);
+  if (wrote === "stale") {
+    // The row exists and is NEWER than this event: a stale retry, understood
+    // and deliberately dropped. Terminal — redelivering it would only ask
+    // the same question again and get the same answer.
+    return { status: "skipped", reason: "stale event — a newer state is already recorded" };
+  }
+  return { status: "processed" };
+}
+
+/**
+ * Write what a subscription now IS — the ONE writer for subscription state.
+ *
+ * Shared between the webhook above and POST /api/checkout/confirm, and that
+ * sharing is the point: the confirm path exists because a webhook can be
+ * misconfigured or delayed, and if it wrote rows its own way the two paths
+ * would eventually disagree about the same subscription. Same keys, same
+ * staleness guard, same create-only ownership — whichever path runs second
+ * finds nothing to change.
+ */
+export async function mirrorSubscriptionState(
+  sub: ParsedSubscription,
+  userId: string,
+  rawEvent: Prisma.InputJsonValue,
+): Promise<"written" | "stale"> {
   const validUntil = validUntilFrom(sub);
   const data = {
     status: sub.status,
@@ -498,7 +537,7 @@ async function handleSubscription(
     endsAt: sub.endsAt,
     updatePaymentUrl: sub.updatePaymentUrl,
     customerPortalUrl: sub.customerPortalUrl,
-    rawEvent: body as Prisma.InputJsonValue,
+    rawEvent,
     testMode: sub.testMode,
     ...(sub.updatedAt ? { providerUpdatedAt: sub.updatedAt } : {}),
   };
@@ -527,12 +566,7 @@ async function handleSubscription(
       where: { provider_externalId: { provider: PROVIDER, externalId: sub.subscriptionId } },
       select: { id: true },
     });
-    if (existing) {
-      // The row exists and is NEWER than this event: a stale retry, understood
-      // and deliberately dropped. Terminal — redelivering it would only ask
-      // the same question again and get the same answer.
-      return { status: "skipped", reason: "stale event — a newer state is already recorded" };
-    }
+    if (existing) return "stale";
     try {
       // `userId` is set HERE and never in an update: a later event whose custom
       // data named a different account must not MOVE the subscription.
@@ -554,7 +588,7 @@ async function handleSubscription(
     }
   }
 
-  return { status: "processed" };
+  return "written";
 }
 
 /**

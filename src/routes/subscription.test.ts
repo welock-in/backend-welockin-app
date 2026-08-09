@@ -236,24 +236,24 @@ test("cancelling twice is refused rather than repeated", async (t) => {
   assert.equal(res.status, 409);
 });
 
-test("cancelling is refused while on trial (nothing to cancel yet)", async (t) => {
+test("cancelling DURING a trial is allowed — it means 'don't charge me'", async (t) => {
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { externalId: "77001", status: "on_trial", validUntil: new Date(Date.now() + 3 * 86_400_000) },
   ]);
-  let called = false;
-  stubFetch(t, async () => {
-    called = true;
-    return { ok: true, status: 200, json: async () => ({}) };
+  let method = "";
+  stubFetch(t, async (_u: string, i: any) => {
+    method = i.method;
+    return { ok: true, status: 200, json: async () => ({ data: { attributes: { ends_at: "2026-08-15T00:00:00.000Z" } } }) };
   });
 
   const res = await request(app).post("/api/subscription/cancel").set(auth);
 
-  assert.equal(res.status, 409);
-  assert.equal(called, false, "Lemon Squeezy is never asked to cancel a trial from in-app");
+  assert.equal(res.status, 202, "a trialer must be able to opt out before being charged");
+  assert.equal(method, "DELETE");
 });
 
-test("GET /subscription marks an on-trial row as NOT cancellable", async (t) => {
+test("GET /subscription still marks an on-trial row as cancellable", async (t) => {
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     {
@@ -268,7 +268,7 @@ test("GET /subscription marks an on-trial row as NOT cancellable", async (t) => 
 
   const res = await request(app).get("/api/subscription").set(auth);
 
-  assert.equal(res.body.subscription.cancellable, false, "the cancel button hides during the trial");
+  assert.equal(res.body.subscription.cancellable, true, "the trialer can cancel to avoid the charge");
 });
 
 test("a cancelled subscription still reads as live, with its end date", async (t) => {

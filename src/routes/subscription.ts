@@ -211,7 +211,7 @@ subscriptionRouter.post(
     const userId = req.user!.id;
     const subs = await prisma.subscription.findMany({
       where: { userId, provider: PROVIDER, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
-      select: { externalId: true, status: true, validUntil: true },
+      select: { id: true, externalId: true, status: true, validUntil: true, trialEndsAt: true },
     });
 
     const now = new Date();
@@ -222,12 +222,12 @@ subscriptionRouter.post(
     if (!live) {
       throw conflict("There is no active subscription to cancel on this account.");
     }
-    // Cancelling DURING a trial is allowed, and is the point of a trial: it means
-    // "don't charge me when it ends". Lemon Squeezy keeps the trial valid until
-    // its end date and then lets it expire instead of converting — the customer
-    // keeps what they were trying, and pays nothing. (Changing PLAN mid-trial is
-    // the thing that is refused, over in /change-plan, because there is no paid
-    // amount to prorate against.)
+    // Cancelling DURING a trial is allowed — it is what a trial is for. What it
+    // does NOT do here is leave the trial running: a trial buys no grace (see
+    // `subscriptionGrants`), so access ends the moment it is cancelled. The
+    // client's copy says so before the confirm, because a customer who expected
+    // to keep the days they had left would otherwise be simply cut off.
+    const wasTrial = live.status === "on_trial";
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), LS_TIMEOUT_MS);
@@ -275,7 +275,26 @@ subscriptionRouter.post(
       /* the cancellation still happened */
     }
 
-    res.status(202).json({ ok: true, endsAt });
+    // Mirror the new status NOW rather than waiting for the webhook.
+    //
+    // The webhook is normally the sole writer, and it still is for anything it
+    // decides — this writes only what we just asked for and are about to be told
+    // again, so the two cannot disagree. It matters because of the trial rule:
+    // the customer pressed cancel expecting to lose access, and if the row still
+    // said `on_trial` until a delivery landed, the very next screen would show
+    // them still inside a trial they just ended. `providerUpdatedAt` is left
+    // untouched, so the real event still applies over this on arrival.
+    await prisma.subscription
+      .update({
+        where: { id: live.id },
+        data: {
+          status: "cancelled",
+          ...(endsAt ? { endsAt: new Date(endsAt), validUntil: new Date(endsAt) } : {}),
+        },
+      })
+      .catch((e) => console.error("[subscription] optimistic cancel write failed:", e));
+
+    res.status(202).json({ ok: true, endsAt, endedNow: wasTrial });
   }),
 );
 

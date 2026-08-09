@@ -81,3 +81,56 @@ test("on trial, the trial's end is the date; otherwise the next renewal is", () 
 test("no dates at all yields null, which grants — see subscriptionGrants", () => {
   assert.equal(validUntilFrom({ status: "active", endsAt: null, trialEndsAt: null, renewsAt: null }), null);
 });
+
+/* ── Cancelling DURING a trial ends access at once ──────────────────────────
+ *
+ * `cancelled` normally still grants: a paying customer keeps the period they
+ * bought. A trial buys nothing, so there is no grace to honour — and "cancel my
+ * trial" plainly means stop it, not hand me the rest of it free.
+ */
+
+test("a subscription cancelled while its trial is still running grants nothing", () => {
+  const now = new Date();
+  const inThreeDays = new Date(now.getTime() + 3 * 86_400_000);
+  assert.equal(
+    subscriptionGrants(
+      { status: "cancelled", validUntil: inThreeDays, trialEndsAt: inThreeDays },
+      now,
+    ),
+    false,
+    "cancelling a trial takes access away immediately",
+  );
+});
+
+test("a PAID subscription cancelled after its trial keeps its grace period", () => {
+  const now = new Date();
+  const lastMonth = new Date(now.getTime() - 30 * 86_400_000);
+  const inTenDays = new Date(now.getTime() + 10 * 86_400_000);
+  assert.equal(
+    subscriptionGrants(
+      // Trialed long ago, converted, paid, and has now cancelled.
+      { status: "cancelled", validUntil: inTenDays, trialEndsAt: lastMonth },
+      now,
+    ),
+    true,
+    "they paid through this date — taking it away would be theft",
+  );
+});
+
+test("a cancelled row with no trial date at all still grants (the old behaviour)", () => {
+  const now = new Date();
+  const inTenDays = new Date(now.getTime() + 10 * 86_400_000);
+  assert.equal(subscriptionGrants({ status: "cancelled", validUntil: inTenDays }, now), true);
+});
+
+test("an ACTIVE trial is untouched by the rule — only cancelling ends it", () => {
+  const now = new Date();
+  const inThreeDays = new Date(now.getTime() + 3 * 86_400_000);
+  assert.equal(
+    subscriptionGrants(
+      { status: "on_trial", validUntil: inThreeDays, trialEndsAt: inThreeDays },
+      now,
+    ),
+    true,
+  );
+});

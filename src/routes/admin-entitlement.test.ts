@@ -317,7 +317,7 @@ test("even a synthetic client testMode:false is ignored — the row is forced te
   assert.ok(created[0][0].data.externalId.startsWith("sim_"));
 });
 
-test("PATCH/DELETE refuse a row that is not a sim row (webhook stays sole writer)", async (t) => {
+test("DELETE refuses a row that is not a sim row (webhook stays sole writer)", async (t) => {
   stubDb(t);
   withTestMode(t, true);
   // A REAL LS row (numeric id, testMode false) must be untouchable by the lab.
@@ -329,38 +329,135 @@ test("PATCH/DELETE refuse a row that is not a sim row (webhook stays sole writer
     status: "active",
     validUntil: new Date(),
   }));
-  const updated = stubMethod(t, prisma.subscription as any, "update", async () => ({}));
+  const del = stubMethod(t, prisma.subscription as any, "delete", async () => ({}));
 
   const res = await request(app)
-    .patch(`/api/admin/users/${USER}/test-subscription/real1`)
+    .delete(`/api/admin/users/${USER}/test-subscription/real1`)
     .set(auth)
-    .send({ reason: "must be refused", remainingDays: 0 });
+    .send({ reason: "must be refused" });
 
-  assert.equal(res.status, 404, "a webhook-owned row is never editable by the test lab");
-  assert.equal(updated.length, 0);
+  assert.equal(res.status, 404, "a webhook-owned row is never deletable by the test lab");
+  assert.equal(del.length, 0);
 });
 
-test("'expire now' on a sim row moves it into the past", async (t) => {
+/* ── Lifecycle transitions & time travel ─────────────────────────────── */
+
+test("→ expired is always a LOCAL write (Lemon Squeezy has no 'end it now')", async (t) => {
   stubDb(t);
   withTestMode(t, true);
-  stubMethod(t, prisma.subscription as any, "findUnique", async () => ({
-    id: "sim1",
+  stubMethod(t, prisma.subscription as any, "findFirst", async () => ({
+    id: "real1",
     userId: USER,
-    externalId: "sim_abc",
-    testMode: true,
+    externalId: "2417513",
+    testMode: false,
     status: "active",
-    validUntil: new Date(Date.now() + 10 * 86_400_000),
+    validUntil: new Date(Date.now() + 20 * 86_400_000),
   }));
   const updated = stubMethod(t, prisma.subscription as any, "update", async (a: any) => a.data);
+  let calledLs = false;
+  stubFetch(t, async () => {
+    calledLs = true;
+    return { ok: true, status: 200, json: async () => ({}) };
+  });
 
   const res = await request(app)
-    .patch(`/api/admin/users/${USER}/test-subscription/sim1`)
+    .post(`/api/admin/users/${USER}/subscription-transition`)
     .set(auth)
-    .send({ reason: "expire it", status: "expired", remainingDays: 0 });
+    .send({ reason: "end it for the test", externalId: "2417513", to: "expired" });
 
-  assert.equal(res.status, 200);
+  assert.equal(res.status, 202);
+  assert.equal(res.body.via, "local", "and it says so, so nobody mistakes it for a real ending");
+  assert.equal(calledLs, false);
   assert.equal(updated[0][0].data.status, "expired");
-  assert.ok(updated[0][0].data.endsAt.getTime() <= Date.now() + 1000, "endsAt is now (expired)");
+});
+
+test("→ active on a REAL trial converts it at Lemon Squeezy (charges now)", async (t) => {
+  stubDb(t);
+  withTestMode(t, true);
+  const ORIGINAL = env.lemonSqueezyApiKey;
+  (env as any).lemonSqueezyApiKey = "test-key";
+  t.after(() => {
+    (env as any).lemonSqueezyApiKey = ORIGINAL;
+  });
+  stubMethod(t, prisma.subscription as any, "findFirst", async () => ({
+    id: "real1",
+    userId: USER,
+    externalId: "2417513",
+    testMode: false,
+    status: "on_trial",
+    validUntil: new Date(Date.now() + 3 * 86_400_000),
+  }));
+  let sent: any = null;
+  let method = "";
+  stubFetch(t, async (_u: string, i: any) => {
+    method = i.method;
+    sent = JSON.parse(i.body);
+    return { ok: true, status: 200, json: async () => ({}) };
+  });
+
+  const res = await request(app)
+    .post(`/api/admin/users/${USER}/subscription-transition`)
+    .set(auth)
+    .send({ reason: "start pro now", externalId: "2417513", to: "active" });
+
+  assert.equal(res.status, 202);
+  assert.equal(res.body.via, "lemonsqueezy", "the real pipeline is what we want to test");
+  assert.equal(method, "PATCH");
+  assert.equal(sent.data.attributes.invoice_immediately, true);
+  assert.ok(sent.data.attributes.trial_ends_at, "the trial is ended now");
+});
+
+test("setting the time on a REAL trial writes trial_ends_at at Lemon Squeezy", async (t) => {
+  stubDb(t);
+  withTestMode(t, true);
+  const ORIGINAL = env.lemonSqueezyApiKey;
+  (env as any).lemonSqueezyApiKey = "test-key";
+  t.after(() => {
+    (env as any).lemonSqueezyApiKey = ORIGINAL;
+  });
+  stubMethod(t, prisma.subscription as any, "findFirst", async () => ({
+    id: "real1",
+    userId: USER,
+    externalId: "2417513",
+    testMode: false,
+    status: "on_trial",
+    validUntil: new Date(Date.now() + 6 * 86_400_000),
+  }));
+  stubMethod(t, prisma.subscription as any, "update", async (a: any) => a.data);
+  let sent: any = null;
+  stubFetch(t, async (_u: string, i: any) => {
+    sent = JSON.parse(i.body);
+    return { ok: true, status: 200, json: async () => ({}) };
+  });
+
+  // 6 days left -> 2 days and 3 hours.
+  const res = await request(app)
+    .post(`/api/admin/users/${USER}/subscription-time`)
+    .set(auth)
+    .send({ reason: "jump to the reminder window", externalId: "2417513", days: 2, hours: 3 });
+
+  assert.equal(res.status, 202);
+  assert.equal(res.body.via, "lemonsqueezy");
+  const ends = Date.parse(sent.data.attributes.trial_ends_at);
+  const hoursOut = (ends - Date.now()) / 3_600_000;
+  assert.ok(hoursOut > 50 && hoursOut < 52, `expected ~51h, got ${hoursOut}`);
+});
+
+test("the lifecycle controls are 503 when test mode is off", async (t) => {
+  stubDb(t);
+  withTestMode(t, false);
+
+  const a = await request(app)
+    .post(`/api/admin/users/${USER}/subscription-transition`)
+    .set(auth)
+    .send({ reason: "blocked", externalId: "x", to: "expired" });
+  const b = await request(app)
+    .post(`/api/admin/users/${USER}/subscription-time`)
+    .set(auth)
+    .send({ reason: "blocked", externalId: "x", days: 1, hours: 0 });
+
+  assert.equal(a.status, 503);
+  assert.equal(b.status, 503);
 });
 
 /* ── Audited writes ──────────────────────────────────────────────────── */

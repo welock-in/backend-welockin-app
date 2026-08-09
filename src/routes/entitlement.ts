@@ -83,6 +83,10 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
       select: {
         status: true,
         validUntil: true,
+        // Load-bearing for `subscriptionGrants`: a subscription cancelled while
+        // its trial is still running grants nothing (a trial buys no grace).
+        // Without this column selected, that rule silently never fires.
+        trialEndsAt: true,
         // For `billingUrl` below. Both are refreshed on every webhook because
         // Lemon Squeezy signs them with an expiry.
         customerPortalUrl: true,

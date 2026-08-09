@@ -18,7 +18,8 @@ import {
   adminRevokeSchema,
   adminSetPlanSchema,
   adminTestSubscriptionCreateSchema,
-  adminTestSubscriptionPatchSchema,
+  adminSubscriptionTimeSchema,
+  adminSubscriptionTransitionSchema,
   adminTrialResetSchema,
 } from "../validation/schemas";
 import {
@@ -769,43 +770,6 @@ async function getSimOr404(userId: string, subId: string) {
   return row;
 }
 
-adminRouter.patch(
-  "/users/:id/test-subscription/:subId",
-  requireAdmin,
-  asyncHandler(async (req, res) => {
-    requireTestTools();
-    const before = await getSimOr404(req.params.id, req.params.subId);
-    const patch = adminTestSubscriptionPatchSchema.parse(req.body);
-
-    const status = patch.status ?? before.status;
-    const horizon =
-      patch.validUntil ??
-      (patch.remainingDays != null
-        ? new Date(Date.now() + patch.remainingDays * 86_400_000)
-        : (before.validUntil ?? new Date()));
-
-    const row = await prisma.subscription.update({
-      where: { id: before.id },
-      data: {
-        status,
-        ...(patch.interval ? { interval: patch.interval } : {}),
-        ...synthDates(status, horizon),
-      },
-    });
-
-    await audit(
-      req,
-      "test_subscription_update",
-      req.params.id,
-      patch.reason,
-      { status: before.status, validUntil: before.validUntil },
-      { status: row.status, validUntil: row.validUntil },
-    );
-
-    res.json({ subscription: row });
-  }),
-);
-
 adminRouter.delete(
   "/users/:id/test-subscription/:subId",
   requireAdmin,
@@ -818,5 +782,217 @@ adminRouter.delete(
       externalId: before.externalId,
     }, { deleted: true });
     res.json({ deleted: true });
+  }),
+);
+
+/* ── Driving a subscription through its lifecycle ───────────────────────────
+ *
+ * The two controls that make the states testable in seconds instead of days.
+ * Both work on ANY subscription of the account — a real Lemon Squeezy one or a
+ * synthetic one — and the difference is deliberately visible in what they do
+ * and in what they report back:
+ *
+ *   REAL row  → ask Lemon Squeezy, and let the webhook write the answer. That
+ *               exercises the whole chain (LS → webhook → row → resolver),
+ *               which is the only test worth trusting.
+ *   SIM row   → write the row, because there is nothing at Lemon Squeezy to ask.
+ *
+ * Both are test-gated: LS cannot do some of these at all (there is no "expire
+ * now"), so the honest ones are faithful and the rest are simulations, and a
+ * simulation must never be reachable on a live storefront.
+ */
+
+/** A subscription of this account, named by its external id. */
+async function getSubOr404(userId: string, externalId: string) {
+  const row = await prisma.subscription.findFirst({
+    where: { userId, provider: "lemonsqueezy", externalId },
+  });
+  if (!row) throw notFound("No such subscription on this account");
+  return row;
+}
+
+const isSim = (externalId: string) => externalId.startsWith("sim_");
+
+/** PATCH a real subscription at Lemon Squeezy; throws a clean 400 on refusal. */
+async function lemonPatch(externalId: string, attributes: Record<string, unknown>): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LS_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch(`${env.lemonSqueezyApiBase}/v1/subscriptions/${externalId}`, {
+      method: "PATCH",
+      headers: {
+        Accept: "application/vnd.api+json",
+        "Content-Type": "application/vnd.api+json",
+        Authorization: `Bearer ${env.lemonSqueezyApiKey}`,
+      },
+      body: JSON.stringify({ data: { type: "subscriptions", id: String(externalId), attributes } }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    console.error("[admin] Lemon Squeezy unreachable:", err instanceof Error ? err.message : err);
+    throw badRequest("Could not reach the payment provider. Please try again.");
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!response.ok) {
+    const why = await readLemonSqueezyError(response);
+    console.error(`[admin] LS PATCH ${externalId} failed: HTTP ${response.status} — ${why}`);
+    throw badRequest(`Lemon Squeezy refused it — ${why}`);
+  }
+}
+
+/** DELETE (cancel) a real subscription at Lemon Squeezy. */
+async function lemonCancel(externalId: string): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LS_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch(`${env.lemonSqueezyApiBase}/v1/subscriptions/${externalId}`, {
+      method: "DELETE",
+      headers: {
+        Accept: "application/vnd.api+json",
+        "Content-Type": "application/vnd.api+json",
+        Authorization: `Bearer ${env.lemonSqueezyApiKey}`,
+      },
+      signal: controller.signal,
+    });
+  } catch (err) {
+    console.error("[admin] Lemon Squeezy unreachable:", err instanceof Error ? err.message : err);
+    throw badRequest("Could not reach the payment provider. Please try again.");
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!response.ok && response.status !== 404) {
+    const why = await readLemonSqueezyError(response);
+    throw badRequest(`Lemon Squeezy refused the cancel — ${why}`);
+  }
+}
+
+/**
+ * Move a subscription to `active`, `cancelled` or `expired`.
+ *
+ *   → active     a trial converts NOW (LS charges the card on file, which in a
+ *                test store is the test card); a cancelled-but-granting row is
+ *                resumed. Both are real Lemon Squeezy operations.
+ *   → cancelled  a real LS cancel. Note our own rule: a subscription cancelled
+ *                while its trial is still running stops granting at once.
+ *   → expired    LS has no "end it now", so this one is always a local write.
+ */
+adminRouter.post(
+  "/users/:id/subscription-transition",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    requireTestTools();
+    const user = await getUserOr404(req.params.id);
+    const { reason, externalId, to } = adminSubscriptionTransitionSchema.parse(req.body);
+    const row = await getSubOr404(user.id, externalId);
+    const sim = isSim(row.externalId);
+
+    const now = new Date();
+    let via: "lemonsqueezy" | "local" = sim ? "local" : "lemonsqueezy";
+
+    // Only the paths that actually TALK to Lemon Squeezy need a key. Expiring a
+    // row is a local write even for a real subscription (LS has no "end it
+    // now"), so requiring one there would refuse an operation it is not used for.
+    const needsLemon = !sim && to !== "expired";
+    if (needsLemon && !env.lemonSqueezyApiKey) {
+      throw new HttpError(503, "Billing is not configured on this deployment");
+    }
+
+    if (to === "active") {
+      if (sim) {
+        await prisma.subscription.update({
+          where: { id: row.id },
+          data: {
+            status: "active",
+            ...synthDates("active", row.validUntil ?? new Date(Date.now() + 30 * 86_400_000)),
+          },
+        });
+      } else if (row.status === "cancelled") {
+        await lemonPatch(row.externalId, { cancelled: false });
+      } else if (row.status === "on_trial") {
+        // Convert the trial now: end it and raise the invoice immediately —
+        // exactly what the customer's own "Pay now" does.
+        await lemonPatch(row.externalId, {
+          trial_ends_at: now.toISOString(),
+          invoice_immediately: true,
+        });
+      } else {
+        throw conflict(`Nothing to do: the subscription is already ${row.status}`);
+      }
+    } else if (to === "cancelled") {
+      if (row.status === "cancelled") throw conflict("Already cancelled");
+      if (sim) {
+        await prisma.subscription.update({
+          where: { id: row.id },
+          data: { status: "cancelled", ...synthDates("cancelled", row.validUntil ?? now) },
+        });
+      } else {
+        await lemonCancel(row.externalId);
+      }
+    } else {
+      // `expired` — no Lemon Squeezy equivalent, so always a local write, even
+      // for a real row. Reported as such so nobody mistakes it for a real end.
+      via = "local";
+      await prisma.subscription.update({
+        where: { id: row.id },
+        data: { status: "expired", ...synthDates("expired", now) },
+      });
+    }
+
+    await audit(req, "subscription_transition", user.id, reason, {
+      externalId,
+      status: row.status,
+    }, { to, via });
+
+    res.status(202).json({ ok: true, to, via });
+  }),
+);
+
+/**
+ * Set how long a subscription has left — days AND hours.
+ *
+ * On a REAL trial this is a genuine Lemon Squeezy write (`trial_ends_at`), so
+ * the whole chain runs and the trial really does end when it says. On anything
+ * else Lemon Squeezy has no writable end date, so the row is set locally and the
+ * response says `via: "local"` — a real webhook would later correct it, which is
+ * exactly the honest caveat.
+ */
+adminRouter.post(
+  "/users/:id/subscription-time",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    requireTestTools();
+    const user = await getUserOr404(req.params.id);
+    const { reason, externalId, days, hours } = adminSubscriptionTimeSchema.parse(req.body);
+    const row = await getSubOr404(user.id, externalId);
+
+    const horizon = new Date(Date.now() + days * 86_400_000 + hours * 3_600_000);
+    const sim = isSim(row.externalId);
+    let via: "lemonsqueezy" | "local" = "local";
+
+    if (!sim && row.status === "on_trial") {
+      if (!env.lemonSqueezyApiKey) throw new HttpError(503, "Billing is not configured");
+      await lemonPatch(row.externalId, { trial_ends_at: horizon.toISOString() });
+      via = "lemonsqueezy";
+      // The webhook will mirror it; write it now so the console repaints without
+      // waiting for a delivery.
+      await prisma.subscription
+        .update({ where: { id: row.id }, data: synthDates("on_trial", horizon) })
+        .catch(() => undefined);
+    } else {
+      await prisma.subscription.update({
+        where: { id: row.id },
+        data: synthDates(row.status, horizon),
+      });
+    }
+
+    await audit(req, "subscription_time", user.id, reason, {
+      externalId,
+      validUntil: row.validUntil,
+    }, { validUntil: horizon, days, hours, via });
+
+    res.status(202).json({ ok: true, validUntil: horizon, via });
   }),
 );

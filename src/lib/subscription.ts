@@ -45,6 +45,12 @@ const GRANTING: readonly string[] = ["on_trial", "active", "paused", "past_due",
 export type SubscriptionLike = {
   status: string;
   validUntil: Date | null;
+  /**
+   * Needed only to tell a trial cancellation from a paid one — see the rule in
+   * `subscriptionGrants`. Optional so callers that do not decide access (the
+   * duplicate-purchase guards, the lifetime-buyer sweep) need not select it.
+   */
+  trialEndsAt?: Date | null;
 };
 
 /**
@@ -55,9 +61,30 @@ export type SubscriptionLike = {
  * reading of "active, end date unknown" is to keep serving the customer and let
  * the next webhook correct it. The alternative fails toward cutting off someone
  * who is paying, on nothing more than a missing field.
+ *
+ * THE ONE EXCEPTION: cancelling DURING a trial ends access immediately.
+ *
+ * `cancelled` is otherwise in the granting list because a paying customer keeps
+ * what they paid for until the period runs out — that grace is bought. A trial
+ * buys nothing: nobody has been charged, so there is no paid-through date to
+ * honour, and "cancel the trial" plainly means "stop it", not "give me the rest
+ * of it free". Lemon Squeezy's own default is to keep the trial running to its
+ * end date, so this rule is ours and is applied here rather than being wished
+ * for at the call sites.
+ *
+ * The test is deliberately narrow: the trial end must still be in the FUTURE.
+ * A subscription that trialed, converted, ran for months and was then cancelled
+ * has a trial end far in the past, and keeps its paid grace exactly as before.
  */
 export function subscriptionGrants(sub: SubscriptionLike, now: Date): boolean {
   if (!GRANTING.includes(sub.status)) return false;
+  if (
+    sub.status === "cancelled" &&
+    sub.trialEndsAt != null &&
+    sub.trialEndsAt.getTime() > now.getTime()
+  ) {
+    return false;
+  }
   if (sub.validUntil == null) return true;
   return sub.validUntil.getTime() > now.getTime();
 }

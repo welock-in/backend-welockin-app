@@ -538,12 +538,28 @@ export const adminTestSubscriptionCreateSchema = z
     message: "Provide remainingDays or validUntil",
   });
 
-export const adminTestSubscriptionPatchSchema = z.object({
+/**
+ * Move a subscription to a named lifecycle state (the test lab's transition
+ * buttons). `externalId` names the row; the route proves it belongs to the
+ * account in the path, and does the REAL Lemon Squeezy operation when the row is
+ * a real one.
+ */
+export const adminSubscriptionTransitionSchema = z.object({
   reason: adminReason,
-  status: subscriptionStatusEnum.optional(),
-  interval: z.enum(["monthly", "yearly"]).optional(),
-  remainingDays: z.number().min(0).max(730).optional(),
-  validUntil: dateInput.optional(),
+  externalId: z.string().trim().min(1, "externalId is required"),
+  to: z.enum(["active", "cancelled", "expired"]),
+});
+
+/**
+ * Set how much time a subscription has left — days AND hours, because "2 days
+ * left" and "4 hours left" are different screens (the trial reminder fires at
+ * two days) and testing the second should not mean waiting a day.
+ */
+export const adminSubscriptionTimeSchema = z.object({
+  reason: adminReason,
+  externalId: z.string().trim().min(1, "externalId is required"),
+  days: z.number().min(0).max(730).default(0),
+  hours: z.number().min(0).max(23).default(0),
 });
 
 export const adminTrialResetSchema = z.object({

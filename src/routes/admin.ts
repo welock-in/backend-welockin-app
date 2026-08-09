@@ -14,8 +14,11 @@ import {
   adminCancelSubscriptionSchema,
   adminCompSchema,
   adminLoginSchema,
+  adminReactivateSubscriptionSchema,
   adminRevokeSchema,
   adminSetPlanSchema,
+  adminTestSubscriptionCreateSchema,
+  adminTestSubscriptionPatchSchema,
   adminTrialResetSchema,
 } from "../validation/schemas";
 import {
@@ -176,6 +179,10 @@ adminRouter.get(
       stats,
       purchases,
       subscriptions,
+      // Whether the test lab (synthetic subscriptions) may be shown/used. The
+      // console hides those controls unless this deploy allows test mode; the
+      // endpoints 503 regardless of the UI, so this is presentation, not a gate.
+      testTools: env.lemonSqueezyAllowTestMode,
       snapshot: snapshot
         ? {
             blocklists: snapshot.blocklists,
@@ -596,5 +603,220 @@ adminRouter.post(
     });
 
     res.status(202).json({ ok: true, endsAt });
+  }),
+);
+
+/**
+ * Turn auto-renewal back ON — the operator mirror of the user's own reactivate.
+ *
+ * A REAL Lemon Squeezy resume (PATCH `cancelled:false`), valid only while the
+ * subscription is cancelled but still inside its grace window; once expired,
+ * only a fresh checkout restores it. Ownership-checked against the account in
+ * the path. NOT test-gated: re-enabling a customer's renewal is a legitimate
+ * support action, exactly like the cancel above.
+ */
+adminRouter.post(
+  "/users/:id/reactivate-subscription",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const user = await getUserOr404(req.params.id);
+    const { reason, externalId } = adminReactivateSubscriptionSchema.parse(req.body);
+
+    if (!env.lemonSqueezyApiKey) {
+      throw new HttpError(503, "Billing is not configured on this deployment");
+    }
+
+    const sub = await prisma.subscription.findFirst({
+      where: { userId: user.id, provider: "lemonsqueezy", externalId },
+      select: { externalId: true, status: true, validUntil: true },
+    });
+    if (!sub) throw notFound("No such subscription on this account");
+    if (sub.status !== "cancelled") {
+      throw conflict(`Subscription is ${sub.status}, not cancelled — nothing to resume`);
+    }
+    // A synthetic row never lives at Lemon Squeezy; resuming it there is a 404.
+    if (sub.externalId.startsWith("sim_")) {
+      throw badRequest("That is a simulated subscription — edit it in the test lab, not at Lemon Squeezy.");
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LS_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await fetch(`${env.lemonSqueezyApiBase}/v1/subscriptions/${sub.externalId}`, {
+        method: "PATCH",
+        headers: {
+          Accept: "application/vnd.api+json",
+          "Content-Type": "application/vnd.api+json",
+          Authorization: `Bearer ${env.lemonSqueezyApiKey}`,
+        },
+        body: JSON.stringify({
+          data: { type: "subscriptions", id: String(sub.externalId), attributes: { cancelled: false } },
+        }),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      console.error("[admin] Lemon Squeezy unreachable:", err instanceof Error ? err.message : err);
+      throw badRequest("Could not reach the payment provider. Please try again.");
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!response.ok) {
+      const why = await readLemonSqueezyError(response);
+      console.error(`[admin] reactivate ${sub.externalId} failed: HTTP ${response.status} — ${why}`);
+      throw badRequest(`Could not resume the subscription — ${why}`);
+    }
+
+    let renewsAt: string | null = null;
+    try {
+      const body = (await response.json()) as { data?: { attributes?: { renews_at?: string | null } } };
+      renewsAt = body.data?.attributes?.renews_at ?? null;
+    } catch {
+      /* the resume still happened */
+    }
+
+    await audit(req, "reactivate_subscription", user.id, reason, { externalId, status: sub.status }, {
+      status: "active",
+      renewsAt,
+    });
+
+    res.status(202).json({ ok: true, renewsAt });
+  }),
+);
+
+/* ── Test lab: synthetic subscriptions ──────────────────────────────────────
+ *
+ * A conjuring tool for the operator's OWN testing, never a real payment. Lemon
+ * Squeezy cannot set an arbitrary remaining-day count or an arbitrary status on
+ * a subscription, so to exercise our resolver and the desktop gate across every
+ * state — mid-active, past_due, unpaid, expired, cancelled-with-grace — the
+ * operator writes a synthetic `Subscription` row directly.
+ *
+ * TWO GATES stop this from ever becoming a production bypass, and either alone
+ * would suffice:
+ *   1. Every write here answers 503 unless LEMONSQUEEZY_ALLOW_TEST_MODE is on.
+ *   2. The row is FORCED `testMode:true` (never taken from the request), so the
+ *      day test mode is switched off, `hideTestRows` drops it from the resolver,
+ *      both checkout guards, and every money endpoint at once — no cleanup.
+ * The id is `sim_<uuid>`; Lemon Squeezy ids are numeric, so a real webhook can
+ * never select or overwrite one of these, and these can never shadow a real sub.
+ */
+function requireTestTools(): void {
+  if (!env.lemonSqueezyAllowTestMode) {
+    throw new HttpError(503, "Test tools are disabled on this deployment");
+  }
+}
+
+/** The horizon column that must agree with `status`, mirroring validUntilFrom. */
+function synthDates(status: string, validUntil: Date): {
+  validUntil: Date;
+  trialEndsAt: Date | null;
+  renewsAt: Date | null;
+  endsAt: Date | null;
+} {
+  if (status === "on_trial") return { validUntil, trialEndsAt: validUntil, renewsAt: validUntil, endsAt: null };
+  if (status === "cancelled" || status === "expired")
+    return { validUntil, trialEndsAt: null, renewsAt: null, endsAt: validUntil };
+  return { validUntil, trialEndsAt: null, renewsAt: validUntil, endsAt: null };
+}
+
+adminRouter.post(
+  "/users/:id/test-subscription",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    requireTestTools();
+    const user = await getUserOr404(req.params.id);
+    const { reason, status, interval, remainingDays, validUntil } =
+      adminTestSubscriptionCreateSchema.parse(req.body);
+
+    const horizon = validUntil ?? new Date(Date.now() + (remainingDays ?? 0) * 86_400_000);
+    const variantId =
+      interval === "yearly" ? env.lemonSqueezyVariantYearly : env.lemonSqueezyVariantMonthly;
+
+    const row = await prisma.subscription.create({
+      data: {
+        userId: user.id,
+        provider: "lemonsqueezy",
+        externalId: `sim_${crypto.randomUUID()}`,
+        variantId: variantId || "",
+        interval,
+        status,
+        ...synthDates(status, horizon),
+        // FORCED, never from the request: this is the second, independent gate.
+        testMode: true,
+        providerUpdatedAt: null,
+      },
+    });
+
+    await audit(req, "test_subscription_create", user.id, reason, null, {
+      externalId: row.externalId,
+      status,
+      interval,
+      validUntil: horizon,
+    });
+
+    res.status(201).json({ subscription: row });
+  }),
+);
+
+/** Load a SYNTHETIC row for this account, or 404 — never a webhook-owned one. */
+async function getSimOr404(userId: string, subId: string) {
+  const row = await prisma.subscription.findUnique({ where: { id: subId } });
+  if (!row || row.userId !== userId || row.testMode !== true || !row.externalId.startsWith("sim_")) {
+    throw notFound("No such simulated subscription on this account");
+  }
+  return row;
+}
+
+adminRouter.patch(
+  "/users/:id/test-subscription/:subId",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    requireTestTools();
+    const before = await getSimOr404(req.params.id, req.params.subId);
+    const patch = adminTestSubscriptionPatchSchema.parse(req.body);
+
+    const status = patch.status ?? before.status;
+    const horizon =
+      patch.validUntil ??
+      (patch.remainingDays != null
+        ? new Date(Date.now() + patch.remainingDays * 86_400_000)
+        : (before.validUntil ?? new Date()));
+
+    const row = await prisma.subscription.update({
+      where: { id: before.id },
+      data: {
+        status,
+        ...(patch.interval ? { interval: patch.interval } : {}),
+        ...synthDates(status, horizon),
+      },
+    });
+
+    await audit(
+      req,
+      "test_subscription_update",
+      req.params.id,
+      patch.reason,
+      { status: before.status, validUntil: before.validUntil },
+      { status: row.status, validUntil: row.validUntil },
+    );
+
+    res.json({ subscription: row });
+  }),
+);
+
+adminRouter.delete(
+  "/users/:id/test-subscription/:subId",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    requireTestTools();
+    const before = await getSimOr404(req.params.id, req.params.subId);
+    const { reason } = adminActionSchema.parse(req.body ?? {});
+    await prisma.subscription.delete({ where: { id: before.id } });
+    await audit(req, "test_subscription_delete", req.params.id, reason ?? "", {
+      externalId: before.externalId,
+    }, { deleted: true });
+    res.json({ deleted: true });
   }),
 );

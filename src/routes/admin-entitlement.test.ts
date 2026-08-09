@@ -258,6 +258,111 @@ test("admin cancel-subscription refuses an id that is not the account's", async 
   assert.equal(finds[0][0].where.userId, USER, "ownership is scoped in the query");
 });
 
+/* ── Test lab: synthetic subscriptions ───────────────────────────────── */
+
+function withTestMode(t: Ctx, on: boolean) {
+  const before = env.lemonSqueezyAllowTestMode;
+  (env as any).lemonSqueezyAllowTestMode = on;
+  t.after(() => {
+    (env as any).lemonSqueezyAllowTestMode = before;
+  });
+}
+
+test("conjuring a synthetic subscription forces testMode and a sim_ id", async (t) => {
+  stubDb(t);
+  withTestMode(t, true);
+  const created = stubMethod(t, prisma.subscription as any, "create", async (a: any) => ({ id: "s1", ...a.data }));
+
+  const res = await request(app)
+    .post(`/api/admin/users/${USER}/test-subscription`)
+    .set(auth)
+    .send({ reason: "testing mid-active month", status: "active", interval: "monthly", remainingDays: 17 });
+
+  assert.equal(res.status, 201);
+  const data = created[0][0].data;
+  assert.equal(data.testMode, true, "always test-mode, never grantable in a live deploy");
+  assert.ok(data.externalId.startsWith("sim_"), "a synthetic id can never collide with a real LS id");
+  assert.equal(data.status, "active");
+  // 17 days out (validUntil, renewsAt for an active row).
+  const days = (new Date(data.validUntil).getTime() - Date.now()) / 86_400_000;
+  assert.ok(days > 16.9 && days < 17.1, `validUntil ~17d, got ${days}`);
+});
+
+test("the test lab is 503 when test mode is off (gate 1)", async (t) => {
+  stubDb(t);
+  withTestMode(t, false);
+  const created = stubMethod(t, prisma.subscription as any, "create", async () => ({}));
+
+  const res = await request(app)
+    .post(`/api/admin/users/${USER}/test-subscription`)
+    .set(auth)
+    .send({ reason: "should be blocked", status: "active", remainingDays: 5 });
+
+  assert.equal(res.status, 503);
+  assert.equal(created.length, 0, "no row is written when the tools are disabled");
+});
+
+test("even a synthetic client testMode:false is ignored — the row is forced test", async (t) => {
+  stubDb(t);
+  withTestMode(t, true);
+  const created = stubMethod(t, prisma.subscription as any, "create", async (a: any) => ({ id: "s1", ...a.data }));
+
+  await request(app)
+    .post(`/api/admin/users/${USER}/test-subscription`)
+    .set(auth)
+    // A caller trying to smuggle a real-looking row.
+    .send({ reason: "smuggle attempt", status: "active", remainingDays: 5, testMode: false, externalId: "999" });
+
+  assert.equal(created[0][0].data.testMode, true);
+  assert.ok(created[0][0].data.externalId.startsWith("sim_"));
+});
+
+test("PATCH/DELETE refuse a row that is not a sim row (webhook stays sole writer)", async (t) => {
+  stubDb(t);
+  withTestMode(t, true);
+  // A REAL LS row (numeric id, testMode false) must be untouchable by the lab.
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => ({
+    id: "real1",
+    userId: USER,
+    externalId: "2417513",
+    testMode: false,
+    status: "active",
+    validUntil: new Date(),
+  }));
+  const updated = stubMethod(t, prisma.subscription as any, "update", async () => ({}));
+
+  const res = await request(app)
+    .patch(`/api/admin/users/${USER}/test-subscription/real1`)
+    .set(auth)
+    .send({ reason: "must be refused", remainingDays: 0 });
+
+  assert.equal(res.status, 404, "a webhook-owned row is never editable by the test lab");
+  assert.equal(updated.length, 0);
+});
+
+test("'expire now' on a sim row moves it into the past", async (t) => {
+  stubDb(t);
+  withTestMode(t, true);
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => ({
+    id: "sim1",
+    userId: USER,
+    externalId: "sim_abc",
+    testMode: true,
+    status: "active",
+    validUntil: new Date(Date.now() + 10 * 86_400_000),
+  }));
+  const updated = stubMethod(t, prisma.subscription as any, "update", async (a: any) => a.data);
+
+  const res = await request(app)
+    .patch(`/api/admin/users/${USER}/test-subscription/sim1`)
+    .set(auth)
+    .send({ reason: "expire it", status: "expired", remainingDays: 0 });
+
+  assert.equal(res.status, 200);
+  assert.equal(updated[0][0].data.status, "expired");
+  assert.ok(updated[0][0].data.endsAt.getTime() <= Date.now() + 1000, "endsAt is now (expired)");
+});
+
 /* ── Audited writes ──────────────────────────────────────────────────── */
 
 test("set-plan is audited with before/after", async (t) => {

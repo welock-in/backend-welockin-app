@@ -503,6 +503,49 @@ export const adminCancelSubscriptionSchema = z.object({
   externalId: z.string().trim().min(1, "externalId is required"),
 });
 
+/** Turn auto-renewal back ON — a real Lemon Squeezy resume (PATCH cancelled:false). */
+export const adminReactivateSubscriptionSchema = z.object({
+  reason: adminReason,
+  externalId: z.string().trim().min(1, "externalId is required"),
+});
+
+/** The seven statuses Lemon Squeezy uses, mirrored for the test-lab conjuror. */
+const subscriptionStatusEnum = z.enum([
+  "on_trial",
+  "active",
+  "paused",
+  "past_due",
+  "unpaid",
+  "cancelled",
+  "expired",
+]);
+
+/**
+ * Conjure a SYNTHETIC subscription for testing (the admin test lab). Never a
+ * real Lemon Squeezy operation — the route forces `testMode:true` and a
+ * `sim_`-prefixed id, and refuses to run unless test mode is on. One of
+ * `remainingDays` / `validUntil` must be given so the row has a horizon.
+ */
+export const adminTestSubscriptionCreateSchema = z
+  .object({
+    reason: adminReason,
+    status: subscriptionStatusEnum,
+    interval: z.enum(["monthly", "yearly"]).default("monthly"),
+    remainingDays: z.number().min(0).max(730).optional(),
+    validUntil: dateInput.optional(),
+  })
+  .refine((v) => v.remainingDays != null || v.validUntil != null, {
+    message: "Provide remainingDays or validUntil",
+  });
+
+export const adminTestSubscriptionPatchSchema = z.object({
+  reason: adminReason,
+  status: subscriptionStatusEnum.optional(),
+  interval: z.enum(["monthly", "yearly"]).optional(),
+  remainingDays: z.number().min(0).max(730).optional(),
+  validUntil: dateInput.optional(),
+});
+
 export const adminTrialResetSchema = z.object({
   reason: adminReason,
   /**

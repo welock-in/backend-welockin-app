@@ -246,6 +246,60 @@ test("a returning account whose subscription lapsed gets NO second trial", async
   );
 });
 
+test("a NEW account on a machine that already trialed gets NO trial (per-device)", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "fresh@example.com" }));
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  // Brand-new account: no subscription rows of its own…
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  // …but THIS MACHINE already has a trial claim.
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => ({ id: "claim-1" }));
+  let sent: any = null;
+  stubFetch(t, async (_url: string, init: any) => {
+    sent = JSON.parse(init.body);
+    return { ok: true, status: 201, json: async () => ({ data: { attributes: { url: "https://x/c" } } }) };
+  });
+
+  await request(app)
+    .post("/api/checkout")
+    .set(auth)
+    .set("x-welockin-device-id", "win-abc")
+    .send({ plan: "monthly" });
+
+  assert.equal(sent.data.attributes.checkout_options.skip_trial, true, "the machine already used its trial");
+  // The device id rides in custom_data so the webhook can record the next trial.
+  assert.equal(sent.data.attributes.checkout_data.custom.device_id, "win-abc");
+});
+
+test("the shared 'unidentified' device id is treated as no device (fail open)", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  // If this were consulted with the shared id, one machine would burn the trial
+  // for all of them. It must NOT be consulted at all.
+  let claimLookups = 0;
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => {
+    claimLookups += 1;
+    return { id: "claim-shared" };
+  });
+  let sent: any = null;
+  stubFetch(t, async (_url: string, init: any) => {
+    sent = JSON.parse(init.body);
+    return { ok: true, status: 201, json: async () => ({ data: { attributes: { url: "https://x/c" } } }) };
+  });
+
+  await request(app)
+    .post("/api/checkout")
+    .set(auth)
+    .set("x-welockin-device-id", "win-unidentified")
+    .send({ plan: "monthly" });
+
+  assert.equal(claimLookups, 0, "the shared fallback id must never key the per-machine ledger");
+  assert.ok(!sent.data.attributes.checkout_options, "an unreadable machine still gets its trial");
+  assert.ok(!sent.data.attributes.checkout_data.custom.device_id, "and its shared id is not recorded");
+});
+
 test("a variant id supplied by the caller is ignored", async (t) => {
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));

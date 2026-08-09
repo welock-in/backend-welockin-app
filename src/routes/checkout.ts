@@ -12,7 +12,8 @@ import {
   type LemonSqueezyWebhook,
 } from "../lib/lemonsqueezy";
 import { clientIp, consumeRateLimit } from "../lib/rate-limit";
-import { readDeviceId } from "../lib/device";
+import { readDeviceId, isReliableDeviceId } from "../lib/device";
+import { ledgerHash } from "../lib/hash";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { accountGone, conflict, badRequest, notFound } from "../lib/http-error";
@@ -95,19 +96,26 @@ checkoutRouter.post(
     // between monthly and yearly is a Lemon Squeezy operation on the existing
     // subscription, not a new checkout — sending them here would leave them
     // holding two.
-    // ONE FREE TRIAL PER ACCOUNT. Lemon Squeezy applies the variant's trial to
-    // EVERY checkout for it — their docs are explicit that repeat-trial
-    // prevention is the merchant's job (there is no built-in block), and an
-    // account whose subscription lapsed would otherwise get a fresh free window
-    // every time it re-subscribed. So: if this account has EVER had a
-    // subscription row (any status — a lapsed or cancelled one counts), the new
-    // checkout skips the trial and charges immediately. The trial is a
-    // first-time offer, not a renewable one.
+    // ONE FREE TRIAL, PER ACCOUNT *AND* PER MACHINE. Lemon Squeezy applies the
+    // variant's trial to EVERY checkout for it — their docs are explicit that
+    // repeat-trial prevention is the merchant's job — so a lapsed customer, or
+    // someone who deletes their account and signs up again on the same PC, would
+    // otherwise get a fresh free window every time. We refuse the second trial
+    // in two independent ways, and EITHER is enough to trigger skip_trial:
     //
-    // This does NOT stop a brand-new EMAIL from farming trials — that needs a
-    // signal LS owns (the card) and its fraud detection, not something we can
-    // see at checkout. It closes the per-account case, which is the one asked
-    // for and the one entirely in our hands.
+    //   • per ACCOUNT — this account already has a subscription row (any status);
+    //   • per DEVICE  — this machine already has a TrialClaim (the same ledger
+    //     that anchors one trial per machine forever, keyed on a KEYED hash of
+    //     the device id, `deviceIdHash @unique`). The device leg is what closes
+    //     the "new email on the same laptop" hole the account leg cannot see.
+    //
+    // Neither can stop a genuinely NEW machine with a NEW email and a NEW card —
+    // that is LS's fraud territory, not ours — but together they close every
+    // case reachable from one physical computer.
+    // Only a device id we can safely key a per-machine decision on — a shared
+    // "unidentified" fallback is treated as no id (see isReliableDeviceId).
+    const rawDeviceId = readDeviceId(req);
+    const deviceId = isReliableDeviceId(rawDeviceId) ? rawDeviceId : "";
     let skipTrial = false;
     if (plan !== "lifetime") {
       const subs = await prisma.subscription.findMany({
@@ -117,8 +125,23 @@ checkoutRouter.post(
       if (subs.some((sub) => subscriptionGrants(sub, new Date()))) {
         throw conflict("You already have an active subscription.");
       }
-      // A row exists at all → this account has subscribed before → no second trial.
-      skipTrial = subs.length > 0;
+      const accountHadSubscription = subs.length > 0;
+
+      // The device leg. A TrialClaim for this machine — written when its last
+      // trial started (see the webhook), or by the legacy cardless-trial path —
+      // means this computer has had its trial. Fails OPEN: no device id (an old
+      // client, or a machine that could not identify itself) simply falls back
+      // to the account leg, never a refusal.
+      let deviceHadTrial = false;
+      if (deviceId) {
+        const claim = await prisma.trialClaim.findUnique({
+          where: { deviceIdHash: ledgerHash(deviceId) },
+          select: { id: true },
+        });
+        deviceHadTrial = claim != null;
+      }
+
+      skipTrial = accountHadSubscription || deviceHadTrial;
     }
 
     const body = {
@@ -127,8 +150,13 @@ checkoutRouter.post(
         attributes: {
           checkout_data: {
             email: user.email,
-            // The whole point of this endpoint. Read back verbatim by the webhook.
-            custom: { user_id: userId },
+            // Read back verbatim by the webhook. `user_id` binds the order to
+            // this account; `device_id` lets the webhook record that THIS
+            // machine has now had its trial, so the next checkout from it skips
+            // the trial (see the skip_trial logic above). Omitted when the
+            // client sent no device id — an old build, or a machine that could
+            // not identify itself.
+            custom: deviceId ? { user_id: userId, device_id: deviceId } : { user_id: userId },
           },
           product_options: {
             // The RETURN PATH. Lemon Squeezy's confirmation modal shows a

@@ -170,8 +170,9 @@ subscriptionRouter.get(
         trialEndsAt: live.trialEndsAt?.toISOString() ?? null,
         validUntil: live.validUntil?.toISOString() ?? null,
         // Whether "Cancel" should be offered at all. A row already cancelled is
-        // running out its grace period and has nothing left to cancel.
-        cancellable: live.status !== "cancelled",
+        // running out its grace period and has nothing left to cancel; a row on
+        // trial cannot be cancelled from inside the app (see POST /cancel).
+        cancellable: live.status !== "cancelled" && live.status !== "on_trial",
         // Whether "Reactivate" should be offered: a cancelled subscription still
         // inside its paid-through window can be un-cancelled (POST /reactivate).
         // `live` is already the granting row, so being cancelled here means
@@ -220,6 +221,14 @@ subscriptionRouter.post(
     const live = subs.find((sub) => subscriptionGrants(sub, now) && sub.status !== "cancelled");
     if (!live) {
       throw conflict("There is no active subscription to cancel on this account.");
+    }
+    // No cancelling from inside the app while the trial is running (product
+    // rule). It is not a cage: the customer is warned two days before the trial
+    // ends and can still stop the charge from Lemon Squeezy's own portal
+    // ("Manage subscription"), so the in-app block only keeps the trial from
+    // being thrown away by a mis-click. In-app cancel is for paying subscribers.
+    if (live.status === "on_trial") {
+      throw conflict("You're on a free trial — there's nothing to cancel yet.");
     }
 
     const controller = new AbortController();

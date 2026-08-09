@@ -752,6 +752,53 @@ test("a subscription is mirrored with the status Lemon Squeezy actually sent", a
 });
 
 /*
+ * One card-trial per MACHINE: when a trial subscription is created and our
+ * checkout put a device id in the custom data, the device is recorded in the
+ * trial ledger so its next checkout skips the trial.
+ */
+test("a trial subscription records the device that started it", async (t) => {
+  configured(t);
+  const db = stubDb(t, { userFirst: async () => ({ id: USER }) });
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
+  const claims = stubMethod(t, prisma.trialClaim as any, "upsert", async (a: any) => a.create);
+
+  const res = await deliver(subBody({ meta: { custom_data: { user_id: USER, device_id: "win-abc" } } }));
+
+  assert.equal(res.status, 200);
+  assert.equal(claims.length, 1, "the device is recorded as having used its trial");
+  assert.ok(claims[0][0].where.deviceIdHash, "keyed on the hashed device id");
+  assert.deepEqual(claims[0][0].update, {}, "create-only: an existing claim is never moved");
+});
+
+test("the shared 'unidentified' device id is never written to the trial ledger", async (t) => {
+  configured(t);
+  const db = stubDb(t, { userFirst: async () => ({ id: USER }) });
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
+  const claims = stubMethod(t, prisma.trialClaim as any, "upsert", async (a: any) => a.create);
+
+  await deliver(subBody({ meta: { custom_data: { user_id: USER, device_id: "win-unidentified" } } }));
+
+  assert.equal(claims.length, 0, "one unreadable machine must not burn the trial for all of them");
+});
+
+test("a subscription created WITHOUT a trial records no device (skip_trial path)", async (t) => {
+  configured(t);
+  const db = stubDb(t, { userFirst: async () => ({ id: USER }) });
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
+  const claims = stubMethod(t, prisma.trialClaim as any, "upsert", async (a: any) => a.create);
+
+  // No trial_ends_at → this checkout skipped the trial; nothing to record.
+  await deliver(
+    subBody({
+      meta: { custom_data: { user_id: USER, device_id: "win-abc" } },
+      attributes: { status: "active", trial_ends_at: null },
+    }),
+  );
+
+  assert.equal(claims.length, 0, "only an actual trial consumes the machine's one trial");
+});
+
+/*
  * The date the resolver reads is derived ONCE here rather than chosen at read
  * time, because picking between three dates in four places is how the three
  * drift apart. On trial, the trial's end is the one that matters.

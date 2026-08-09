@@ -18,6 +18,8 @@ import {
   type ParsedSubscription,
 } from "../lib/lemonsqueezy";
 import { intervalForVariant, subscriptionGrants, validUntilFrom } from "../lib/subscription";
+import { ledgerHash } from "../lib/hash";
+import { isReliableDeviceId } from "../lib/device";
 
 export const lemonSqueezyWebhookRouter = Router();
 
@@ -345,6 +347,41 @@ async function cancelSubscriptionsForLifetimeBuyer(userId: string): Promise<void
   }
 }
 
+/**
+ * Mark THIS MACHINE as having used its one free trial.
+ *
+ * Writes into the same `TrialClaim` ledger that has always enforced one trial
+ * per machine (keyed on a server-peppered hash of the device id, `deviceIdHash
+ * @unique`). Create-only via upsert with an empty update: a machine that already
+ * has a claim — from the legacy cardless trial, or an earlier card trial — keeps
+ * the claim it has, so a trial's anchor is never moved. The `endsAt` we store is
+ * the LS trial end, for support; nothing gates on it here (the checkout only
+ * asks "does a claim exist").
+ *
+ * Best-effort: the subscription has already been recorded by the caller. A lost
+ * claim only re-opens the "same machine, new email" window, and is logged.
+ */
+async function recordDeviceTrialConsumed(
+  deviceId: string,
+  userId: string,
+  trialEndsAt: Date,
+): Promise<void> {
+  const deviceIdHash = ledgerHash(deviceId);
+  await prisma.trialClaim
+    .upsert({
+      where: { deviceIdHash },
+      create: {
+        deviceIdHash,
+        firstUserId: userId,
+        startedAt: new Date(),
+        endsAt: trialEndsAt,
+        status: "card_trial",
+      },
+      update: {},
+    })
+    .catch((e) => console.error(`[lemonsqueezy] could not record device trial for ${userId}:`, e));
+}
+
 /** Record that an order/subscription has been turned into a grant, once, for ever. */
 async function markOrderConsumed(externalId: string, kind: "order" | "subscription"): Promise<void> {
   await prisma.consumedOrder
@@ -609,6 +646,22 @@ async function handleSubscription(
   if (!userId) {
     console.warn(`[lemonsqueezy] unmatched subscription ${sub.subscriptionId} (${sub.event})`);
     return { status: "failed", reason: `no account matches subscription ${sub.subscriptionId}` };
+  }
+
+  // ONE CARD-TRIAL PER MACHINE. If this subscription came with a trial and our
+  // checkout put a device id in the custom data, record that this machine has
+  // now used its trial — so the NEXT checkout from it skips the trial (see
+  // routes/checkout.ts). The same TrialClaim ledger that anchors one trial per
+  // machine forever; the write is create-only, so it never moves an existing
+  // claim. Best-effort: a missed record only re-opens the narrow window, never
+  // fails the subscription.
+  if (sub.trialEndsAt) {
+    const raw = body.meta?.custom_data?.device_id;
+    const deviceId = typeof raw === "string" ? raw.trim() : "";
+    // Same guard as the checkout side: never key the ledger on the shared
+    // "unidentified" fallback, or one such machine would use up the trial for
+    // every other machine that cannot identify itself.
+    if (isReliableDeviceId(deviceId)) await recordDeviceTrialConsumed(deviceId, userId, sub.trialEndsAt);
   }
 
   const wrote = await mirrorSubscriptionState(sub, userId, body as Prisma.InputJsonValue);

@@ -4,6 +4,14 @@ import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { asyncHandler } from "../middleware/async-handler";
 import { requireAdmin } from "../middleware/admin-auth";
+import { hideTestRowsFor } from "../lib/subscription";
+import {
+  MAX_ATTEMPTS,
+  drainCancels,
+  enqueueAndAttemptCancel,
+  replayTask,
+} from "../lib/billing-tasks";
+
 import { signAdminToken } from "../lib/admin-jwt";
 import { toPublicUser } from "../lib/user";
 import { notFound, unauthorized, badRequest, conflict, HttpError } from "../lib/http-error";
@@ -289,12 +297,139 @@ adminRouter.delete(
       { email: before.email, plan: before.plan, createdAt: before.createdAt },
       { deleted: true },
     );
+    // STOP CHARGING THE CARD, before the rows that name the subscription go.
+    // Deleting from the console had exactly the same hole as DELETE /api/me: the
+    // account vanished, Lemon Squeezy was never told, and the customer kept
+    // being billed for something nobody could see any more. Enqueued first so an
+    // unreachable provider postpones the cancellation instead of losing it.
+    const liveSubs = await prisma.subscription.findMany({
+      // Test rows filtered — the lab's synthetic ids would dead-letter a task for
+      // a subscription Lemon Squeezy has never heard of.
+      // Lemon Squeezy rows only: the outbox cannot cancel an Apple subscription
+      // (the customer does that in their App Store settings), so enqueueing one
+      // would only mint a dead-lettered task.
+      where: {
+        userId: req.params.id,
+        provider: "lemonsqueezy",
+        ...hideTestRowsFor(req.params.id, env),
+      },
+      select: { externalId: true, status: true },
+    });
+    for (const s of liveSubs) {
+      if (s.status === "expired" || s.status === "cancelled") continue;
+      await enqueueAndAttemptCancel(s.externalId, "account-deleted-by-admin");
+    }
+
     // Relations (devices, focusEvents, snapshot, authProviders, liveSessions)
     // all cascade on delete in the schema. ConsumedOrder does NOT — it has no
     // user relation on purpose, so a paid order stays spent after the account
     // is gone (see schema.prisma + the audit's recycled-email finding).
     await prisma.user.delete({ where: { id: req.params.id } });
     res.json({ deleted: true });
+  }),
+);
+
+/**
+ * Work off the billing actions we still owe Lemon Squeezy, by hand.
+ *
+ * The scheduled run at `/api/cron/billing-tasks` is what normally does this; this
+ * is the same drain behind the admin gate, for an operator who has just fixed the
+ * cause and does not want to wait for the next tick.
+ *
+ * Safe to press twice, and safe to press while the cron is running: each task is
+ * claimed by an atomic conditional update before the provider is touched, and
+ * cancelling an already-cancelled subscription is a no-op anyway.
+ */
+adminRouter.post(
+  "/billing-tasks/drain",
+  requireAdmin,
+  asyncHandler(async (_req, res) => {
+    res.json(await drainCancels());
+  }),
+);
+
+/**
+ * What is still owed — split into what is still being retried and what has given
+ * up.
+ *
+ * The split is the point. A dead-lettered task is no longer picked up by the
+ * drain, so it is exactly the row that will sit there for ever if nobody is shown
+ * it: a customer whose card is still being charged and whose cancellation the
+ * automatic machinery has stopped trying to send.
+ */
+adminRouter.get(
+  "/billing-tasks",
+  requireAdmin,
+  asyncHandler(async (_req, res) => {
+    const columns = {
+      id: true,
+      externalId: true,
+      kind: true,
+      reason: true,
+      attempts: true,
+      lastError: true,
+      lockedAt: true,
+      nextAttemptAt: true,
+      createdAt: true,
+    } as const;
+
+    const [pending, deadLetter] = await Promise.all([
+      prisma.billingTask.findMany({
+        where: { doneAt: null, attempts: { lt: MAX_ATTEMPTS } },
+        orderBy: { nextAttemptAt: "asc" },
+        take: 100,
+        select: columns,
+      }),
+      prisma.billingTask.findMany({
+        where: { doneAt: null, attempts: { gte: MAX_ATTEMPTS } },
+        orderBy: { createdAt: "asc" },
+        take: 100,
+        select: columns,
+      }),
+    ]);
+
+    res.json({
+      owed: pending.length + deadLetter.length,
+      pending,
+      deadLetter,
+      maxAttempts: MAX_ATTEMPTS,
+    });
+  }),
+);
+
+/**
+ * Put a dead-lettered task back in the queue.
+ *
+ * What makes the dead letter safe to have. A task exhausts its attempts for
+ * reasons an operator fixes — an expired API key, a subscription Lemon Squeezy
+ * refused to touch — and without a way back the only remedy would be editing the
+ * database by hand. Audited like every other money action, because "who put this
+ * back and why" is the first question when it fails again.
+ */
+adminRouter.post(
+  "/billing-tasks/:id/replay",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { reason } = adminActionSchema.parse(req.body ?? {});
+    const task = await prisma.billingTask.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, externalId: true, attempts: true, doneAt: true, lastError: true },
+    });
+    if (!task) throw notFound("Billing task not found");
+    if (task.doneAt) throw conflict("That billing task is already settled.");
+
+    const ok = await replayTask(task.id);
+    await audit(
+      req,
+      "billing_task_replay",
+      // Not a user action: the outbox is deliberately keyed on the PROVIDER's id
+      // and carries no user, because the account it belonged to may be deleted.
+      "",
+      reason ?? "",
+      { attempts: task.attempts, lastError: task.lastError },
+      { externalId: task.externalId, requeued: ok },
+    );
+    res.json({ requeued: ok });
   }),
 );
 

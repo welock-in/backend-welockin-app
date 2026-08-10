@@ -215,6 +215,16 @@ export const env = {
   // is empty (no blank-password admin in prod).
   adminUsername: process.env.ADMIN_USERNAME ?? "admin",
   adminPassword: process.env.ADMIN_PASSWORD ?? "",
+  /**
+   * Shared secret for the scheduled runs (`/api/cron/*`).
+   *
+   * Vercel sends it as `Authorization: Bearer $CRON_SECRET` on every cron
+   * invocation. UNSET MEANS THE CRON ROUTES REFUSE — never "let anyone in": the
+   * billing drain talks to Lemon Squeezy with our API key, so an open endpoint
+   * would be a free way to burn the quota, and the failure of an unset secret
+   * must be a cron that does not run rather than one anybody can run.
+   */
+  cronSecret: process.env.CRON_SECRET ?? "",
   // Separate signing secret for admin tokens so a leaked user JWT can never be a
   // valid admin token (and vice-versa). Falls back to the (prod-validated)
   // jwtSecret when unset.

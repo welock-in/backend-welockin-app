@@ -27,6 +27,7 @@ import {
 import { claimWebhookEvent, markWebhookEvent } from "../lib/webhook-events";
 import { ledgerHash } from "../lib/hash";
 import { isReliableDeviceId } from "../lib/device";
+import { enqueueAndAttemptCancel } from "../lib/billing-tasks";
 
 export const lemonSqueezyWebhookRouter = Router();
 
@@ -249,6 +250,17 @@ export async function recordPaidOrder(
     if (consumed) return "already-consumed";
   }
 
+  // BEFORE the upsert, and that ordering is the point. The cancellation used to
+  // run after it, inside the `!existing` branch — which is also the guard that
+  // stops the branch ever running again. A crash in between therefore lost the
+  // cancellation permanently: the retry found a Purchase, skipped the branch, and
+  // the customer kept a lifetime licence AND a live monthly charge.
+  //
+  // Safe to run first: everything above has already established that this is a
+  // paid, sellable lifetime order, so the recurring plan it replaces should stop
+  // whether or not our own row write succeeds a millisecond later.
+  if (!existing) await cancelSubscriptionsForLifetimeBuyer(userId);
+
   await prisma.purchase.upsert({
     where: { provider_externalId: { provider: PROVIDER, externalId: order.orderId } },
     create: {
@@ -277,14 +289,6 @@ export async function recordPaidOrder(
   // skips this. Never deleted, never cascaded — that is the whole point.
   if (!existing) {
     await markOrderConsumed(order.orderId, "order");
-    // `recordPaidOrder` is only ever reached for the LIFETIME variant (the
-    // webhook's isSellableOrder and /confirm's variant branch both gate on it),
-    // so a new Purchase here means this account just bought lifetime. If they
-    // were paying monthly/yearly, that subscription must stop — otherwise they
-    // pay every month ON TOP of a licence they already own for ever. Done on the
-    // SERVER, once (guarded by existing===null), so it happens even if the app
-    // never reopens. Best-effort: a failed cancel must not undo the grant.
-    await cancelSubscriptionsForLifetimeBuyer(userId);
   }
   return "written";
 }
@@ -299,7 +303,6 @@ export async function recordPaidOrder(
  * and simply stops renewing. The webhook that the cancel triggers writes the row.
  */
 async function cancelSubscriptionsForLifetimeBuyer(userId: string): Promise<void> {
-  if (!env.lemonSqueezyApiKey) return;
   let subs: (SubscriptionLike & { externalId: string })[];
   try {
     subs = await prisma.subscription.findMany({
@@ -332,35 +335,14 @@ async function cancelSubscriptionsForLifetimeBuyer(userId: string): Promise<void
     // holding a lifetime licence AND a live recurring charge — the exact
     // outcome the outbox in this same change set exists to prevent.
     if (!subscriptionIsLive(sub)) continue;
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 10_000);
-      try {
-        const r = await fetch(`${env.lemonSqueezyApiBase}/v1/subscriptions/${sub.externalId}`, {
-          method: "DELETE",
-          headers: {
-            Accept: "application/vnd.api+json",
-            "Content-Type": "application/vnd.api+json",
-            Authorization: `Bearer ${env.lemonSqueezyApiKey}`,
-          },
-          signal: controller.signal,
-        });
-        if (!r.ok && r.status !== 404) {
-          console.error(
-            `[lemonsqueezy] lifetime buyer ${userId}: cancel of ${sub.externalId} returned HTTP ${r.status}`,
-          );
-        } else {
-          console.info(`[lemonsqueezy] lifetime buyer ${userId}: cancelled subscription ${sub.externalId}`);
-        }
-      } finally {
-        clearTimeout(timer);
-      }
-    } catch (e) {
-      console.error(
-        `[lemonsqueezy] lifetime buyer ${userId}: cancel of ${sub.externalId} failed:`,
-        e instanceof Error ? e.message : e,
-      );
-    }
+    // Through the outbox rather than straight at Lemon Squeezy. It used to be a
+    // single fetch with a `console.error` if it failed — and the failure mode of
+    // that shrug is a customer holding a lifetime licence AND a live monthly
+    // charge, invisible until they notice it on their statement. Writing the
+    // intent down first means an outage postpones the cancellation instead of
+    // losing it. Still never throws: the grant has already landed and must not
+    // be undone by the provider being slow.
+    await enqueueAndAttemptCancel(sub.externalId, "lifetime-upgrade");
   }
 }
 

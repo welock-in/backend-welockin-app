@@ -675,6 +675,65 @@ model WebhookEvent {
 /// cancelled subscription VALID until the end of the period already paid for, so
 /// treating `cancelled` as "no access" cuts off someone who paid through the end
 /// of the month and is right to complain. `expired` is the status that means gone.
+/// A billing action we owe the PROVIDER, recorded so it cannot be lost.
+///
+/// WHY IT EXISTS. Two places used to call Lemon Squeezy "best-effort" and shrug
+/// if the call failed, and in both the shrug costs the customer real money:
+///
+///   · DELETE /api/me removed the account and let the Subscription rows cascade
+///     away without ever telling Lemon Squeezy to stop. The card kept being
+///     charged, and the row that would have explained why was gone.
+///   · Buying the lifetime licence tries to cancel the monthly/yearly plan it
+///     replaces. A failed call there leaves the customer holding lifetime AND a
+///     live recurring charge.
+///
+/// Both are the same shape: an outbound call that MUST eventually happen, made
+/// at a moment when the provider may be unreachable and just before the local
+/// evidence disappears. So the intent is written down first, attempted
+/// immediately, and retried until it lands.
+///
+/// Deliberately keyed on the provider's id and not on ours: by the time this is
+/// retried, the account it belonged to may not exist.
+model BillingTask {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  provider String
+  /// The subscription id AT the provider.
+  externalId String
+  /// "cancel" today. Named so a future "refund" or "resume" needs no migration.
+  kind String
+  /// Why we owe it — "account-deleted", "lifetime-upgrade". For support, and for
+  /// the admin console to explain a stuck row without reading code.
+  reason String
+
+  attempts      Int       @default(0)
+  lastError     String?
+  /// Set when the provider has confirmed it. Null means still owed.
+  doneAt        DateTime?
+  /// Exponential backoff, so a provider outage is not hammered.
+  nextAttemptAt DateTime  @default(now())
+
+  /// CONCURRENCY LOCK. Claimed by an atomic conditional update before the
+  /// provider is called, so two cron runs — or a cron overlapping a manual
+  /// drain — cannot both send the same cancellation.
+  ///
+  /// A timestamp rather than a boolean, because a run that dies mid-task would
+  /// otherwise strand the row for ever: a lock older than LOCK_TTL_MS is
+  /// treated as abandoned and may be re-claimed. Cancelling twice at Lemon
+  /// Squeezy is harmless (the second is a no-op, or a 404 we count as done), so
+  /// the lock is here to avoid waste and log noise, not to guarantee
+  /// exactly-once — which no distributed system gets for free anyway.
+  lockedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// One outstanding task per action per subscription. A second lifetime webhook,
+  /// or a retried deletion, must not queue the same cancellation twice.
+  @@unique([provider, externalId, kind])
+  @@index([doneAt, nextAttemptAt])
+}
+
 model Subscription {
   id String @id @default(auto()) @map("_id") @db.ObjectId
 

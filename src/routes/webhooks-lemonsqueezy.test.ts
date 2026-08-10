@@ -224,11 +224,14 @@ test("a paid order for our variant grants the licence to the account the checkou
 
 /*
  * Buying lifetime while paying monthly must STOP the monthly billing — otherwise
- * the customer pays every month on top of a licence they now own for ever. The
- * webhook cancels the live subscription at Lemon Squeezy (DELETE), server-side,
- * so it happens even if the app never reopens.
+ * the customer pays every month on top of a licence they now own for ever.
+ *
+ * It goes through the outbox now, and the ORDER is the point: the instruction is
+ * written down BEFORE the call goes out. It used to be a lone fetch with a
+ * console.error on failure, so a Lemon Squeezy blip left the customer holding
+ * lifetime AND a live recurring charge, with nothing anywhere to retry it.
  */
-test("a lifetime purchase cancels the buyer's live subscription", async (t) => {
+test("a lifetime purchase records and sends the cancellation of the buyer's plan", async (t) => {
   // The API key is what lets the cancel call go out (the webhook itself needs
   // only the signing secret).
   configured(t, { lemonSqueezyApiKey: "test-key" });
@@ -237,6 +240,25 @@ test("a lifetime purchase cancels the buyer's live subscription", async (t) => {
       { externalId: "sub-77001", status: "active", validUntil: new Date(Date.now() + 20 * 86_400_000) },
     ],
   });
+
+  const queued: any[] = [];
+  let created = false;
+  stubMethod(t, prisma.billingTask as any, "findUnique", async () =>
+    created ? { id: "task-1", externalId: "sub-77001", attempts: 0, doneAt: null } : null,
+  );
+  stubMethod(t, prisma.billingTask as any, "create", async (a: any) => {
+    created = true;
+    queued.push(a.data);
+    return a.data;
+  });
+  // The claim: an atomic conditional update taken before the provider is called.
+  stubMethod(t, prisma.billingTask as any, "updateMany", async () => ({ count: 1 }));
+  const settled: any[] = [];
+  stubMethod(t, prisma.billingTask as any, "update", async (a: any) => {
+    settled.push(a.data);
+    return {};
+  });
+
   let cancelled = "";
   let method = "";
   const originalFetch = globalThis.fetch;
@@ -253,8 +275,12 @@ test("a lifetime purchase cancels the buyer's live subscription", async (t) => {
 
   assert.equal(res.status, 200);
   assert.equal(db.purchaseUpsert.length, 1, "the lifetime licence is still recorded");
+  assert.equal(queued.length, 1, "the cancellation is written down before it is attempted");
+  assert.equal(queued[0].externalId, "sub-77001");
+  assert.equal(queued[0].reason, "lifetime-upgrade");
   assert.equal(method, "DELETE");
   assert.ok(cancelled.endsWith("/v1/subscriptions/sub-77001"), cancelled);
+  assert.ok(settled[0]?.doneAt instanceof Date, "and marked settled once LS confirms");
 });
 
 /*

@@ -197,6 +197,7 @@ Both land in the same `Purchase` table, told apart by `provider`.
 | `LEMONSQUEEZY_STORE_ID` | *(empty)* | Your store. An order from any other store is refused. |
 | `LEMONSQUEEZY_VARIANT_ID` | *(empty)* | **The one variant we sell.** Unset means *sell nothing*, never *sell everything* — a signature only proves the delivery is ours, not that the buyer bought the licence. |
 | `LEMONSQUEEZY_VARIANTS_GRANTING` | *(empty)* | **Retired subscription variants that must keep granting** — comma-separated. The variant allowlist refuses anything it does not recognise, and a price change in Lemon Squeezy mints a *new* variant id while existing subscribers stay on the old one. Without this list, the deploy that updates the ids above cuts every one of them off, silently. Get the value from `GET /api/admin/billing/variants` before deploying. |
+| `CRON_SECRET` | *(empty)* | Credential for the scheduled runs under `/api/cron/*` (Vercel sends it as a bearer token). **Unset means those routes refuse everyone**, which also means the billing outbox is never drained — a deleted customer would keep being charged. Set it before going live. |
 | `LEMONSQUEEZY_API_BASE` | `https://api.lemonsqueezy.com` | Override for tests. |
 | `LEMONSQUEEZY_ALLOW_TEST_MODE` | `false` | May a **test-mode** order grant a real lifetime licence? Requires the literal `"true"`, and is deliberately *not* inferred from `NODE_ENV` — which is unset on more machines than anyone expects, and every one of those would have failed open into a free-licence tap. |
 
@@ -452,6 +453,40 @@ Set the environment variables above in the Vercel project. `prisma generate` run
 on install; run `npx prisma db push` once against the production `DATABASE_URL`
 (locally with that URL, or a one-off job) to create collections/indexes, and
 `npm run device:migrate` once to create the phone-binding partial indexes.
+
+#### The billing cron — READ BEFORE GO-LIVE
+
+`vercel.json` declares one scheduled job:
+
+```json
+{ "path": "/api/cron/billing-tasks", "schedule": "*/15 * * * *" }
+```
+
+It drains the cancellation outbox (`BillingTask`) — the cancellations we owe Lemon
+Squeezy after an account deletion or a lifetime upgrade. Each one is attempted
+inline when it is created, so this job only matters when Lemon Squeezy was
+unreachable at that moment. That is also exactly when it matters most: **without
+it, a deleted customer keeps being charged and nothing ever retries.**
+
+**Every-15-minutes requires Vercel Pro.** The Hobby plan allows cron jobs only
+**once per day**, and a deploy carrying this schedule on Hobby is rejected.
+
+A daily cron is **not sufficient for go-live**: it leaves up to 24 hours of
+charging on a card whose owner has deleted their account. If this project is on
+Hobby, pick one before selling:
+
+- upgrade to Vercel Pro and keep `*/15 * * * *`; or
+- keep the Vercel entry daily as a backstop and drive the endpoint from a reliable
+  external scheduler (GitHub Actions `schedule`, cron-job.org, Upstash QStash, an
+  always-on box) every 10–15 minutes:
+
+  ```bash
+  curl -fsS -X POST -H "Authorization: Bearer $CRON_SECRET"     https://app.connect.welock.in/api/cron/billing-tasks
+  ```
+
+Whichever you choose, confirm it: `GET /api/admin/billing-tasks` should report
+`owed: 0` in steady state, and a non-empty `deadLetter` means cancellations have
+given up and a customer may still be paying.
 
 **Production checklist (boot fails closed without the required secrets):**
 

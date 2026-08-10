@@ -3,6 +3,9 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { toPublicUser } from "../lib/user";
 import { notFound } from "../lib/http-error";
+import { enqueueAndAttemptCancel } from "../lib/billing-tasks";
+import { env } from "../lib/env";
+import { hideTestRowsFor } from "../lib/subscription";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 
@@ -74,8 +77,44 @@ meRouter.delete(
     // this at purchase time; this covers the rows that predate the ledger.
     const [oldPurchases, oldSubs] = await Promise.all([
       prisma.purchase.findMany({ where: { userId }, select: { provider: true, externalId: true } }),
-      prisma.subscription.findMany({ where: { userId }, select: { provider: true, externalId: true } }),
+      prisma.subscription.findMany({
+        // Test rows filtered like every other subscription query. The admin test
+        // lab mints synthetic rows with ids Lemon Squeezy has never heard of, and
+        // asking it to cancel one would fail every attempt until the task
+        // dead-lettered — a permanent red mark for a subscription that never
+        // existed, sitting next to the real ones that do need attention.
+        where: { userId, ...hideTestRowsFor(userId, env) },
+        select: { provider: true, externalId: true, status: true },
+      }),
     ]);
+
+    // STOP CHARGING THE CARD. Deleting the account here removed our record of the
+    // subscription and told Lemon Squeezy nothing at all — so the customer went
+    // on being billed every month for an account that no longer existed, and the
+    // row that would have explained it had cascaded away.
+    //
+    // Enqueued BEFORE the cascade, deliberately: once the rows are gone there is
+    // nothing left to read the subscription ids from, so the instruction has to
+    // outlive them. The outbox is keyed on the provider's id for the same reason
+    // — by the time it is retried, the account it belonged to will not exist.
+    for (const s of oldSubs) {
+      if (s.status === "expired" || s.status === "cancelled") continue; // nothing left to stop
+      // The outbox speaks Lemon Squeezy only. An Apple subscription cannot be
+      // cancelled from the server — the customer does that in their App Store
+      // settings — so enqueueing it would only mint a dead-lettered task.
+      if (s.provider !== "lemonsqueezy") continue;
+      const recorded = await enqueueAndAttemptCancel(s.externalId, "account-deleted");
+      // We are one line away from deleting the only record of this subscription.
+      // If the instruction did not land, stopping here is the lesser harm: the
+      // customer retries and is deleted a moment later, whereas continuing would
+      // orphan a live charge with nothing anywhere pointing at it. Deletion is
+      // deferred, never refused.
+      if (!recorded) {
+        throw new Error(
+          `could not record the cancellation for subscription ${s.externalId}; deletion aborted`,
+        );
+      }
+    }
     for (const p of oldPurchases) {
       await prisma.consumedOrder
         .upsert({

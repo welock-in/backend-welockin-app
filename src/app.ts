@@ -4,6 +4,7 @@ import helmet from "helmet";
 import morgan from "morgan";
 import { env } from "./lib/env";
 import { healthRouter } from "./routes/health";
+import { cronRouter } from "./routes/cron";
 import { healthLemonSqueezyRouter } from "./routes/health-lemonsqueezy";
 import { updatesRouter } from "./routes/updates";
 import { authRouter } from "./routes/auth";
@@ -76,6 +77,10 @@ export function createApp(): Express {
 
   // Routes — everything under /api.
   app.use("/api/health", healthRouter);
+  // Scheduled work. Mounted UNGATED like /api/health because its caller is the
+  // platform's scheduler, not a signed-in user — it carries CRON_SECRET instead,
+  // and refuses outright when that is unset (see routes/cron.ts).
+  app.use("/api/cron", cronRouter);
   // Desktop auto-update manifest. PUBLIC like /api/health: a signed-out machine
   // must still be able to receive a fix.
   app.use("/api/updates", updatesRouter);

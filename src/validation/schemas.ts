@@ -137,6 +137,14 @@ export const appleAuthSchema = z.object({
 });
 
 /**
+ * Every mutating admin action carries one, and it is validated rather than
+ * merely accepted: `.trim()` before `.min(3)` means a reason of spaces is the
+ * same as no reason at all, and the cap keeps a paste accident out of the audit
+ * log. Declared up here because the grant schemas below all reach for it.
+ */
+const adminReason = z.string().trim().min(3, "A reason is required").max(500);
+
+/**
  * Accepts a date as an ISO 8601 string or a millisecond epoch number and
  * coerces it to a Date. Rejects invalid dates.
  */
@@ -290,13 +298,92 @@ export const adminLoginSchema = z.object({
   password: z.string().min(1, "password is required"),
 });
 
-export const adminSetPlanSchema = z.object({
-  plan: z.string().trim().min(1, "plan is required"),
-  // Optional so the existing admin UI keeps working, but recorded in the audit
-  // row when present — a plan change with a stated reason is a change someone can
-  // explain six months later.
-  reason: z.string().trim().max(500).optional(),
-});
+/**
+ * Plan names `POST /api/admin/users/:id/plan` will hand out as a complimentary
+ * grant. Anything else withdraws the grant instead.
+ *
+ * Lowercase, and compared lowercased: the console sends whatever is in its
+ * dropdown, and a capitalisation difference must not silently become "revoke".
+ */
+export const GRANTING_PLAN_NAMES: ReadonlySet<string> = new Set([
+  "pro",
+  "lifetime",
+  "active",
+  "comped",
+  "trialing",
+]);
+
+/** The only plan allowed to grant with no end date at all. */
+const PERMANENT_PLAN = "lifetime";
+
+/**
+ * Setting a plan by hand — which is a complimentary grant, and is therefore held
+ * to the same standard as one.
+ *
+ * THREE RULES, and each replaces something that used to be possible:
+ *
+ *   · a REASON is mandatory. It used to be optional here while `adminCompSchema`
+ *     required one for the identical power, so the weaker door was the one the
+ *     console happened to use. An unattributable permanent grant is traceable
+ *     (who and when) but not explicable (why), and "why" is the only part that
+ *     matters six months later in a support thread.
+ *   · a granting plan needs an END DATE. Every hand-granted Pro used to be
+ *     permanent by default, which is not a decision anyone made — it is what
+ *     happens when a field is omitted.
+ *   · only `lifetime` may be permanent, and the route additionally demands the
+ *     user id be repeated back (see admin.ts). A grant with no end is the one
+ *     that can never be noticed later, so it is the one that must be typed out.
+ */
+export const adminSetPlanSchema = z
+  .object({
+    plan: z.string().trim().min(1, "plan is required"),
+    reason: adminReason,
+    /**
+     * When the grant ends. Required for every granting plan except `lifetime`.
+     *
+     * Explicitly nullable as well as optional, like `adminCompSchema.until`, so
+     * the console can send `null` to mean "no end date" without it reading as
+     * "field forgotten" — the difference matters, because one of them is refused.
+     */
+    until: dateInput.nullish(),
+    /** Echo of the target user id — required for a PERMANENT grant only. */
+    confirmUserId: z.string().trim().optional(),
+  })
+  .superRefine((value, ctx) => {
+    const plan = value.plan.toLowerCase();
+    // Withdrawing a grant has no end date to speak of.
+    if (!GRANTING_PLAN_NAMES.has(plan)) return;
+
+    if (plan === PERMANENT_PLAN) {
+      // Allowed to be open-ended; admin.ts asks for the confirmation.
+      if (value.until != null && value.until.getTime() <= Date.now()) {
+        ctx.addIssue({
+          path: ["until"],
+          code: z.ZodIssueCode.custom,
+          message: "That end date is already in the past.",
+        });
+      }
+      return;
+    }
+
+    if (value.until == null) {
+      ctx.addIssue({
+        path: ["until"],
+        code: z.ZodIssueCode.custom,
+        message: `A "${value.plan}" grant must have an end date. Use plan "lifetime" for one that never expires.`,
+      });
+      return;
+    }
+    if (value.until.getTime() <= Date.now()) {
+      // A grant that ended before it began reads as a grant in the console and
+      // does nothing at all — the worst of both.
+      ctx.addIssue({
+        path: ["until"],
+        code: z.ZodIssueCode.custom,
+        message: "That end date is already in the past.",
+      });
+    }
+  });
 
 /** Suspend / unsuspend / hard-delete / cancel — every mutating admin write now
  *  carries an optional reason that lands in the audit row. */
@@ -481,7 +568,6 @@ export const onboardingSubmitSchema = z.object({
  * mistake — which is exactly what you are trying to tell apart when you go
  * looking six months on.
  */
-const adminReason = z.string().trim().min(3, "A reason is required").max(500);
 
 export const adminCompSchema = z.object({
   reason: adminReason,

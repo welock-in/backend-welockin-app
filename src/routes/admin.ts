@@ -1,9 +1,10 @@
 import { Router } from "express";
 import crypto from "node:crypto";
 import { prisma } from "../lib/prisma";
-import { env } from "../lib/env";
+import { env, variantGate } from "../lib/env";
 import { asyncHandler } from "../middleware/async-handler";
 import { requireAdmin } from "../middleware/admin-auth";
+import { resolveAndCache } from "./entitlement";
 import { hideTestRowsFor } from "../lib/subscription";
 import {
   MAX_ATTEMPTS,
@@ -25,6 +26,7 @@ import {
   adminReactivateSubscriptionSchema,
   adminRevokeSchema,
   adminSetPlanSchema,
+  GRANTING_PLAN_NAMES,
   adminTestSubscriptionCreateSchema,
   adminSubscriptionTimeSchema,
   adminSubscriptionTransitionSchema,
@@ -36,6 +38,16 @@ import {
   computeUserStats,
   liveSessionWhere,
 } from "../services/admin-stats";
+
+/**
+ * Which plan names the console may hand out as a complimentary grant. Anything
+ * else ("free", "expired", …) removes the comp instead — it does NOT cancel a
+ * real paid subscription, which is a money decision and has its own button.
+ *
+ * Defined next to the schema that validates against it, so the rule about which
+ * plans need an end date cannot drift from the rule about which plans grant.
+ */
+const GRANTING_PLANS = GRANTING_PLAN_NAMES;
 
 export const adminRouter = Router();
 
@@ -270,13 +282,63 @@ adminRouter.post(
   requireAdmin,
   asyncHandler(async (req, res) => {
     const before = await getUserOr404(req.params.id);
-    const { plan, reason } = adminSetPlanSchema.parse(req.body);
-    const user = await prisma.user.update({
+    const { plan, reason, until, confirmUserId } = adminSetPlanSchema.parse(req.body);
+
+    // A grant with NO END DATE is the one nobody ever notices again: it does not
+    // appear in an expiry sweep, it does not turn up in a renewal report, and the
+    // only way it ends is if a human remembers it exists. So it is the one that
+    // has to be typed out rather than clicked — same shape as the trial reset's
+    // confirmation, which guards the other irreversible-by-mis-click action here.
+    const permanent = plan.toLowerCase() === "lifetime" && until == null;
+    if (permanent && confirmUserId !== req.params.id) {
+      throw badRequest(
+        "A lifetime grant with no end date must be confirmed by repeating the user id in confirmUserId.",
+      );
+    }
+
+    // THIS USED TO DO NOTHING, convincingly. It wrote `User.plan`, which is a
+    // CACHE: `resolveAndCache` overwrites it from the real rows on the very next
+    // /api/entitlement call, i.e. within minutes. The console showed the new
+    // plan, the audit log recorded a change, the customer's access never moved,
+    // and the row quietly reverted. An admin action that reports success without
+    // acting is worse than no button at all.
+    //
+    // So it is routed to the lever that actually decides — the complimentary
+    // grant `computeEntitlement` reads — and the response carries the RESOLVED
+    // entitlement rather than the row we just wrote, so the console cannot show
+    // a state the resolver disagrees with.
+    const grants = GRANTING_PLANS.has(plan.toLowerCase());
+    await prisma.user.update({
       where: { id: req.params.id },
-      data: { plan },
+      data: grants
+        ? {
+            compActive: true,
+            // The requested plan is kept in the reason because the LEVER has no
+            // notion of "which plan" — a comp is a comp. Without this, an
+            // operator who picked "lifetime" and an operator who picked "pro"
+            // leave identical rows, and support can never tell what was meant.
+            compReason: reason ? `set plan ${plan}: ${reason}` : `admin: set plan ${plan}`,
+            // Time-boxable, and permanent only when nobody asked for an end. A
+            // grant that quietly expired would be worse than one that lasts.
+            compedUntil: until ?? null,
+          }
+        : { compActive: false, compedUntil: null },
     });
-    await audit(req, "set_plan", user.id, reason ?? "", { plan: before.plan }, { plan });
-    res.json({ user: toPublicUser(user) });
+
+    // No device id: this is a server-side recompute for the console, not a
+    // client asking whether IT may run.
+    const view = await resolveAndCache(req.params.id, "");
+    const user = await prisma.user.findUniqueOrThrow({ where: { id: req.params.id } });
+
+    await audit(
+      req,
+      "set_plan",
+      user.id,
+      reason ?? "",
+      { plan: before.plan, compActive: before.compActive },
+      { plan, compActive: grants, compedUntil: until ?? null, permanent, resolved: view.status },
+    );
+    res.json({ user: toPublicUser(user), entitlement: view });
   }),
 );
 
@@ -430,6 +492,69 @@ adminRouter.post(
       { externalId: task.externalId, requeued: ok },
     );
     res.json({ requeued: ok });
+  }),
+);
+
+/**
+ * Every subscription variant this database has ever seen, and whether it grants.
+ *
+ * THE PRE-DEPLOY SAFETY CHECK for `LEMONSQUEEZY_VARIANTS_GRANTING`. The variant
+ * allowlist refuses anything it does not recognise, and the way that goes wrong
+ * is silent: a price change in Lemon Squeezy mints a NEW variant id, existing
+ * subscribers stay on the OLD one, and the deploy that updates the environment
+ * cuts every one of them off with no error anywhere.
+ *
+ * So before deploying, read this list. Anything marked `grants: false` with a
+ * live subscriber on it belongs in LEMONSQUEEZY_VARIANTS_GRANTING — and this
+ * endpoint is the only place that can tell you, because it is the only place
+ * that knows what people are actually subscribed to.
+ */
+adminRouter.get(
+  "/billing/variants",
+  requireAdmin,
+  asyncHandler(async (_req, res) => {
+    const rows = await prisma.subscription.findMany({
+      select: { variantId: true, interval: true, status: true },
+    });
+
+    const now = new Date();
+    const seen = new Map<string, { variantId: string; total: number; live: number; statuses: Record<string, number> }>();
+    for (const row of rows) {
+      const id = row.variantId || "(none)";
+      const entry = seen.get(id) ?? { variantId: id, total: 0, live: 0, statuses: {} };
+      entry.total += 1;
+      entry.statuses[row.status] = (entry.statuses[row.status] ?? 0) + 1;
+      // "Live" in the loose sense that matters here: a status that would grant if
+      // the variant were allowed. Deliberately NOT subscriptionGrants — that
+      // already applies the allowlist, and would report zero for exactly the
+      // variants this endpoint exists to find.
+      if (!["expired", "unpaid"].includes(row.status)) entry.live += 1;
+      seen.set(id, entry);
+    }
+
+    const granting = new Set(variantGate.granting);
+    const variants = [...seen.values()]
+      .map((v) => ({
+        ...v,
+        grants: !variantGate.armed || v.variantId === "(none)" || granting.has(v.variantId),
+      }))
+      .sort((a, b) => b.live - a.live);
+
+    // The one line an operator needs: what would break if this deployed now.
+    const atRisk = variants.filter((v) => !v.grants && v.live > 0);
+
+    res.json({
+      gateArmed: variantGate.armed,
+      granting: variantGate.granting,
+      variants,
+      atRisk,
+      // Copy-paste ready. Existing retired ids plus everything at risk, so the
+      // fix is one environment variable away rather than a manual transcription.
+      suggestedVariantsGranting: [
+        ...new Set([...env.lemonSqueezyVariantsGranting, ...atRisk.map((v) => v.variantId)]),
+      ].join(","),
+      checkedAt: now.toISOString(),
+    });
   }),
 );
 

@@ -76,6 +76,14 @@ function stubDb(t: Ctx, over: Record<string, any> = {}) {
   };
 }
 
+/** What the post-write recompute reads. Nothing owned, nothing subscribed. */
+function stubResolver(t: Ctx) {
+  stubMethod(t, prisma.user as any, "findUniqueOrThrow", async () => ({ ...USER_ROW }));
+  stubMethod(t, prisma.purchase as any, "findMany", async () => []);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findFirst", async () => null);
+}
+
 /* ── Comp ────────────────────────────────────────────────────────────── */
 
 test("a comp without a reason is refused", async (t) => {
@@ -462,18 +470,158 @@ test("the lifecycle controls are 503 when test mode is off", async (t) => {
 
 /* ── Audited writes ──────────────────────────────────────────────────── */
 
-test("set-plan is audited with before/after", async (t) => {
+/*
+ * SET-PLAN USED TO DO NOTHING, convincingly.
+ *
+ * It wrote `User.plan` — a CACHE that `resolveAndCache` rewrites from the real
+ * rows on the next /api/entitlement call. The console showed the new plan, the
+ * audit log recorded a change, the customer's access never moved, and the row
+ * reverted within minutes. So the test asserts the LEVER now, not the label:
+ * the complimentary grant that `computeEntitlement` actually reads.
+ */
+test("set-plan flips the entitlement lever, not just the cached label", async (t) => {
   const db = stubDb(t, { userFind: async () => ({ ...USER_ROW, plan: "trial" }) });
+  stubResolver(t);
 
   const res = await request(app)
     .post(`/api/admin/users/${USER}/plan`)
     .set(auth)
-    .send({ plan: "lifetime", reason: "granted after a support call" });
+    .send({
+      plan: "lifetime",
+      reason: "granted after a support call",
+      // A grant with no end date is the one nobody ever notices again, so it has
+      // to be typed out rather than clicked.
+      confirmUserId: USER,
+    });
 
   assert.equal(res.status, 200);
+  const wrote = db.userUpdate[0][0].data;
+  assert.equal(wrote.compActive, true, "the grant is written where the resolver looks");
+  assert.equal(wrote.compedUntil, null, "lifetime is the one plan allowed to be open-ended");
   assert.equal(db.audit.length, 1);
   assert.equal(db.audit[0][0].data.action, "set_plan");
-  assert.equal(db.audit[0][0].data.after.plan, "lifetime");
+  assert.match(db.audit[0][0].data.reason, /support call/, "and the reason is kept");
+  assert.ok(res.body.entitlement, "the response carries the RESOLVED state, not the wish");
+});
+
+/*
+ * A PERMANENT grant is the only one that can never be spotted later: it appears
+ * in no expiry sweep and no renewal report, and ends only if a human remembers
+ * it exists. So it is guarded the same way the trial reset is — by making the
+ * operator repeat the id back.
+ */
+test("a lifetime grant with no end date needs the user id repeated back", async (t) => {
+  const db = stubDb(t, { userFind: async () => ({ ...USER_ROW }) });
+  stubResolver(t);
+
+  const res = await request(app)
+    .post(`/api/admin/users/${USER}/plan`)
+    .set(auth)
+    .send({ plan: "lifetime", reason: "support goodwill" });
+
+  assert.equal(res.status, 400);
+  assert.equal(db.userUpdate.length, 0, "nothing is granted on a mis-click");
+});
+
+test("a wrong confirmation is refused like a missing one", async (t) => {
+  const db = stubDb(t, { userFind: async () => ({ ...USER_ROW }) });
+  stubResolver(t);
+
+  const res = await request(app)
+    .post(`/api/admin/users/${USER}/plan`)
+    .set(auth)
+    .send({ plan: "lifetime", reason: "support goodwill", confirmUserId: "507f1f77bcf86cd799439099" });
+
+  assert.equal(res.status, 400);
+  assert.equal(db.userUpdate.length, 0);
+});
+
+/*
+ * Every hand-granted Pro used to be permanent, which is not a decision anyone
+ * made — it is what happens when a field is omitted.
+ */
+test("a Pro grant must carry an end date", async (t) => {
+  const db = stubDb(t, { userFind: async () => ({ ...USER_ROW }) });
+  stubResolver(t);
+
+  const res = await request(app)
+    .post(`/api/admin/users/${USER}/plan`)
+    .set(auth)
+    .send({ plan: "pro", reason: "two weeks while their card is reissued" });
+
+  assert.equal(res.status, 400);
+  assert.equal(db.userUpdate.length, 0);
+});
+
+test("a Pro grant with an end date is time-boxed", async (t) => {
+  const db = stubDb(t, { userFind: async () => ({ ...USER_ROW }) });
+  stubResolver(t);
+  const until = new Date(Date.now() + 14 * 86_400_000).toISOString();
+
+  const res = await request(app)
+    .post(`/api/admin/users/${USER}/plan`)
+    .set(auth)
+    .send({ plan: "pro", reason: "two weeks while their card is reissued", until });
+
+  assert.equal(res.status, 200);
+  assert.equal(db.userUpdate[0][0].data.compActive, true);
+  assert.equal(db.userUpdate[0][0].data.compedUntil?.toISOString(), until);
+});
+
+test("an end date already in the past is refused rather than granted and ignored", async (t) => {
+  const db = stubDb(t, { userFind: async () => ({ ...USER_ROW }) });
+  stubResolver(t);
+
+  const res = await request(app)
+    .post(`/api/admin/users/${USER}/plan`)
+    .set(auth)
+    .send({ plan: "pro", reason: "backdated by mistake", until: "2020-01-01T00:00:00.000Z" });
+
+  assert.equal(res.status, 400);
+  assert.equal(db.userUpdate.length, 0);
+});
+
+/* ── the reason is mandatory, and a reason of spaces is not a reason ─────── */
+
+test("set-plan without a reason is refused", async (t) => {
+  const db = stubDb(t, { userFind: async () => ({ ...USER_ROW }) });
+  stubResolver(t);
+
+  const res = await request(app).post(`/api/admin/users/${USER}/plan`).set(auth).send({ plan: "free" });
+
+  assert.equal(res.status, 400);
+  assert.equal(db.userUpdate.length, 0);
+});
+
+test("a reason of whitespace is the same as no reason", async (t) => {
+  const db = stubDb(t, { userFind: async () => ({ ...USER_ROW }) });
+  stubResolver(t);
+
+  const res = await request(app)
+    .post(`/api/admin/users/${USER}/plan`)
+    .set(auth)
+    .send({ plan: "free", reason: "     " });
+
+  assert.equal(res.status, 400);
+  assert.equal(db.userUpdate.length, 0);
+});
+
+/*
+ * WITHDRAWING is a money decision too. Taking someone's access away without a
+ * stated reason is exactly as unexplainable six months later as granting it.
+ */
+test("set-plan to a non-granting plan withdraws the comp, and still needs a reason", async (t) => {
+  const db = stubDb(t, { userFind: async () => ({ ...USER_ROW, compActive: true }) });
+  stubResolver(t);
+
+  const res = await request(app)
+    .post(`/api/admin/users/${USER}/plan`)
+    .set(auth)
+    .send({ plan: "free", reason: "grant expired" });
+
+  assert.equal(res.status, 200);
+  assert.equal(db.userUpdate[0][0].data.compActive, false);
+  assert.match(db.audit[0][0].data.reason, /grant expired/);
 });
 
 /* ── Auth ────────────────────────────────────────────────────────────── */

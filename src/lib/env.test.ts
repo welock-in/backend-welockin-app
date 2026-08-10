@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { checkPaymentConfig } from "./env";
+import { checkPaymentConfig, checkVariantGate } from "./env";
 
 /*
  * The failure this guard exists for is not a crash — it is a customer being
@@ -180,4 +180,77 @@ test("anything that is not an account id is dropped, and the rest still works", 
     parseAccountIdList(`me@example.com,${ID_A},$RCAnonymousID:87c6,${ID_B.slice(0, 20)}`, "X"),
     [ID_A],
   );
+});
+
+/* ── the variant allowlist's boot check ──────────────────────────────────
+ *
+ * This is the one setting here whose misconfiguration is INVISIBLE and expensive
+ * in the wrong direction. Every other missing value makes something refuse
+ * loudly; a variant id missing from the allowlist makes a paying subscriber
+ * silently stop being one, and the only symptom is a support ticket weeks later.
+ *
+ * The way it happens is routine rather than exotic: a price change in Lemon
+ * Squeezy mints a NEW variant id, existing subscribers stay on the OLD one, and
+ * the deploy that updates the environment cuts every one of them off at once.
+ */
+
+const GATE = {
+  lemonSqueezyVariantId: "1960881",
+  lemonSqueezyVariantMonthly: "1986433",
+  lemonSqueezyVariantYearly: "1986420",
+  lemonSqueezyVariantsGranting: [] as string[],
+};
+
+test("an unconfigured deploy reports the gate OFF rather than silently refusing", () => {
+  const v = checkVariantGate({
+    lemonSqueezyVariantId: "",
+    lemonSqueezyVariantMonthly: "",
+    lemonSqueezyVariantYearly: "",
+    lemonSqueezyVariantsGranting: [],
+  });
+
+  assert.equal(v.armed, false);
+  assert.deepEqual(v.granting, []);
+  assert.equal(v.problems.length, 0, "not configured is not an error — a lifetime-only deploy is valid");
+  assert.ok(
+    v.notes.some((n) => n.includes("ANY subscription")),
+    "but 'every variant grants' is too surprising to leave unsaid",
+  );
+});
+
+test("an armed gate names exactly which ids grant", () => {
+  const v = checkVariantGate({ ...GATE, lemonSqueezyVariantsGranting: ["1700000"] });
+
+  assert.equal(v.armed, true);
+  assert.deepEqual(v.granting.sort(), ["1700000", "1960881", "1986420", "1986433"]);
+  assert.equal(v.problems.length, 0);
+  assert.ok(
+    v.notes.some((n) => n.includes("1700000") && n.includes("ARMED")),
+    "the boot log has to be readable as an answer to 'what grants right now'",
+  );
+});
+
+test("a non-numeric variant id is a problem, not a silently dead entry", () => {
+  // A product id, a name or a stray quote would sit in the list matching nothing
+  // — which looks exactly like a correctly configured allowlist right up until
+  // someone's access disappears.
+  const v = checkVariantGate({ ...GATE, lemonSqueezyVariantsGranting: ["prod_abc", "1700000"] });
+
+  assert.equal(v.problems.length, 1);
+  assert.match(v.problems[0], /prod_abc/);
+});
+
+test("a malformed primary variant id is caught too", () => {
+  const v = checkVariantGate({ ...GATE, lemonSqueezyVariantMonthly: '"1986433"' });
+
+  assert.equal(v.problems.length, 1);
+  assert.match(v.problems[0], /LEMONSQUEEZY_VARIANT_MONTHLY/);
+});
+
+test("a duplicate is noted but never refused", () => {
+  const v = checkVariantGate({ ...GATE, lemonSqueezyVariantsGranting: ["1986433"] });
+
+  assert.equal(v.problems.length, 0, "listing an id twice is harmless");
+  assert.deepEqual(v.granting.sort(), ["1960881", "1986420", "1986433"], "and deduplicated");
+  assert.ok(v.notes.some((n) => n.includes("more than once")));
 });

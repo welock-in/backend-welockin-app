@@ -516,3 +516,145 @@ test("change-plan rejects a plan that is not monthly or yearly (no lifetime here
 
   assert.equal(res.status, 400, "lifetime is a checkout, not a variant swap");
 });
+
+/* ── GET /portal — a link that is actually alive ─────────────────────────
+ *
+ * Lemon Squeezy SIGNS the customer-portal URL and it expires after 24 hours. We
+ * persist it on every webhook and used to hand that stored copy out, which is
+ * fine for an account whose subscription changed today and a dead link for
+ * everyone else — i.e. for almost everyone, almost always, in the way that is
+ * hardest to notice: the button works, the page just refuses.
+ */
+
+const liveSub = {
+  id: "row-1",
+  externalId: "77001",
+  status: "active",
+  validUntil: new Date(Date.now() + 20 * 86_400_000),
+  trialEndsAt: null,
+  trialCancelledAt: null,
+  pauseMode: null,
+  variantId: "",
+  providerUpdatedAt: new Date(),
+  createdAt: new Date(),
+  customerPortalUrl: "https://stored/portal",
+  updatePaymentUrl: "https://stored/pay",
+};
+
+test("the portal link is fetched fresh from Lemon Squeezy, not served from the row", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [liveSub]);
+  const writes = stubMethod(t, prisma.subscription as any, "update", async () => ({}));
+  stubFetch(t, async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      data: { attributes: { urls: { customer_portal: "https://fresh/portal" } } },
+    }),
+  }));
+
+  const res = await request(app).get("/api/subscription/portal").set(auth);
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.url, "https://fresh/portal");
+  assert.equal(res.body.fresh, true);
+  assert.equal(writes[0][0].data.customerPortalUrl, "https://fresh/portal", "and cached on the way past");
+});
+
+test("an unreachable provider falls back to the stored link rather than nothing", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [liveSub]);
+  stubMethod(t, prisma.subscription as any, "update", async () => ({}));
+  stubFetch(t, async () => {
+    throw new Error("ECONNREFUSED");
+  });
+
+  const res = await request(app).get("/api/subscription/portal").set(auth);
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.url, "https://stored/portal");
+  assert.equal(res.body.fresh, false, "possibly stale beats no link at all — and says so");
+});
+
+/*
+ * The subscription is found from the TOKEN and never named by the request. There
+ * is no id to supply, so there is nothing to enumerate: an account with no rows
+ * gets a refusal, not somebody else's billing page.
+ */
+test("an account with no subscription cannot reach a portal link", async (t) => {
+  configured(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubFetch(t, async () => {
+    throw new Error("must not reach Lemon Squeezy");
+  });
+
+  const res = await request(app).get("/api/subscription/portal").set(auth);
+
+  assert.equal(res.status, 409);
+});
+
+test("the portal link needs a bearer token", async () => {
+  const res = await request(app).get("/api/subscription/portal");
+  assert.equal(res.status, 401);
+});
+
+/* ── a cancelled trial is not resumable ──────────────────────────────────
+ *
+ * The other half of the tombstone. Cancelling a trial ends access at once, so
+ * there is nothing left to resume — and if this endpoint resumed it anyway, the
+ * customer would get the rest of their trial back for free, repeatedly.
+ */
+test("reactivate refuses a trial that was cancelled", async (t) => {
+  configured(t);
+  const inThreeDays = new Date(Date.now() + 3 * 86_400_000);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    {
+      externalId: "77001",
+      status: "cancelled",
+      validUntil: inThreeDays,
+      endsAt: inThreeDays,
+      trialEndsAt: inThreeDays,
+      trialCancelledAt: new Date(),
+      pauseMode: null,
+      variantId: "",
+      providerUpdatedAt: new Date(),
+      createdAt: new Date(),
+    },
+  ]);
+  stubFetch(t, async () => {
+    throw new Error("must not reach Lemon Squeezy");
+  });
+
+  const res = await request(app).post("/api/subscription/reactivate").set(auth);
+
+  assert.equal(res.status, 409);
+});
+
+test("reactivate still works for a cancelled PAID subscription", async (t) => {
+  configured(t);
+  const inTenDays = new Date(Date.now() + 10 * 86_400_000);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    {
+      externalId: "77001",
+      status: "cancelled",
+      validUntil: inTenDays,
+      endsAt: inTenDays,
+      // Trialed long ago, converted, paid, then cancelled — the grace is bought.
+      trialEndsAt: new Date(Date.now() - 30 * 86_400_000),
+      trialCancelledAt: null,
+      pauseMode: null,
+      variantId: "",
+      providerUpdatedAt: new Date(),
+      createdAt: new Date(),
+    },
+  ]);
+  stubFetch(t, async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ data: { attributes: { renews_at: inTenDays.toISOString() } } }),
+  }));
+
+  const res = await request(app).post("/api/subscription/reactivate").set(auth);
+
+  assert.equal(res.status, 202);
+});

@@ -42,7 +42,25 @@ export type ReceiptInput = {
   deviceId: string;
   status: string;
   isPro: boolean;
+  /**
+   * The countdown the UI draws, and NOTHING else. It is not a boundary: it comes
+   * from the device ledger, which for a Lemon Squeezy trial is unrelated and
+   * usually already in the past. Reading it as a boundary is what once locked
+   * out a customer at the moment they paid — see `accessNotAfter`.
+   */
   trialEndsAt: Date | null;
+  /**
+   * The instant access must actually STOP, taken from whichever source is
+   * granting it: a subscription's paid-up period, a trial's last day, a comp's
+   * expiry. Null means "no boundary" and is reserved for a lifetime licence.
+   *
+   * Required rather than optional on purpose. An offline lease that outlives the
+   * thing paying for it is the product being given away — a flat thirty-day rope
+   * minted on the last day of a cancelled month is a free month — and a caller
+   * that simply forgot to pass a boundary would reintroduce exactly that. So the
+   * type makes every call site name the boundary, even when the answer is null.
+   */
+  accessNotAfter: Date | null;
   serverTime: Date;
   /**
    * ENTITLEMENT_ENFORCED. Inside the signature on purpose.
@@ -64,35 +82,56 @@ export type ReceiptInput = {
  * trial run a few extra days costs a few days. So a lifetime licence gets a long
  * rope and a trial a short one.
  *
- * A trial receipt never outlives the trial itself: handing someone a seven-day
- * offline pass on the last day of their window would extend it by seven days.
+ * This is only the ROPE — how long we would be willing to go without hearing
+ * from the server. It is not the whole answer: `issueReceipt` then clips it to
+ * `accessNotAfter`, so a long rope never survives the thing that pays for it.
+ * Keeping the two apart is deliberate; folding the boundary in here is what
+ * produced the bug this replaces.
  */
 const LOCKED_TTL_MS = 6 * 60 * 60 * 1000;
 
-function ttlMs(status: string, isPro: boolean, trialEndsAt: Date | null, now: Date): number {
+function ttlMs(status: string, isPro: boolean): number {
   if (!isPro) {
     // Locked. A short life so a licence bought five minutes from now is not
     // shut out until tomorrow — the client refreshes and the wall lifts.
     return LOCKED_TTL_MS;
   }
-  if (status === "trialing" && trialEndsAt) {
-    const untilTrialEnds = trialEndsAt.getTime() - now.getTime();
-    // FLOORED, and the floor is the whole point. `status` and `trialEndsAt`
-    // come from different places: "trialing" can mean a Lemon Squeezy trial
-    // (subscriptionOnTrial), while trialEndsAt is the DEVICE ledger's date.
-    // For anyone whose old device window has already elapsed, the two disagree
-    // and this arithmetic went NEGATIVE — clamping to zero and minting a
-    // receipt that was expired the moment it was signed. The client stores it,
-    // reads it back as Stale, and locks out a customer who has just paid.
-    //
-    // The caller now passes the window that actually grants (see
-    // routes/entitlement.ts), so this should no longer go negative. The floor
-    // stays anyway: a receipt that grants nothing is never the right answer to
-    // "isPro", and this cost a paying customer their app once already.
-    return Math.max(LOCKED_TTL_MS, Math.min(7 * DAY_MS, untilTrialEnds));
-  }
+  // A trial is not a purchase: it gets a week at most even if we somehow failed
+  // to learn when it ends. Without this a trial whose validUntil never arrived
+  // fell through to the paid branch and drew a THIRTY-DAY offline pass.
+  if (status === "trialing") return 7 * DAY_MS;
   // active / comped — a paid or granted licence.
   return 30 * DAY_MS;
+}
+
+/**
+ * The rope, clipped to the boundary.
+ *
+ * Two rules, and they are not symmetric:
+ *   · the boundary may only ever SHORTEN a lease — a subscription renewing in
+ *     three years still re-checks in thirty days;
+ *   · it never applies to a LOCKED receipt, whose expiry is a refresh interval
+ *     and not a grant, so a stale boundary cannot make a lock last longer.
+ *
+ * If the boundary has already passed while `isPro` is true, the two disagree and
+ * the resolver is wrong. We do NOT paper over that with a floor: a floor here is
+ * precisely how a trial with one hour to run bought six. The lease is clipped to
+ * the boundary, the client reads it back as stale, refreshes, and is told the
+ * truth by the server. The inconsistency is logged because it is a bug worth
+ * seeing, not a state worth tolerating.
+ */
+function expiryFor(input: ReceiptInput, now: Date): Date {
+  const rope = new Date(now.getTime() + ttlMs(input.status, input.isPro));
+  if (!input.isPro || input.accessNotAfter == null) return rope;
+  if (input.accessNotAfter.getTime() >= rope.getTime()) return rope;
+
+  if (input.accessNotAfter.getTime() <= now.getTime()) {
+    console.error(
+      "[receipt] isPro with a boundary already in the past — the resolver and the boundary disagree",
+      { userId: input.userId, status: input.status, accessNotAfter: input.accessNotAfter },
+    );
+  }
+  return input.accessNotAfter;
 }
 
 /**
@@ -162,9 +201,7 @@ export function issueReceipt(input: ReceiptInput): string | null {
     isPro: input.isPro,
     trialEndsAt: input.trialEndsAt ? input.trialEndsAt.toISOString() : null,
     serverTime: now.toISOString(),
-    expiresAt: new Date(
-      now.getTime() + ttlMs(input.status, input.isPro, input.trialEndsAt, now),
-    ).toISOString(),
+    expiresAt: expiryFor(input, now).toISOString(),
     nonce: randomBytes(9).toString("base64url"),
     // Appended AFTER nonce rather than inserted next to `isPro`, where it reads
     // more naturally: the order in `canonical` is the signed byte order, so

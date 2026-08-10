@@ -3,7 +3,12 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { checkoutConfirmSchema, checkoutSchema } from "../validation/schemas";
-import { hideTestRowsFor, subscriptionGrants, variantForPlan } from "../lib/subscription";
+import {
+  hideTestRowsFor,
+  subscriptionGrants,
+  variantForPlan,
+  subscriptionIsLive,
+} from "../lib/subscription";
 import {
   parseOrderEvent,
   parseSubscriptionEvent,
@@ -120,9 +125,24 @@ checkoutRouter.post(
     if (plan !== "lifetime") {
       const subs = await prisma.subscription.findMany({
         where: { userId, ...hideTestRowsFor(userId, env) },
-        select: { status: true, validUntil: true },
+        select: {
+          status: true,
+          validUntil: true,
+          trialEndsAt: true,
+          trialCancelledAt: true,
+          pauseMode: true,
+          providerUpdatedAt: true,
+          createdAt: true,
+          variantId: true,
+          updatedAt: true,
+        },
       });
-      if (subs.some((sub) => subscriptionGrants(sub, new Date()))) {
+      // EXISTENCE, not access. This guard stops us selling a second
+      // subscription to someone who already has one — a billing question. Using
+      // the ACCESS predicate here meant a subscription Lemon Squeezy is still
+      // charging for (unknown variant, cancelled trial, void pause) no longer
+      // blocked the checkout, and the customer ended up paying twice.
+      if (subs.some(subscriptionIsLive)) {
         throw conflict("You already have an active subscription.");
       }
       const accountHadSubscription = subs.length > 0;

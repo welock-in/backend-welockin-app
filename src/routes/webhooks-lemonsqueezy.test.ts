@@ -7,6 +7,7 @@ import { createApp } from "../app";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { parseOrderEvent, parseSubscriptionEvent } from "../lib/lemonsqueezy";
+import { subscriptionGrants } from "../lib/subscription";
 import { REAL_ORDER_CREATED, REAL_ORDER_REFUNDED, REAL_USER_ID } from "./lemonsqueezy-fixtures";
 
 /*
@@ -719,7 +720,11 @@ function subBody(over: Record<string, any> = {}) {
         user_email: "buyer@example.com",
         status: "on_trial",
         store_id: Number(STORE),
-        variant_id: 5551,
+        // The configured MONTHLY variant. It used to be an arbitrary 5551, which
+        // quietly made every subscription fixture a plan we do not sell — fine
+        // while any variant granted, and misleading the moment that stopped
+        // being true. Tests about unknown variants say so explicitly instead.
+        variant_id: 1986433,
         trial_ends_at: "2026-08-11T10:00:00.000Z",
         renews_at: "2026-08-11T10:00:00.000Z",
         ends_at: null,
@@ -867,6 +872,46 @@ test("a test-mode ENDING is still recorded, even though a test-mode start is not
     subBody({ meta: { event_name: "subscription_updated" }, attributes: { test_mode: true, status: "active" } }),
   );
   assert.equal(db.subCreate.length, 1, "but a granting state is not");
+});
+
+/*
+ * ── A subscription for something we do not sell ─────────────────────────
+ *
+ * The store check was the ONLY gate on this path: any subscription bought in
+ * our store granted full Pro, whatever variant it was for. Today the store
+ * holds exactly the three products we sell, so nothing could be bought that
+ * exploited it — but the shape is the hole, and it opens by itself the first
+ * time a second subscription variant exists: a discounted "Lite" tier, a
+ * grandfathered plan, an experiment, a pay-what-you-want variant. Each would
+ * have been a full licence at its own price, on a public checkout URL, and
+ * `checkout[custom][user_id]` lets the buyer name the account to credit.
+ *
+ * The state is still MIRRORED — refusing to record what Lemon Squeezy tells us
+ * is how a row goes stale for ever — it simply does not grant.
+ */
+test("a subscription for a variant we do not sell is recorded, but grants nothing", async (t) => {
+  configured(t);
+  const db = stubDb(t, { userFirst: async () => ({ id: USER }) });
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
+
+  await deliver(subBody({ attributes: { variant_id: 999999, status: "active" } }));
+
+  assert.equal(db.subCreate.length, 1, "we still record what the provider told us");
+  assert.equal(
+    subscriptionGrants(
+      {
+        status: "active",
+        variantId: "999999",
+        validUntil: new Date(Date.now() + 30 * 86_400_000),
+        trialEndsAt: null,
+        trialCancelledAt: null,
+        updatedAt: new Date(),
+      },
+      new Date(),
+    ),
+    false,
+    "but a plan we never sold is not a licence",
+  );
 });
 
 /*
@@ -1279,4 +1324,79 @@ test("a plan change is mirrored immediately, not at the next renewal", async (t)
   assert.equal(finalStatus(db.eventMark), "processed", "not 'unhandled event'");
   assert.equal(db.subCreate[0][0].data.variantId, "1986420");
   assert.equal(db.subCreate[0][0].data.interval, "yearly", "the row says the NEW plan");
+});
+
+/* ── the trial tombstone, and the delivery order that nearly lost it ──────
+ *
+ * Cancelling a trial ends access at once. The tombstone is what makes that
+ * survive a RESUME in the Lemon Squeezy customer portal, which puts the status
+ * back to `on_trial` with the same trial_ends_at and takes no payment.
+ *
+ * The subtlety is WHERE it is written. The staleness guard drops any event older
+ * than what we already recorded — correct for state, catastrophic for this fact:
+ * Lemon Squeezy retries with backoff over hours, so a `subscription_cancelled`
+ * arriving after a newer event is exactly the case the guard exists for, and
+ * inside the guarded write the tombstone would simply be discarded. The trial
+ * would then still be resumable for free.
+ */
+test("a cancelled trial is tombstoned even when its delivery arrives late", async (t) => {
+  configured(t);
+  stubDb(t, {
+    userFirst: async () => ({ id: USER }),
+    // Every guarded write is rejected as stale — the out-of-order retry.
+    subWrite: async () => ({ count: 0 }),
+  });
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => ({ id: "row-1" }));
+
+  const writes: any[] = [];
+  const realUpdateMany = (prisma.subscription as any).updateMany;
+  (prisma.subscription as any).updateMany = async (a: any) => {
+    writes.push(a);
+    return realUpdateMany(a);
+  };
+  t.after(() => {
+    (prisma.subscription as any).updateMany = realUpdateMany;
+  });
+
+  await deliver(
+    subBody({
+      meta: { event_name: "subscription_cancelled" },
+      attributes: {
+        status: "cancelled",
+        trial_ends_at: new Date(Date.now() + 3 * 86_400_000).toISOString(),
+      },
+    }),
+  );
+
+  const tombstone = writes.find((w) => w.data?.trialCancelledAt && w.where?.trialCancelledAt === null);
+  assert.ok(tombstone, "the tombstone is written on its own, outside the staleness guard");
+  assert.equal(
+    tombstone.where.trialCancelledAt,
+    null,
+    "set-once: a second delivery cannot move the timestamp",
+  );
+});
+
+/*
+ * `trial_ends_at` is what the tombstone RULE reads to know the window is still
+ * running. A later payload that simply omits it would blank the column and
+ * disarm the tombstone — after which Resume hands the trial back for free.
+ */
+test("a payload that omits trial_ends_at does not clear it", async (t) => {
+  configured(t);
+  const db = stubDb(t, { userFirst: async () => ({ id: USER }) });
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
+
+  await deliver(
+    subBody({
+      meta: { event_name: "subscription_updated" },
+      attributes: { status: "active", trial_ends_at: null },
+    }),
+  );
+
+  assert.equal(db.subCreate.length, 1);
+  assert.ok(
+    !("trialEndsAt" in db.subCreate[0][0].data),
+    "an absent field means 'not mentioned', never 'cleared'",
+  );
 });

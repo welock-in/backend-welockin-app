@@ -196,6 +196,7 @@ Both land in the same `Purchase` table, told apart by `provider`.
 | `LEMONSQUEEZY_WEBHOOK_SECRET` | *(empty)* | Signing secret of the webhook, set when you create it in the dashboard. Verification **fails closed** while empty: every delivery is rejected. |
 | `LEMONSQUEEZY_STORE_ID` | *(empty)* | Your store. An order from any other store is refused. |
 | `LEMONSQUEEZY_VARIANT_ID` | *(empty)* | **The one variant we sell.** Unset means *sell nothing*, never *sell everything* — a signature only proves the delivery is ours, not that the buyer bought the licence. |
+| `LEMONSQUEEZY_VARIANTS_GRANTING` | *(empty)* | **Retired subscription variants that must keep granting** — comma-separated. The variant allowlist refuses anything it does not recognise, and a price change in Lemon Squeezy mints a *new* variant id while existing subscribers stay on the old one. Without this list, the deploy that updates the ids above cuts every one of them off, silently. Get the value from `GET /api/admin/billing/variants` before deploying. |
 | `LEMONSQUEEZY_API_BASE` | `https://api.lemonsqueezy.com` | Override for tests. |
 | `LEMONSQUEEZY_ALLOW_TEST_MODE` | `false` | May a **test-mode** order grant a real lifetime licence? Requires the literal `"true"`, and is deliberately *not* inferred from `NODE_ENV` — which is unset on more machines than anyone expects, and every one of those would have failed open into a free-licence tap. |
 

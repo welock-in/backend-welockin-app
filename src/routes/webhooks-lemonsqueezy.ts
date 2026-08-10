@@ -17,7 +17,13 @@ import {
   type ParsedOrder,
   type ParsedSubscription,
 } from "../lib/lemonsqueezy";
-import { intervalForVariant, subscriptionGrants, validUntilFrom } from "../lib/subscription";
+import {
+  intervalForVariant,
+  subscriptionGrants,
+  validUntilFrom,
+  type SubscriptionLike,
+  subscriptionIsLive,
+} from "../lib/subscription";
 import { claimWebhookEvent, markWebhookEvent } from "../lib/webhook-events";
 import { ledgerHash } from "../lib/hash";
 import { isReliableDeviceId } from "../lib/device";
@@ -294,11 +300,22 @@ export async function recordPaidOrder(
  */
 async function cancelSubscriptionsForLifetimeBuyer(userId: string): Promise<void> {
   if (!env.lemonSqueezyApiKey) return;
-  let subs: { externalId: string; status: string; validUntil: Date | null }[];
+  let subs: (SubscriptionLike & { externalId: string })[];
   try {
     subs = await prisma.subscription.findMany({
       where: { userId, provider: PROVIDER },
-      select: { externalId: true, status: true, validUntil: true },
+      select: {
+        externalId: true,
+        status: true,
+        validUntil: true,
+        trialEndsAt: true,
+        trialCancelledAt: true,
+        pauseMode: true,
+        providerUpdatedAt: true,
+        createdAt: true,
+        variantId: true,
+        updatedAt: true,
+      },
     });
   } catch (e) {
     console.error("[lemonsqueezy] lifetime buyer: could not read subscriptions:", e);
@@ -309,7 +326,12 @@ async function cancelSubscriptionsForLifetimeBuyer(userId: string): Promise<void
     // Only ones that are actually live and not already cancelled — no point
     // poking an expired row, and cancelling a cancelled one is a wasted call.
     if (sub.status === "cancelled" || sub.status === "expired") continue;
-    if (!subscriptionGrants(sub, now)) continue;
+    // Deliberately NOT the access predicate. Being billed is a status question:
+    // a subscription that stopped granting (unknown variant, void pause) is
+    // still taking the customer's money, and skipping it here would leave them
+    // holding a lifetime licence AND a live recurring charge — the exact
+    // outcome the outbox in this same change set exists to prevent.
+    if (!subscriptionIsLive(sub)) continue;
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 10_000);
@@ -334,9 +356,6 @@ async function cancelSubscriptionsForLifetimeBuyer(userId: string): Promise<void
         clearTimeout(timer);
       }
     } catch (e) {
-      // Never echo the error (the request carried the key); never throw (the
-      // grant already landed). A stranded subscription is a support ticket, not
-      // a reason to fail the purchase.
       console.error(
         `[lemonsqueezy] lifetime buyer ${userId}: cancel of ${sub.externalId} failed:`,
         e instanceof Error ? e.message : e,
@@ -580,7 +599,23 @@ async function handleSubscription(
   // arriving from a test subscription still deserves to be written — refusing to
   // record an ending is how a test row stays live for ever.
   const granting = subscriptionGrants(
-    { status: sub.status, validUntil: validUntilFrom(sub) },
+    {
+      status: sub.status,
+      validUntil: validUntilFrom(sub),
+      variantId: sub.variantId ?? "",
+      pauseMode: sub.pauseMode,
+      trialEndsAt: sub.trialEndsAt,
+      // No tombstone here: this is the incoming PAYLOAD, not our row, and the
+      // question being asked is only "is this state a granting one" for the
+      // test-mode gate below. The status leg still catches a cancelled trial,
+      // and the stored row is where the tombstone is read for real decisions.
+      trialCancelledAt: null,
+      // This event is arriving right now, so "when we last heard from the
+      // provider" is now — which is what bounds the grace if it carries no end
+      // date. `sub.updatedAt` is the provider's own stamp on this very event.
+      providerUpdatedAt: sub.updatedAt ?? new Date(),
+      createdAt: new Date(),
+    },
     new Date(),
   );
   if (sub.testMode && !env.lemonSqueezyAllowTestMode && granting) {
@@ -642,7 +677,42 @@ export async function mirrorSubscriptionState(
   rawEvent: Prisma.InputJsonValue,
 ): Promise<"written" | "stale" | "already-consumed"> {
   const validUntil = validUntilFrom(sub);
+
+  // The trial tombstone (see schema). Included in the write ONLY when we are
+  // looking at a cancellation that landed while the trial was still running —
+  // which is what keeps it set-once: every other event simply omits the key, so
+  // nothing can clear it. A resume arriving later restores `status` and leaves
+  // the tombstone exactly where it was, and the row stays non-granting for the
+  // rest of the window it was cancelled in.
+  const cancelledDuringTrial =
+    sub.status === "cancelled" &&
+    sub.trialEndsAt != null &&
+    sub.trialEndsAt.getTime() > Date.now();
+
+  // THE TOMBSTONE IS WRITTEN OUTSIDE THE STALENESS GUARD, on its own, before
+  // anything else — and that is not a tidiness preference.
+  //
+  // The guard below drops any event older than what we have already recorded,
+  // which is right for STATE (a late retry must not resurrect a cancelled row)
+  // and catastrophic for this FACT. Lemon Squeezy retries with backoff over
+  // hours, so the `subscription_cancelled` delivery arriving after a newer event
+  // is exactly the case the guard was built for — and inside the guarded write
+  // the tombstone would simply be discarded. The trial would then still be
+  // resumable for free, which is the hole the tombstone exists to close.
+  //
+  // Safe to run unguarded because it is monotonic: set once, and `trialCancelledAt:
+  // null` in the WHERE means a second delivery cannot move the timestamp.
+  if (cancelledDuringTrial) {
+    await prisma.subscription
+      .updateMany({
+        where: { provider: PROVIDER, externalId: sub.subscriptionId, trialCancelledAt: null },
+        data: { trialCancelledAt: new Date() },
+      })
+      .catch((e) => console.error("[lemonsqueezy] could not write the trial tombstone:", e));
+  }
+
   const data = {
+    ...(cancelledDuringTrial ? { trialCancelledAt: new Date() } : {}),
     status: sub.status,
     variantId: sub.variantId ?? "",
     interval: intervalForVariant(
@@ -651,7 +721,14 @@ export async function mirrorSubscriptionState(
       env.lemonSqueezyVariantYearly,
     ),
     validUntil,
-    trialEndsAt: sub.trialEndsAt,
+    pauseMode: sub.pauseMode,
+    // CONDITIONAL, like providerUpdatedAt below. The tombstone rule reads
+    // `trialEndsAt` to know whether the cancelled trial window is still running,
+    // so a later payload that simply omits `trial_ends_at` would blank the column
+    // and disarm the tombstone — after which Resume in the customer portal hands
+    // the trial back for free. An absent field means "not mentioned", never
+    // "cleared".
+    ...(sub.trialEndsAt ? { trialEndsAt: sub.trialEndsAt } : {}),
     renewsAt: sub.renewsAt,
     endsAt: sub.endsAt,
     updatePaymentUrl: sub.updatePaymentUrl,
@@ -708,10 +785,18 @@ export async function mirrorSubscriptionState(
       // Re-run the conditional update once, against the row that now exists,
       // under the same staleness guard.
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-        await prisma.subscription.updateMany({
+        // The result is READ, not discarded. Ignoring it reported "written" for a
+        // write the staleness guard had just rejected, and the event was then
+        // marked terminally processed — so the state it carried was lost with no
+        // redelivery to recover it.
+        const retried = await prisma.subscription.updateMany({
           where: { provider: PROVIDER, externalId: sub.subscriptionId, ...notNewer },
           data,
         });
+        // Same semantics as the primary path. Reporting "written" for a write the
+        // staleness guard rejected marked the event terminally processed, so the
+        // state it carried was dropped with no redelivery left to recover it.
+        if (retried.count === 0) return "stale";
       } else {
         throw err;
       }

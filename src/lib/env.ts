@@ -255,19 +255,52 @@ export const env = {
   // VARIANT_LIFETIME is frankly the better name (it says WHICH variant, where
   // _ID says nothing) and it is what production carries; _ID stays canonical
   // only because it shipped first in .env.example and in the boot checks.
-  lemonSqueezyVariantId:
-    process.env.LEMONSQUEEZY_VARIANT_ID ?? process.env.LEMONSQUEEZY_VARIANT_LIFETIME ?? "",
+  // TRIMMED, like the retired list below. A trailing space or newline is the
+  // normal accident when pasting into a hosting dashboard, and an untrimmed id
+  // matches nothing — which looks exactly like a correctly configured allowlist
+  // right up until every subscriber on that plan loses access.
+  lemonSqueezyVariantId: (
+    process.env.LEMONSQUEEZY_VARIANT_ID ??
+    process.env.LEMONSQUEEZY_VARIANT_LIFETIME ??
+    ""
+  ).trim(),
   /**
    * The two SUBSCRIPTION variants.
    *
-   * Used only to label a row "monthly" or "yearly" for humans — never to decide
-   * whether a subscription grants, which is `subscriptionGrants`'s job and reads
-   * the status. So an unrecognised variant degrades to an unlabelled row rather
-   * than to a refused customer: the day a price changes, someone paying us must
-   * not lose access because the id in the environment is one release behind.
+   * These label a row "monthly" or "yearly" for humans, AND — since the billing
+   * audit — they are part of what decides whether a subscription grants.
+   *
+   * That is a reversal, so the reasoning it replaces is worth stating: the rule
+   * used to be status-only, deliberately, so that the day a price changed nobody
+   * paying us would lose access because an id in the environment was one release
+   * behind. The cost of that generosity was that ANY subscription bought in our
+   * store granted FULL access — a discounted "Lite" tier, a grandfathered plan,
+   * an experiment, or a pay-what-you-want variant with `min_price: 0` would each
+   * have been a full licence at its own price, on a public checkout URL.
+   *
+   * The lockout risk is answered directly instead of by not checking at all:
+   *   · nothing configured  → everything grants (a lifetime-only deploy is
+   *     unaffected, the same posture `checkPaymentConfig` takes);
+   *   · variant id missing from the payload → grants (we refuse only what we
+   *     positively know we do not sell, never what we merely failed to read);
+   *   · a retired id → list it in LEMONSQUEEZY_VARIANTS_GRANTING and it keeps
+   *     working, which is the migration path a price change actually needs.
    */
-  lemonSqueezyVariantMonthly: process.env.LEMONSQUEEZY_VARIANT_MONTHLY ?? "",
-  lemonSqueezyVariantYearly: process.env.LEMONSQUEEZY_VARIANT_YEARLY ?? "",
+  lemonSqueezyVariantMonthly: (process.env.LEMONSQUEEZY_VARIANT_MONTHLY ?? "").trim(),
+  lemonSqueezyVariantYearly: (process.env.LEMONSQUEEZY_VARIANT_YEARLY ?? "").trim(),
+  /**
+   * Retired subscription variants that must KEEP granting — comma-separated.
+   *
+   * The escape hatch for the gate above, and the reason turning it on is safe:
+   * when a plan's price changes, Lemon Squeezy issues a new variant id and every
+   * existing subscriber stays on the old one. Without this list they would all
+   * lose access on the deploy that updated the environment. Add the old id here,
+   * remove it once the last subscriber on it has churned.
+   */
+  lemonSqueezyVariantsGranting: (process.env.LEMONSQUEEZY_VARIANTS_GRANTING ?? "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean),
   lemonSqueezyApiBase: process.env.LEMONSQUEEZY_API_BASE ?? "https://api.lemonsqueezy.com",
   /**
    * May a TEST-mode order grant a real lifetime licence?
@@ -531,6 +564,109 @@ export function checkPaymentConfig(input: {
 }
 
 export const paymentConfig = checkPaymentConfig(env);
+
+export type VariantGateVerdict = {
+  /** Is the allowlist actually deciding access, or is it switched off? */
+  armed: boolean;
+  /** Every id that currently grants — the three plans plus the retired list. */
+  granting: string[];
+  problems: string[];
+  notes: string[];
+};
+
+/**
+ * Validate the variant allowlist — the gate that decides whether a subscription
+ * for a given Lemon Squeezy variant may grant access at all.
+ *
+ * WHY THIS DESERVES A BOOT CHECK OF ITS OWN. It is the one rule here whose
+ * misconfiguration is INVISIBLE and expensive in the wrong direction. Every other
+ * missing value makes something refuse loudly; a variant id missing from this
+ * list makes a paying subscriber silently stop being a paying subscriber, and
+ * the only symptom is a support ticket weeks later. The specific way it happens
+ * is routine: a price change in Lemon Squeezy mints a NEW variant id, existing
+ * subscribers stay on the OLD one, and the deploy that updates the environment
+ * cuts every one of them off at once.
+ *
+ * So this never throws in production and never disables anything. It says, at
+ * boot, exactly which ids currently grant, so an operator can compare that list
+ * against the ids actually in use (see `GET /api/admin/billing/variants`, which
+ * reads them out of the database) BEFORE the deploy rather than after.
+ *
+ * Pure, so the rule can be tested without spawning a process.
+ */
+export function checkVariantGate(input: {
+  lemonSqueezyVariantId: string;
+  lemonSqueezyVariantMonthly: string;
+  lemonSqueezyVariantYearly: string;
+  lemonSqueezyVariantsGranting: readonly string[];
+}): VariantGateVerdict {
+  const primary = [
+    ["LEMONSQUEEZY_VARIANT_ID", input.lemonSqueezyVariantId],
+    ["LEMONSQUEEZY_VARIANT_MONTHLY", input.lemonSqueezyVariantMonthly],
+    ["LEMONSQUEEZY_VARIANT_YEARLY", input.lemonSqueezyVariantYearly],
+  ] as const;
+
+  const problems: string[] = [];
+  const notes: string[] = [];
+
+  const configured = primary.filter(([, v]) => v);
+  const retired = input.lemonSqueezyVariantsGranting;
+  const armed = configured.length > 0;
+
+  if (!armed) {
+    // Not a problem: a deploy mid-setup, or one that sells nothing yet. Said out
+    // loud anyway, because "every variant in the store grants" is a surprising
+    // thing for a running system to be doing silently.
+    notes.push(
+      "LEMONSQUEEZY_VARIANT_* are all empty, so the variant allowlist is OFF and ANY subscription from the store grants access.",
+    );
+    return { armed, granting: [], problems, notes };
+  }
+
+  const granting = [...configured.map(([, v]) => v), ...retired];
+
+  // Lemon Squeezy variant ids are numeric. A non-numeric entry is almost always
+  // a product id, a name, or a stray quote — and it would sit in the list
+  // matching nothing at all, which looks exactly like a correctly-configured
+  // allowlist right up until someone's access disappears.
+  for (const [name, value] of primary) {
+    if (value && !/^\d+$/.test(value)) {
+      problems.push(`${name}="${value}" is not a numeric Lemon Squeezy variant id.`);
+    }
+  }
+  for (const value of retired) {
+    if (!/^\d+$/.test(value)) {
+      problems.push(
+        `LEMONSQUEEZY_VARIANTS_GRANTING contains "${value}", which is not a numeric variant id.`,
+      );
+    }
+  }
+
+  const seen = new Set<string>();
+  for (const value of granting) {
+    if (seen.has(value)) {
+      notes.push(`Variant ${value} is listed more than once — harmless, but probably not intended.`);
+    }
+    seen.add(value);
+  }
+
+  notes.push(
+    `Variant allowlist ARMED: ${[...seen].join(", ")} grant access; any other subscription variant in the store does NOT. ` +
+      `Retired ids from past price changes must be in LEMONSQUEEZY_VARIANTS_GRANTING — check GET /api/admin/billing/variants against this list before deploying.`,
+  );
+
+  return { armed, granting: [...seen], problems, notes };
+}
+
+export const variantGate = checkVariantGate(env);
+for (const note of variantGate.notes) console.info(`[env] ${note}`);
+for (const problem of variantGate.problems) console.error(`[env] ${problem}`);
+// Dev/CI stops on a malformed list, where it costs a restart. Production never
+// does: a bad entry here must not take the whole service down, and the note
+// above already says precisely which ids are granting.
+if (variantGate.problems.length > 0 && !isProduction) {
+  throw new Error(variantGate.problems.join(" / "));
+}
 
 /**
  * The two ids the hard config check does NOT cover.

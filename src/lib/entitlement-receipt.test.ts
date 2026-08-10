@@ -31,6 +31,7 @@ const BASE = {
   status: "active",
   isPro: true,
   trialEndsAt: null,
+  accessNotAfter: null,
   serverTime: new Date("2026-08-06T12:00:00.000Z"),
   enforced: true,
 };
@@ -147,29 +148,50 @@ test("a trial receipt never outlives the trial", () => {
   const yearLeft = new Date(now.getTime() + 365 * DAY);
 
   assert.equal(
-    ttl(issueReceipt({ ...BASE, status: "trialing", isPro: true, trialEndsAt: twoDaysLeft })!),
+    ttl(
+      issueReceipt({
+        ...BASE,
+        status: "trialing",
+        isPro: true,
+        trialEndsAt: twoDaysLeft,
+        accessNotAfter: twoDaysLeft,
+      })!,
+    ),
     2 * DAY,
   );
   // And a long trial is still capped at the offline maximum.
   assert.equal(
-    ttl(issueReceipt({ ...BASE, status: "trialing", isPro: true, trialEndsAt: yearLeft })!),
+    ttl(
+      issueReceipt({
+        ...BASE,
+        status: "trialing",
+        isPro: true,
+        trialEndsAt: yearLeft,
+        accessNotAfter: yearLeft,
+      })!,
+    ),
     7 * DAY,
   );
 });
 
 /*
- * This used to assert a TTL of exactly 0, which was the bug rather than the
- * rule: a zero-TTL receipt is expired the instant it is signed, and the client
- * reads that back as Stale and LOCKS. See the floor in ttlMs, and the test at
- * the bottom of this file for the case that made it a customer-facing failure.
+ * A trial we could not put an end date on. It used to fall out of the trial
+ * branch — which required a non-null date — and land on the PAID branch, so the
+ * least trustworthy state in the system drew the longest offline pass in it.
  */
-test("a trial in the past is floored, not zeroed", () => {
-  const past = new Date(BASE.serverTime.getTime() - DAY);
-
+test("a trial with no known end still gets a trial's rope, not a purchase's", () => {
   assert.equal(
-    ttl(issueReceipt({ ...BASE, status: "trialing", isPro: true, trialEndsAt: past })!),
-    6 * HOUR,
-    "short, so the client re-asks quickly — but never zero",
+    ttl(
+      issueReceipt({
+        ...BASE,
+        status: "trialing",
+        isPro: true,
+        trialEndsAt: null,
+        accessNotAfter: null,
+      })!,
+    ),
+    7 * DAY,
+    "missing data must not promote a trial to a thirty-day licence",
   );
 });
 
@@ -216,15 +238,104 @@ test("an unreadable key disables receipts instead of crashing the route", async 
  * anyone whose old device window had elapsed the subtraction went negative,
  * clamped to zero, and minted a receipt already expired when signed — stored,
  * read back as Stale, and enforced as a lock.
+ *
+ * It was patched with a six-hour FLOOR, which fixed the lockout and quietly
+ * created a second bug in the other direction: a trial with one hour left also
+ * got six. The floor is gone. What replaces it is separating the two dates, so
+ * the countdown the UI draws can no longer shorten anything at all — only
+ * `accessNotAfter`, read from whatever is actually granting, decides the end.
  */
-test("a receipt is never born expired, whatever the two trial windows disagree about", () => {
+test("a stale device date cannot shorten a receipt the subscription is paying for", () => {
   const now = BASE.serverTime;
-  const stale = new Date(now.getTime() - 90 * DAY); // an old device trial
+  const staleDeviceTrial = new Date(now.getTime() - 90 * DAY);
+  const realTrialEnd = new Date(now.getTime() + 3 * DAY);
 
-  const ttlMs = ttl(
-    issueReceipt({ ...BASE, status: "trialing", isPro: true, trialEndsAt: stale })!,
+  const lease = ttl(
+    issueReceipt({
+      ...BASE,
+      status: "trialing",
+      isPro: true,
+      trialEndsAt: staleDeviceTrial,
+      accessNotAfter: realTrialEnd,
+    })!,
   );
 
-  assert.ok(ttlMs > 0, "a receipt that grants nothing is never the right answer to isPro");
-  assert.equal(ttlMs, 6 * HOUR, "floored at the locked TTL, so the client refreshes soon");
+  assert.equal(lease, 3 * DAY, "the granting window decides, not the ledger's leftovers");
+  assert.ok(lease > 0, "a receipt that grants nothing is never the right answer to isPro");
+});
+
+// --- The offline lease may never outlive the thing that pays for it ------------
+//
+// `trialEndsAt` above is the UI's countdown date and nothing more. The instant
+// access must actually STOP is a separate input, `accessNotAfter`, derived from
+// whichever source is granting — a subscription's paid-up period, a trial's last
+// day, a comp's expiry. Null is reserved for a lifetime licence, the only thing
+// with no boundary.
+//
+// Keeping them apart is what lets both rules hold at once: a stale device date
+// can no longer shorten a receipt (the incident above), and no receipt can
+// outlive the window that grants it (the audit finding below).
+
+test("an active subscription's offline lease stops when the paid period does", () => {
+  const now = BASE.serverTime;
+  const threeDays = new Date(now.getTime() + 3 * DAY);
+
+  // Cancel-at-period-end is the case that pays for this: the customer keeps
+  // access until the period ends, and a flat 30-day lease minted on their last
+  // day hands them a free month after they stopped paying.
+  assert.equal(
+    ttl(issueReceipt({ ...BASE, status: "active", isPro: true, accessNotAfter: threeDays })!),
+    3 * DAY,
+  );
+});
+
+test("a trial shorter than the offline floor is not rounded up to it", () => {
+  const now = BASE.serverTime;
+  const oneHourLeft = new Date(now.getTime() + HOUR);
+
+  // The floor used to win here — six hours of access on a trial with one hour
+  // to run, i.e. every trial ending five hours late, unblockable and offline.
+  assert.equal(
+    ttl(
+      issueReceipt({
+        ...BASE,
+        status: "trialing",
+        isPro: true,
+        trialEndsAt: oneHourLeft,
+        accessNotAfter: oneHourLeft,
+      })!,
+    ),
+    HOUR,
+  );
+});
+
+test("a lifetime licence has no boundary, so it keeps the long rope", () => {
+  assert.equal(
+    ttl(issueReceipt({ ...BASE, status: "active", isPro: true, accessNotAfter: null })!),
+    30 * DAY,
+    "null is 'no boundary', not 'boundary of zero'",
+  );
+});
+
+test("the boundary only ever shortens a lease, never extends one", () => {
+  const now = BASE.serverTime;
+  const farFuture = new Date(now.getTime() + 900 * DAY);
+
+  assert.equal(
+    ttl(issueReceipt({ ...BASE, status: "active", isPro: true, accessNotAfter: farFuture })!),
+    30 * DAY,
+    "a subscription renewing in three years still re-checks in thirty days",
+  );
+  assert.equal(
+    ttl(
+      issueReceipt({
+        ...BASE,
+        status: "expired",
+        isPro: false,
+        accessNotAfter: farFuture,
+      })!,
+    ),
+    6 * HOUR,
+    "and a boundary can never talk a LOCKED receipt into granting for longer",
+  );
 });

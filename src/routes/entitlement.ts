@@ -2,7 +2,11 @@ import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { ledgerHash } from "../lib/hash";
-import { hideTestRowsFor, subscriptionGrants } from "../lib/subscription";
+import {
+  hideTestRowsFor,
+  subscriptionGrants,
+  subscriptionGrantsUntil,
+} from "../lib/subscription";
 import { issueReceipt } from "../lib/entitlement-receipt";
 import { readDeviceId } from "../lib/device";
 import { parseFingerprint } from "../lib/fingerprint";
@@ -90,6 +94,15 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
         // "monthly" | "yearly" — written by the Lemon Squeezy webhook and the
         // RevenueCat sync alike, read back as the view's `plan`.
         interval: true,
+        trialCancelledAt: true,
+        pauseMode: true,
+        variantId: true,
+        // Also load-bearing: together they bound the grace a row with no end
+        // date gets. The PROVIDER's clock, deliberately — Prisma's `updatedAt`
+        // is our own write time, and any endpoint that touches the row could
+        // then renew someone's access by accident.
+        providerUpdatedAt: true,
+        createdAt: true,
         // For `billingUrl` below. Both are refreshed on every webhook because
         // Lemon Squeezy signs them with an expiry.
         customerPortalUrl: true,
@@ -152,6 +165,12 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   // already on file, so the portal is the page that can actually do something
   // — a fresh checkout would sell them a second subscription. Null means "we
   // have no subscription for you", and the client offers the plan picker.
+  //
+  // LAST-KNOWN, NOT LIVE. Lemon Squeezy signs these URLs with a 24-hour expiry,
+  // and this is whatever the last webhook stored — so for any account that has
+  // not had an event today it is a dead link. Clients should open
+  // `GET /api/subscription/portal`, which fetches a fresh one; this stays as the
+  // value support can see and as a fallback when the provider is unreachable.
   const liveSub = subs.find((sub) => subscriptionGrants(sub, now));
   const billingUrl = liveSub?.customerPortalUrl ?? liveSub?.updatePaymentUrl ?? null;
 
@@ -172,6 +191,45 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   const trialSub = subs.find((sub) => sub.status === "on_trial" && subscriptionGrants(sub, now));
   const grantingUntil = trialSub ? (trialSub.validUntil ?? null) : view.trialEndsAt ? new Date(view.trialEndsAt) : null;
 
+  // The instant access must actually STOP — which is a different question from
+  // the countdown above, and the one the offline lease is clipped to.
+  //
+  // Read from whatever is granting, in the SAME precedence computeEntitlement
+  // uses, because a boundary taken from a source that is not the granting one is
+  // how a receipt ends up either too long (a cancelled month still worth thirty
+  // days offline) or too short (the lockout this file's history is full of).
+  //
+  // Null means "no boundary", and only two things may claim it: a lifetime
+  // licence, and a comp deliberately granted without an end date.
+  // The LATEST boundary across every granting row, not the first one the database
+  // happened to return. An account that cancelled and resubscribed carries two
+  // granting rows, and clipping the lease to whichever came back first would cut
+  // a paying customer off at the old subscription's end date.
+  //
+  // `subscriptionGrantsUntil`, not `validUntil`: a row with no end date does not
+  // grant for ever — it grants for the incomplete-data grace — and reading a null
+  // here as "no boundary" handed out a thirty-day offline lease while the server's
+  // own answer for that identical row expired in three days.
+  const grantingSubsUntil = subs
+    .filter((sub) => subscriptionGrants(sub, now))
+    .map(subscriptionGrantsUntil);
+  const subscriptionBoundary = grantingSubsUntil.includes(null)
+    ? null
+    : grantingSubsUntil.reduce<Date | null>(
+        (latest, d) => (latest == null || (d && d > latest) ? d : latest),
+        null,
+      );
+
+  const accessNotAfter = !view.isPro
+    ? null
+    : purchases.some((p) => !p.isRefunded)
+      ? null // lifetime — outranks everything and never lapses
+      : liveSub
+        ? subscriptionBoundary // the paid-up period, trial or paid alike
+        : compActive
+          ? (user.compedUntil ?? null)
+          : (claim?.endsAt ?? user.trialEndsAt ?? null); // the device trial
+
   // Anything that ever granted, or ever would have. `claim` covers the machine
   // trial even when it has elapsed, which is precisely the case that must not
   // read as "brand new".
@@ -190,6 +248,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
       status: view.status,
       isPro: view.isPro,
       trialEndsAt: grantingUntil,
+      accessNotAfter,
       serverTime: now,
       enforced: view.enforced,
     }),

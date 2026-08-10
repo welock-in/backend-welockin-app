@@ -712,6 +712,31 @@ model Subscription {
   renewsAt    DateTime?
   endsAt      DateTime?
 
+  /// Lemon Squeezy's `pause.mode` while the subscription is paused: "void" or
+  /// "free". Null when it is not paused.
+  ///
+  /// The two are opposites for access. `free` is "stop charging me but let me
+  /// keep using it"; `void` is "suspend the whole thing". `paused` alone was
+  /// read as granting, which handed the product to everyone who asked us to
+  /// suspend it — indefinitely, since a paused subscription has no end date.
+  pauseMode String?
+
+  /// TOMBSTONE: when this subscription was cancelled while its trial was still
+  /// running. Set once, never cleared.
+  ///
+  /// Cancelling a trial ends access immediately — a trial buys no grace, nobody
+  /// was charged. That rule used to be read off `status`, which left it trivially
+  /// undone: cancel the trial, then press Resume in the Lemon Squeezy customer
+  /// portal. LS puts the status back to `on_trial` with the SAME trial_ends_at,
+  /// no payment is taken, and the row grants again — repeatably, for free.
+  ///
+  /// The tombstone is what makes the cancellation a fact about the trial rather
+  /// than a description of the current status, so no later event can talk the
+  /// row back into granting for the rest of that window. It stops mattering on
+  /// its own once trial_ends_at passes: from there the customer has either paid
+  /// (status active, a real renews_at) or has nothing.
+  trialCancelledAt DateTime?
+
   /// The customer portal URL Lemon Squeezy mints, so "manage my subscription"
   /// does not have to be a support ticket. Refreshed on every webhook because LS
   /// signs it with an expiry.

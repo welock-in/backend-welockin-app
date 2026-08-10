@@ -111,6 +111,8 @@ export type LemonSqueezyWebhook = {
       renews_at?: string | null;
       ends_at?: string | null;
       urls?: { update_payment_method?: string; customer_portal?: string };
+      /** Present only while paused. `mode` is "void" or "free". */
+      pause?: { mode?: string; resumes_at?: string | null } | null;
       /// Part of the dedup key: a redelivery of one event repeats it, a genuinely
       /// new event on the same subscription does not.
       updated_at?: string;
@@ -278,6 +280,11 @@ export type ParsedSubscription = {
    * stale retry can resurrect a cancelled state.
    */
   updatedAt: Date | null;
+  /**
+   * `pause.mode` — "void" (access suspended too) or "free" (we stop charging,
+   * they keep using it). Null when the subscription is not paused.
+   */
+  pauseMode: string | null;
   testMode: boolean;
 };
 
@@ -317,6 +324,11 @@ export function parseSubscriptionEvent(body: LemonSqueezyWebhook): ParsedSubscri
     updatePaymentUrl: str(attrs.urls?.update_payment_method),
     customerPortalUrl: str(attrs.urls?.customer_portal),
     updatedAt: parseDate(attrs.updated_at),
+    // "void" | "free", or null when not paused. The two mean opposite things for
+    // access — `free` keeps the customer using the product while we stop
+    // charging, `void` suspends both — and reading `paused` without it grants
+    // access to everyone who asked us to suspend it.
+    pauseMode: str((attrs.pause as { mode?: unknown } | null | undefined)?.mode),
     testMode: attrs.test_mode === true || body.meta?.test_mode === true,
   };
 }

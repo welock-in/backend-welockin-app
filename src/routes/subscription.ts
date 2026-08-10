@@ -1,12 +1,18 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
-import { hideTestRowsFor, subscriptionGrants, variantForPlan } from "../lib/subscription";
+import {
+  hideTestRowsFor,
+  subscriptionGrants,
+  subscriptionIsLive,
+  variantForPlan,
+} from "../lib/subscription";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { badRequest, conflict } from "../lib/http-error";
 import { readLemonSqueezyError } from "../lib/lemonsqueezy";
 import { changePlanSchema } from "../validation/schemas";
+import { clientIp, consumeRateLimit } from "../lib/rate-limit";
 
 export const subscriptionRouter = Router();
 
@@ -57,11 +63,35 @@ subscriptionRouter.post(
     // would otherwise try to INVOICE a test subscription through the live key.
     const subs = await prisma.subscription.findMany({
       where: { userId, provider: PROVIDER, ...hideTestRowsFor(userId, env) },
-      select: { externalId: true, status: true, validUntil: true, trialEndsAt: true },
+      select: {
+        externalId: true,
+        status: true,
+        validUntil: true,
+        trialEndsAt: true,
+        trialCancelledAt: true,
+        pauseMode: true,
+        providerUpdatedAt: true,
+        createdAt: true,
+        variantId: true,
+        updatedAt: true,
+      },
     });
 
     const now = new Date();
-    const trial = subs.find((sub) => sub.status === "on_trial" && subscriptionGrants(sub, now));
+    // Manageability, not access — with one condition kept from the access rules
+    // because this endpoint TAKES MONEY: the trial window must still be open.
+    // Converting a row whose window has lapsed would charge a customer on the
+    // strength of a stale record, and the two ways to get here are both benign
+    // (a second click, or a trial that converted between drawing the button and
+    // pressing it). Everything else `subscriptionGrants` would refuse — an
+    // unrecognised variant, a void pause — is about entitlement, not about
+    // whether Lemon Squeezy will honour this charge.
+    const trial = subs.find(
+      (sub) =>
+        sub.status === "on_trial" &&
+        subscriptionIsLive(sub) &&
+        (sub.validUntil == null || sub.validUntil.getTime() > now.getTime()),
+    );
     if (!trial) {
       // Not an error worth a 500, and not something a retry fixes. The two ways
       // to get here are both benign: a second click, and a customer whose trial
@@ -150,8 +180,14 @@ subscriptionRouter.get(
         interval: true,
         validUntil: true,
         trialEndsAt: true,
+        trialCancelledAt: true,
+        pauseMode: true,
+        providerUpdatedAt: true,
+        createdAt: true,
+        variantId: true,
         renewsAt: true,
         endsAt: true,
+        updatedAt: true,
       },
       orderBy: { updatedAt: "desc" },
     });
@@ -159,7 +195,10 @@ subscriptionRouter.get(
     const now = new Date();
     // The one that still grants, if any — an account can carry old expired rows
     // and the settings screen must describe the live one, not the first one.
-    const live = subs.find((sub) => subscriptionGrants(sub, now)) ?? null;
+    // What the customer is PAYING, which is not the same as what grants them
+    // access: a screen that hides a subscription because it stopped granting is
+    // a screen with no cancel button on a card that is still being charged.
+    const live = subs.find(subscriptionIsLive) ?? null;
 
     res.json({
       subscription: live && {
@@ -181,6 +220,140 @@ subscriptionRouter.get(
         reactivatable: live.status === "cancelled",
       },
     });
+  }),
+);
+
+/**
+ * A LIVE customer-portal link, fetched from Lemon Squeezy at the moment it is
+ * asked for.
+ *
+ * WHY IT CANNOT BE THE STORED ONE. Lemon Squeezy SIGNS the portal URL and it
+ * expires after 24 hours. We persist it on every webhook, and the entitlement
+ * response hands that stored copy out as `billingUrl` — which is fine for a
+ * customer whose subscription changed today, and a dead link for everyone else.
+ * Since most accounts go weeks between events, "Manage billing" was broken for
+ * almost everyone almost always, in the way that is hardest to notice: the
+ * button works, the page just refuses.
+ *
+ * So the row's copy stays (it is a useful last-known value for support) and this
+ * endpoint is what the app opens. The fresh URLs are written back on the way
+ * past, because a value we just learned is worth keeping.
+ */
+subscriptionRouter.get(
+  "/portal",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    if (!env.lemonSqueezyApiKey) {
+      console.error("[subscription] cannot fetch a portal link: no Lemon Squeezy API key");
+      throw badRequest("Billing is not available right now.");
+    }
+
+    // Every request here is an authenticated outbound Lemon Squeezy call plus a
+    // write, and — unlike /cancel or /end-trial — it never transitions into a
+    // state that refuses a repeat, so a loop is unbounded. Same two-leg cap the
+    // sibling money routes use: generous for a human pressing a button, fatal to
+    // a script draining the shared API quota.
+    await consumeRateLimit(`portal:${req.user!.id}`, 30, 5 * 60_000);
+    await consumeRateLimit(`portal:ip:${clientIp(req)}`, 60, 5 * 60_000);
+
+    const subs = await prisma.subscription.findMany({
+      where: { userId: req.user!.id, provider: PROVIDER, ...hideTestRowsFor(req.user!.id, env) },
+      select: {
+        id: true,
+        externalId: true,
+        status: true,
+        validUntil: true,
+        trialEndsAt: true,
+        trialCancelledAt: true,
+        pauseMode: true,
+        providerUpdatedAt: true,
+        createdAt: true,
+        variantId: true,
+        updatedAt: true,
+        customerPortalUrl: true,
+        updatePaymentUrl: true,
+      },
+      orderBy: { updatedAt: "desc" },
+    });
+
+    // Found from the TOKEN, never named by the request — a subscription id in
+    // the query would hand anyone a portal link into a stranger's billing.
+    const now = new Date();
+    const live = subs.find(subscriptionIsLive) ?? subs[0];
+    if (!live) throw conflict("There is no subscription on this account.");
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LS_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await fetch(`${env.lemonSqueezyApiBase}/v1/subscriptions/${live.externalId}`, {
+        method: "GET",
+        headers: {
+          Accept: "application/vnd.api+json",
+          Authorization: `Bearer ${env.lemonSqueezyApiKey}`,
+        },
+        signal: controller.signal,
+      });
+    } catch (err) {
+      console.error(
+        "[subscription] Lemon Squeezy unreachable while fetching a portal link:",
+        err instanceof Error ? err.message : err,
+      );
+      // Fall back to the stored copy rather than leaving them with nothing: it
+      // may be expired, but "possibly stale" beats "no link at all".
+      if (live.customerPortalUrl ?? live.updatePaymentUrl) {
+        res.json({ url: live.customerPortalUrl ?? live.updatePaymentUrl, fresh: false });
+        return;
+      }
+      throw badRequest("Could not reach the payment provider. Please try again.");
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!response.ok) {
+      const why = await readLemonSqueezyError(response);
+      console.error(
+        `[subscription] Lemon Squeezy refused to describe ${live.externalId}: ` +
+          `HTTP ${response.status} — ${why}`,
+      );
+      if (live.customerPortalUrl ?? live.updatePaymentUrl) {
+        res.json({ url: live.customerPortalUrl ?? live.updatePaymentUrl, fresh: false });
+        return;
+      }
+      throw badRequest(`Could not open billing — ${why}`);
+    }
+
+    let portal: string | null = null;
+    let payment: string | null = null;
+    try {
+      const body = (await response.json()) as {
+        data?: { attributes?: { urls?: { customer_portal?: string; update_payment_method?: string } } };
+      };
+      portal = body.data?.attributes?.urls?.customer_portal ?? null;
+      payment = body.data?.attributes?.urls?.update_payment_method ?? null;
+    } catch {
+      /* handled by the null check below */
+    }
+
+    const url = portal ?? payment ?? live.customerPortalUrl ?? live.updatePaymentUrl;
+    if (!url) throw badRequest("Could not open billing right now.");
+
+    // Keep what we just learned. Best-effort: a failed write costs the next
+    // request a round trip, not this one its answer. `providerUpdatedAt` is left
+    // alone so this cannot outrank a real event in the staleness guard.
+    if (portal || payment) {
+      await prisma.subscription
+        .update({
+          where: { id: live.id },
+          data: {
+            ...(portal ? { customerPortalUrl: portal } : {}),
+            ...(payment ? { updatePaymentUrl: payment } : {}),
+          },
+        })
+        .catch((e) => console.error("[subscription] could not cache the portal URLs:", e));
+    }
+
+    res.json({ url, fresh: portal != null || payment != null });
   }),
 );
 
@@ -212,14 +385,30 @@ subscriptionRouter.post(
     const userId = req.user!.id;
     const subs = await prisma.subscription.findMany({
       where: { userId, provider: PROVIDER, ...hideTestRowsFor(userId, env) },
-      select: { id: true, externalId: true, status: true, validUntil: true, trialEndsAt: true },
+      select: {
+        id: true,
+        externalId: true,
+        status: true,
+        validUntil: true,
+        trialEndsAt: true,
+        trialCancelledAt: true,
+        pauseMode: true,
+        providerUpdatedAt: true,
+        createdAt: true,
+        variantId: true,
+        updatedAt: true,
+      },
     });
 
     const now = new Date();
     // Same rule as everywhere else: found from the TOKEN, never named by the
     // request. A subscription id in the body would let anyone cancel a
     // stranger's plan.
-    const live = subs.find((sub) => subscriptionGrants(sub, now) && sub.status !== "cancelled");
+    // THERE IS ALWAYS A WAY OUT. Read as a billing question on purpose: a
+    // subscription that stopped granting access but is still being charged is
+    // exactly the one a customer most needs to cancel, and gating this on the
+    // access predicate would have refused them.
+    const live = subs.find((sub) => subscriptionIsLive(sub) && sub.status !== "cancelled");
     if (!live) {
       throw conflict("There is no active subscription to cancel on this account.");
     }
@@ -290,6 +479,11 @@ subscriptionRouter.post(
         where: { id: live.id },
         data: {
           status: "cancelled",
+          // The tombstone, written here too rather than left to the webhook: the
+          // customer could reach the Lemon Squeezy portal and press Resume before
+          // the delivery lands, and the whole point of the tombstone is that no
+          // resume gives back a trial that was refused.
+          ...(wasTrial ? { trialCancelledAt: now } : {}),
           ...(endsAt ? { endsAt: new Date(endsAt), validUntil: new Date(endsAt) } : {}),
         },
       })
@@ -326,13 +520,31 @@ subscriptionRouter.post(
     const userId = req.user!.id;
     const subs = await prisma.subscription.findMany({
       where: { userId, provider: PROVIDER, ...hideTestRowsFor(userId, env) },
-      select: { externalId: true, status: true, validUntil: true, endsAt: true },
+      select: {
+        externalId: true,
+        status: true,
+        validUntil: true,
+        endsAt: true,
+        // Not decoration. Without it `subscriptionGrants` cannot see that this
+        // cancellation happened during a TRIAL, and this endpoint would happily
+        // resume a trial the customer had ended — handing back free access that
+        // was never paid for, as many times as they liked.
+        trialEndsAt: true,
+        trialCancelledAt: true,
+        pauseMode: true,
+        providerUpdatedAt: true,
+        createdAt: true,
+        variantId: true,
+        updatedAt: true,
+      },
     });
 
     const now = new Date();
     // Resumable = cancelled AND still granting (before ends_at). A row already
     // expired cannot be resumed — Lemon Squeezy would refuse, and the honest
-    // answer is "start a new plan", not a confusing provider error.
+    // answer is "start a new plan", not a confusing provider error. A cancelled
+    // TRIAL is deliberately not resumable either: it stopped granting the moment
+    // it was cancelled, so there is nothing left to resume.
     const resumable = subs.find(
       (sub) => sub.status === "cancelled" && subscriptionGrants(sub, now),
     );
@@ -444,12 +656,24 @@ subscriptionRouter.post(
     const userId = req.user!.id;
     const subs = await prisma.subscription.findMany({
       where: { userId, provider: PROVIDER, ...hideTestRowsFor(userId, env) },
-      select: { externalId: true, status: true, validUntil: true, variantId: true },
+      select: {
+        externalId: true,
+        status: true,
+        validUntil: true,
+        variantId: true,
+        trialEndsAt: true,
+        trialCancelledAt: true,
+        pauseMode: true,
+        providerUpdatedAt: true,
+        createdAt: true,
+        updatedAt: true,
+      },
     });
 
     const now = new Date();
     // Found from the TOKEN, never named by the request — like every money action.
-    const live = subs.find((sub) => subscriptionGrants(sub, now) && sub.status !== "cancelled");
+    // Billing question, like /cancel above.
+    const live = subs.find((sub) => subscriptionIsLive(sub) && sub.status !== "cancelled");
     if (!live) {
       throw conflict("There is no active subscription to change.");
     }

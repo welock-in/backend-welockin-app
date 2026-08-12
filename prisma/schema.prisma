@@ -619,6 +619,18 @@ model Purchase {
   /// rather than trusting the absence to mean anything.
   testMode Boolean?
 
+  /// "sandbox" | "production" — which StoreKit environment this purchase came
+  /// from (provider "revenuecat"). OPTIONAL with no default, like `testMode`
+  /// above and for the same MongoDB reason: a default is applied at CREATE
+  /// only, so it would tell nothing about the rows that predate the column
+  /// while pretending to.
+  environment String?
+  /// When access was actively taken back (Apple refund/revocation), as opposed
+  /// to never granted. Sits alongside `refundedAt`, which some providers set
+  /// with refund semantics only; a reader that cares about "was this pulled"
+  /// checks isRefunded, which both paths set.
+  revokedAt DateTime?
+
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
@@ -732,7 +744,55 @@ model Subscription {
   /// guard existed have none, and `null` always accepts the next write.
   /// (Prisma's own `updatedAt` below is OUR write time — useless for ordering
   /// someone else's events.)
+  ///
+  /// For provider "revenuecat" this is OUR fetch time, not an upstream stamp:
+  /// the row is never written from an event payload, only from a full
+  /// re-fetch of the subscriber, so "when we last asked" IS the ordering.
   providerUpdatedAt DateTime?
+
+  // --- RevenueCat mirror (provider "revenuecat") -----------------------------
+  //
+  // ALL OPTIONAL, and none carries a `@default`, deliberately: on MongoDB a
+  // default is applied at CREATE only, so every Lemon Squeezy row written
+  // before these columns existed simply has no field — and a default would
+  // dress that absence up as a value nobody ever recorded. Absent means
+  // "not known", which every reader must (and does) tolerate.
+
+  /// Is auto-renew still on? Apple's toggle, via RevenueCat's
+  /// `unsubscribe_detected_at` (null = still renewing). NEVER a reason to cut
+  /// access: turning off auto-renew keeps access until `validUntil` — which is
+  /// exactly why an RC row never carries status "cancelled" (see
+  /// lib/revenuecat.ts, statusForSubscription).
+  willRenew Boolean?
+  /// "sandbox" | "production" — which StoreKit environment the money (or lack
+  /// of it) came from. `testMode` above stays the flag readers gate on; this
+  /// is the human-readable provenance for support.
+  environment String?
+  /// The RevenueCat entitlement identifier this product unlocks (e.g. "pro").
+  /// Informative — access is decided from status+validUntil, never from this.
+  entitlementId String?
+  /// RevenueCat's `period_type`: "normal" | "trial" | "intro". Verbatim, like
+  /// the Lemon Squeezy status: when support and a customer disagree, the
+  /// useful question is what the processor said.
+  periodType String?
+  /// When RevenueCat noticed the customer turned auto-renew OFF. Cancellation
+  /// is NOT expiration: this row keeps granting until validUntil.
+  unsubscribeDetectedAt DateTime?
+  /// When RevenueCat noticed a billing problem. While a grace period is open
+  /// the row reads past_due and keeps granting until the grace end.
+  billingIssueDetectedAt DateTime?
+  /// When Apple refunded this subscription. A refund IS an ending: the row is
+  /// written expired with revokedAt set, and grants nothing.
+  refundedAt DateTime?
+  /// When access was actively taken back (refund/revocation), as opposed to
+  /// merely running out. Mirrors Purchase.revokedAt.
+  revokedAt DateTime?
+  /// RevenueCat's app_user_id this state was fetched under — our Mongo user id
+  /// when the app identified the user before purchase. For support.
+  appUserId String?
+  /// RevenueCat's original_app_user_id — the identity the subscriber was first
+  /// created as, which is what survives TRANSFER events. For support.
+  originalAppUserId String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

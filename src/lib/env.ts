@@ -39,6 +39,22 @@ function requiredSecret(name: string, devFallback: string): string {
 const jwtSecret = requiredSecret("JWT_SECRET", "change-me");
 
 /**
+ * RevenueCat — the iOS purchase path (StoreKit under RevenueCat's plumbing).
+ *
+ * Read once here so `revenuecatEnabled` below can be DERIVED from the same
+ * values the env object exports: the feature is ON only when both halves of it
+ * can actually work. The auth token is what lets the webhook believe a
+ * delivery; the secret API key is what lets us re-fetch the subscriber that
+ * delivery describes. With either one missing the integration is
+ * half-configured — a webhook that accepts events it can never act on, or an
+ * API client nothing ever triggers — so, exactly like the Lemon Squeezy
+ * all-or-none rule, a partial config FAILS CLOSED into "off" rather than into
+ * whichever half happens to boot.
+ */
+const revenuecatWebhookAuthToken = process.env.REVENUECAT_WEBHOOK_AUTH_TOKEN ?? "";
+const revenuecatSecretApiKey = process.env.REVENUECAT_SECRET_API_KEY ?? "";
+
+/**
  * The server-only key behind the TrialClaim ledger's device hashes.
  *
  * Deliberately NOT `required()`. Every claim in the ledger is keyed with this
@@ -236,6 +252,65 @@ export const env = {
    */
   lemonSqueezyAllowTestMode: process.env.LEMONSQUEEZY_ALLOW_TEST_MODE === "true",
 
+  // --- RevenueCat (iOS: StoreKit subscriptions + lifetime) --------------------
+  /**
+   * The Authorization header value configured on the webhook in the RevenueCat
+   * dashboard. It is the webhook's whole perimeter (RevenueCat does not sign
+   * deliveries), so it must be long and random. Empty = webhook refuses
+   * everything, exactly like an unset Lemon Squeezy webhook secret.
+   */
+  revenuecatWebhookAuthToken,
+  /**
+   * OPTIONAL second factor for the webhook: when set, deliveries must ALSO
+   * carry a valid `X-RevenueCat-Signature` (hex HMAC-SHA256 of the raw body).
+   * RevenueCat does not sign webhooks natively today — this exists for a
+   * signing proxy in front of us, and is verified only when configured. The
+   * Authorization token above stays the real barrier either way.
+   */
+  revenuecatWebhookHmacSecret: process.env.REVENUECAT_WEBHOOK_HMAC_SECRET ?? "",
+  /** Secret API key (server-side) for GET /v1/subscribers — never the public SDK key. */
+  revenuecatSecretApiKey,
+  /** Informational only: the RevenueCat project this deploy expects to serve. */
+  revenuecatProjectId: process.env.REVENUECAT_PROJECT_ID ?? "",
+  /** The entitlement identifier configured in RevenueCat (informative — access
+   *  is decided from our own mirrored rows, never from this string). */
+  revenuecatExpectedEntitlement: process.env.REVENUECAT_EXPECTED_ENTITLEMENT ?? "pro",
+  /**
+   * OPTIONAL allow-list of RevenueCat app ids (CSV). When set, webhook events
+   * whose `app_id` is not in the list are acknowledged and skipped — the same
+   * "someone else's store" refusal the Lemon Squeezy webhook makes on store_id.
+   */
+  revenuecatAllowedAppIds: (process.env.REVENUECAT_ALLOWED_APP_IDS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+  /**
+   * May a SANDBOX transaction grant real access?
+   *
+   * Requires the literal "true", like every other switch here that guards
+   * money. Note the isolation is at READ time, not at write time: sandbox
+   * events are always RECORDED (their rows carry testMode), and this flag only
+   * decides whether those rows grant — see hideTestRows. That is what lets
+   * TestFlight testers be granted on a staging backend without a single
+   * sandbox row ever granting in production.
+   */
+  revenuecatAllowSandbox: process.env.REVENUECAT_ALLOW_SANDBOX === "true",
+  /**
+   * Webhook events older than this are acknowledged and skipped as replays.
+   * RevenueCat retries failed deliveries for up to ~72h, so the default leaves
+   * a day of headroom beyond their own retry horizon.
+   */
+  revenuecatMaxEventAgeHours: intFromEnv("REVENUECAT_MAX_EVENT_AGE_HOURS", 96),
+  /** Override only for tests. */
+  revenuecatApiBase: process.env.REVENUECAT_API_BASE ?? "https://api.revenuecat.com",
+  /**
+   * Is the RevenueCat integration usable at all? Derived, never set directly:
+   * both the webhook's auth token and the server API key must exist, because
+   * every webhook ends in a subscriber re-fetch — see the note at the top of
+   * this file where the two are read.
+   */
+  revenuecatEnabled: Boolean(revenuecatWebhookAuthToken && revenuecatSecretApiKey),
+
   /**
    * May the client HARD-GATE on the entitlement status it is told?
    *
@@ -431,6 +506,19 @@ if (process.env.LEMONSQUEEZY_API_KEY || process.env.LEMON_API_KEY) {
         `${missingPlans.length > 1 ? "are" : "is"} empty — those plans will answer 400.`,
     );
   }
+}
+
+// RevenueCat is all-or-none for the same reason Lemon Squeezy is: with only the
+// webhook token, deliveries are believed and then nothing can re-fetch the state
+// they announce; with only the API key, nothing ever triggers a fetch. Either
+// half alone is OFF (`revenuecatEnabled` is already false — see its derivation),
+// but silence would leave an operator staring at a webhook that answers 503 with
+// no clue which variable is missing, so the half-configured state is named.
+if (Boolean(revenuecatWebhookAuthToken) !== Boolean(revenuecatSecretApiKey)) {
+  console.warn(
+    "[env] RevenueCat is half-configured, so it is DISABLED — set both " +
+      "REVENUECAT_WEBHOOK_AUTH_TOKEN and REVENUECAT_SECRET_API_KEY, or neither.",
+  );
 }
 
 // A half-configured storefront is not a storefront. Blanking the keys is how that

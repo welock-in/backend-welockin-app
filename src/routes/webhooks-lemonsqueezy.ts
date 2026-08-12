@@ -18,15 +18,13 @@ import {
   type ParsedSubscription,
 } from "../lib/lemonsqueezy";
 import { intervalForVariant, subscriptionGrants, validUntilFrom } from "../lib/subscription";
+import { claimWebhookEvent, markWebhookEvent } from "../lib/webhook-events";
 import { ledgerHash } from "../lib/hash";
 import { isReliableDeviceId } from "../lib/device";
 
 export const lemonSqueezyWebhookRouter = Router();
 
 const PROVIDER = "lemonsqueezy";
-
-/** Terminal states. A redelivery finding one of these has genuinely nothing to do. */
-const DONE = new Set(["processed", "skipped"]);
 
 /**
  * Lemon Squeezy order webhook — the first thing in this backend that writes a
@@ -537,74 +535,21 @@ async function claimEvent(order: ParsedOrder, body: LemonSqueezyWebhook): Promis
  * Claim a delivery by key.
  *
  * Split out of `claimEvent` so subscriptions reuse it rather than growing a
- * second copy: the P2034-versus-P2002 distinction below is the part that took a
- * lost sale to get right, and two copies of it would eventually disagree.
+ * second copy, and since RevenueCat arrived the copy itself lives in
+ * lib/webhook-events.ts, shared across providers for the same reason: the
+ * P2034-versus-P2002 distinction in there is the part that took a lost sale to
+ * get right, and two copies of it would eventually disagree.
  */
 async function claimEventKey(
   eventKey: string,
   type: string,
   body: LemonSqueezyWebhook,
 ): Promise<"fresh" | "done" | "retry"> {
-  try {
-    await prisma.webhookEvent.create({
-      data: {
-        provider: PROVIDER,
-        eventId: eventKey,
-        type,
-        payload: body as Prisma.InputJsonValue,
-        status: "processing",
-      },
-    });
-    return "fresh";
-  } catch (err) {
-    if (!(err instanceof Prisma.PrismaClientKnownRequestError)) throw err;
-
-    // P2034 is a write CONFLICT: the row was not written. Distinct from P2002,
-    // where someone else genuinely got there first. Conflating them told Lemon
-    // Squeezy an order was handled when nothing had been.
-    if (err.code === "P2034") return "retry";
-    if (err.code !== "P2002") throw err;
-
-    const prior = await prisma.webhookEvent.findUnique({
-      where: { provider_eventId: { provider: PROVIDER, eventId: eventKey } },
-      select: { status: true },
-    });
-    if (prior && DONE.has(prior.status)) return "done";
-
-    // Left "processing" by an instance that died, or "failed" by a real error.
-    // Either way the work still owes an outcome, and every write below is
-    // idempotent, so redoing it is safe.
-    await prisma.webhookEvent
-      .update({
-        where: { provider_eventId: { provider: PROVIDER, eventId: eventKey } },
-        data: { status: "processing", attempts: { increment: 1 } },
-      })
-      .catch(() => undefined);
-    return "fresh";
-  }
+  return claimWebhookEvent(PROVIDER, eventKey, type, body as Prisma.InputJsonValue);
 }
 
 async function markEvent(eventKey: string, status: string, error?: string): Promise<void> {
-  await prisma.webhookEvent
-    // updateMany for its WHERE, not its many: the status filter makes a finished
-    // row immovable. The claim race (two instances re-running one event) is
-    // survivable because every write is idempotent — but only if the LOSER
-    // finishing late cannot re-mark the winner's `processed` as `failed`, which
-    // would put a completed sale back on the to-do list.
-    .updateMany({
-      where: {
-        provider: PROVIDER,
-        eventId: eventKey,
-        status: { notIn: Array.from(DONE) },
-      },
-      data: { status, error: error ?? null, processedAt: new Date() },
-    })
-    .catch((e) => {
-      // Best-effort, but never silent: this row is the only trace a replay tool
-      // would have, and a status write that vanished without a word once made a
-      // healthy queue indistinguishable from a stuck one.
-      console.error(`[lemonsqueezy] could not mark ${eventKey} as ${status}:`, e);
-    });
+  return markWebhookEvent(PROVIDER, eventKey, status, error);
 }
 
 /**

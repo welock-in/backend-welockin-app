@@ -56,7 +56,7 @@ subscriptionRouter.post(
     // must stop existing everywhere at once — and this endpoint in particular
     // would otherwise try to INVOICE a test subscription through the live key.
     const subs = await prisma.subscription.findMany({
-      where: { userId, provider: PROVIDER, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
+      where: { userId, provider: PROVIDER, ...hideTestRows({ lemonSqueezy: env.lemonSqueezyAllowTestMode, revenuecat: env.revenuecatAllowSandbox }) },
       select: { externalId: true, status: true, validUntil: true, trialEndsAt: true },
     });
 
@@ -142,7 +142,7 @@ subscriptionRouter.get(
       where: {
         userId: req.user!.id,
         provider: PROVIDER,
-        ...hideTestRows(env.lemonSqueezyAllowTestMode),
+        ...hideTestRows({ lemonSqueezy: env.lemonSqueezyAllowTestMode, revenuecat: env.revenuecatAllowSandbox }),
       },
       select: {
         status: true,
@@ -210,7 +210,7 @@ subscriptionRouter.post(
 
     const userId = req.user!.id;
     const subs = await prisma.subscription.findMany({
-      where: { userId, provider: PROVIDER, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
+      where: { userId, provider: PROVIDER, ...hideTestRows({ lemonSqueezy: env.lemonSqueezyAllowTestMode, revenuecat: env.revenuecatAllowSandbox }) },
       select: { id: true, externalId: true, status: true, validUntil: true, trialEndsAt: true },
     });
 
@@ -324,7 +324,7 @@ subscriptionRouter.post(
 
     const userId = req.user!.id;
     const subs = await prisma.subscription.findMany({
-      where: { userId, provider: PROVIDER, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
+      where: { userId, provider: PROVIDER, ...hideTestRows({ lemonSqueezy: env.lemonSqueezyAllowTestMode, revenuecat: env.revenuecatAllowSandbox }) },
       select: { externalId: true, status: true, validUntil: true, endsAt: true },
     });
 
@@ -442,7 +442,7 @@ subscriptionRouter.post(
 
     const userId = req.user!.id;
     const subs = await prisma.subscription.findMany({
-      where: { userId, provider: PROVIDER, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
+      where: { userId, provider: PROVIDER, ...hideTestRows({ lemonSqueezy: env.lemonSqueezyAllowTestMode, revenuecat: env.revenuecatAllowSandbox }) },
       select: { externalId: true, status: true, validUntil: true, variantId: true },
     });
 

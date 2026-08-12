@@ -140,23 +140,40 @@ export function variantForPlan(
 /**
  * The Prisma `where` fragment that hides TEST-mode rows once test mode is shut.
  *
- * Three places read billing rows to decide something — the entitlement
- * resolver, and the checkout's two "you already have this" guards — and all
- * three must agree about whether a test purchase counts. One fragment, so they
- * cannot drift into a state where a row grants access but does not block a
+ * Several places read billing rows to decide something — the entitlement
+ * resolver, and the checkout/subscription "you already have this" guards — and
+ * all of them must agree about whether a test purchase counts. One fragment, so
+ * they cannot drift into a state where a row grants access but does not block a
  * second purchase of it.
  *
- * While ALLOW_TEST_MODE is ON this is EMPTY, deliberately: a test purchase is
- * the thing being tested, and hiding it would make the test prove nothing. The
- * moment the flag goes off, every test row stops existing as far as access and
- * checkout are concerned — which is what makes the switch to a live key safe
- * without a database migration.
+ * PER PROVIDER, not one global switch, because the two test worlds are
+ * unrelated: `lemonSqueezyAllowTestMode` opens Lemon Squeezy TEST-mode rows
+ * (desktop), `revenuecatAllowSandbox` opens StoreKit SANDBOX rows (iOS,
+ * TestFlight). A tester exercising one storefront must never quietly re-open
+ * the other's free-licence tap — so a testMode row only counts when the flag
+ * of ITS OWN provider says so, and the protection can never be lifted
+ * globally by accident.
+ *
+ * While a provider's flag is ON its test rows are visible, deliberately: a
+ * test purchase is the thing being tested, and hiding it would make the test
+ * prove nothing. The moment the flag goes off, every test row of that provider
+ * stops existing as far as access and checkout are concerned — which is what
+ * makes the switch to live safe without a database migration.
  *
  * `NOT: { testMode: true }` rather than `testMode: false`, because on MongoDB a
  * column added after launch is ABSENT on older documents, not false — and
  * `testMode: false` would silently exclude every row written before this
  * existed, i.e. every real customer we already have.
  */
-export function hideTestRows(allowTestMode: boolean): Record<string, unknown> {
-  return allowTestMode ? {} : { NOT: { testMode: true } };
+export function hideTestRows(allow: {
+  lemonSqueezy: boolean;
+  revenuecat: boolean;
+}): Record<string, unknown> {
+  return {
+    OR: [
+      { NOT: { testMode: true } },
+      ...(allow.lemonSqueezy ? [{ provider: "lemonsqueezy" }] : []),
+      ...(allow.revenuecat ? [{ provider: "revenuecat" }] : []),
+    ],
+  };
 }

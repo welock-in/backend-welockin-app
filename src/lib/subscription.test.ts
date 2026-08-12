@@ -134,3 +134,37 @@ test("an ACTIVE trial is untouched by the rule — only cancelling ends it", () 
     true,
   );
 });
+
+/*
+ * The per-provider test-row gate. One fragment feeds every billing read, and
+ * the property that matters is ISOLATION: opening one provider's test world
+ * must never open the other's — REVENUECAT_ALLOW_SANDBOX is how TestFlight
+ * testers get access on staging, and it must not also resurrect Lemon Squeezy
+ * test orders (or vice versa).
+ */
+import { hideTestRows } from "./subscription";
+
+test("with every flag off, only the NOT-test clause remains (absent still reads as real)", () => {
+  assert.deepEqual(hideTestRows({ lemonSqueezy: false, revenuecat: false }), {
+    OR: [{ NOT: { testMode: true } }],
+  });
+});
+
+test("each flag opens ONLY its own provider's test rows", () => {
+  assert.deepEqual(hideTestRows({ lemonSqueezy: true, revenuecat: false }), {
+    OR: [{ NOT: { testMode: true } }, { provider: "lemonsqueezy" }],
+  });
+  assert.deepEqual(hideTestRows({ lemonSqueezy: false, revenuecat: true }), {
+    OR: [{ NOT: { testMode: true } }, { provider: "revenuecat" }],
+  });
+});
+
+test("both flags open both — and STILL nothing beyond those two providers", () => {
+  assert.deepEqual(hideTestRows({ lemonSqueezy: true, revenuecat: true }), {
+    OR: [
+      { NOT: { testMode: true } },
+      { provider: "lemonsqueezy" },
+      { provider: "revenuecat" },
+    ],
+  });
+});

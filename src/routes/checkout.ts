@@ -85,7 +85,7 @@ checkoutRouter.post(
     // makes every plan pointless — a second purchase buys nothing, and refunding
     // it afterwards costs us the fee and them the goodwill.
     const owned = await prisma.purchase.findFirst({
-      where: { userId, isRefunded: false, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
+      where: { userId, isRefunded: false, ...hideTestRows({ lemonSqueezy: env.lemonSqueezyAllowTestMode, revenuecat: env.revenuecatAllowSandbox }) },
       select: { id: true },
     });
     if (owned) throw conflict("You already own the lifetime licence.");
@@ -119,7 +119,7 @@ checkoutRouter.post(
     let skipTrial = false;
     if (plan !== "lifetime") {
       const subs = await prisma.subscription.findMany({
-        where: { userId, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
+        where: { userId, ...hideTestRows({ lemonSqueezy: env.lemonSqueezyAllowTestMode, revenuecat: env.revenuecatAllowSandbox }) },
         select: { status: true, validUntil: true },
       });
       if (subs.some((sub) => subscriptionGrants(sub, new Date()))) {

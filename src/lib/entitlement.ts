@@ -81,6 +81,22 @@ export interface EntitlementView {
    */
   receipt?: string | null;
   /**
+   * WHICH plan grants, for the client's plan-aware copy: "lifetime" outranks a
+   * subscription's interval, and null means the access (if any) comes from
+   * something planless — a comp, a machine trial — or from a subscription row
+   * whose interval we never learned. Optional so the field can appear on a
+   * deploy before every client understands it; a client MUST treat absence
+   * and null the same way.
+   */
+  plan?: "monthly" | "yearly" | "lifetime" | null;
+  /**
+   * The end of the period the GRANTING subscription has paid for (ISO), or
+   * null when nothing time-bounded grants — a lifetime has no end, and a
+   * machine trial's window is already `trialEndsAt`. The client renders "renews
+   * on" / "access until" from this, never computes it.
+   */
+  validUntil?: string | null;
+  /**
    * Where this account should be sent to deal with money, or null when we do
    * not know and the client should offer the plan picker instead.
    *

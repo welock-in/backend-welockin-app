@@ -313,6 +313,24 @@ test("a RevenueCat outage is a clean 502 the client can retry — never a fake v
   assert.equal(res.body.code, "UPSTREAM_UNAVAILABLE");
 });
 
+test("a body we cannot read is a 502 too — and revokes nothing on the way", async (t) => {
+  providerOpen(t);
+  stubMethod(
+    t,
+    globalThis as any,
+    "fetch",
+    async () => new Response(JSON.stringify({ request_date: "2026-08-12" }), { status: 200 }),
+  );
+  const db = stubResolver(t);
+
+  const res = await request(app).post("/api/billing/revenuecat/refresh").set(auth).send({});
+
+  assert.equal(res.status, 502);
+  assert.equal(res.body.code, "UPSTREAM_UNAVAILABLE");
+  assert.equal(db.subSweep.length, 0, "an unreadable answer must not withdraw paid access");
+  assert.equal(db.purchaseSweep.length, 0);
+});
+
 /* ── the alias ──────────────────────────────────────────────────────────── */
 
 test("GET /api/billing/entitlement serves the same view, even while the shop is shut", async (t) => {

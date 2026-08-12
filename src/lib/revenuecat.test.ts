@@ -287,18 +287,20 @@ function stubMethod(t: Ctx, target: Record<string, any>, name: string, impl: (..
   return calls;
 }
 
-/** Stub the RC API to answer one fixed subscriber, plus every write the sync
- *  makes. Returns the recorded sweep calls so tests can read their WHERE. */
-function stubSync(t: Ctx, subscriber: RcSubscriber) {
+/**
+ * Stub the RC API and every write the sync makes. `respond` returns the raw
+ * HTTP answer, so a test can produce a 404 or a body of the wrong SHAPE —
+ * the two paths that must never be mistaken for "this customer owns nothing".
+ * Returns the recorded calls so tests can read each WHERE.
+ */
+function stubSync(t: Ctx, respond: () => Response) {
   const before = env.revenuecatSecretApiKey;
   (env as any).revenuecatSecretApiKey = "sk_test";
   t.after(() => {
     (env as any).revenuecatSecretApiKey = before;
   });
 
-  stubMethod(t, globalThis as any, "fetch", async () =>
-    new Response(JSON.stringify({ subscriber }), { status: 200 }),
-  );
+  stubMethod(t, globalThis as any, "fetch", async () => respond());
   return {
     subUpsert: stubMethod(t, prisma.subscription as any, "upsert", async () => ({})),
     purchaseUpsert: stubMethod(t, prisma.purchase as any, "upsert", async () => ({})),
@@ -307,8 +309,14 @@ function stubSync(t: Ctx, subscriber: RcSubscriber) {
   };
 }
 
+/** The ordinary case: a 200 whose body has the documented wrapper. */
+const ok = (subscriber: RcSubscriber) => () =>
+  new Response(JSON.stringify({ subscriber }), { status: 200 });
+
 test("an EMPTY snapshot sweeps ALL of this user's RC rows — the transfer-loser fix", async (t) => {
-  const db = stubSync(t, {}); // the losing account after a full transfer
+  // A 200 with empty collections: the losing account still EXISTS at
+  // RevenueCat and is authoritatively saying it holds nothing.
+  const db = stubSync(t, ok({}));
 
   await syncUserFromRevenueCat(USER);
 
@@ -330,7 +338,7 @@ test("an EMPTY snapshot sweeps ALL of this user's RC rows — the transfer-loser
 });
 
 test("the sweep is scoped: never lemonsqueezy, never a comp, never another user", async (t) => {
-  const db = stubSync(t, {});
+  const db = stubSync(t, ok({}));
 
   await syncUserFromRevenueCat(USER);
 
@@ -349,9 +357,9 @@ test("a normally-expired subscription is PRESENT in the snapshot, so it is spare
   // The false-positive the sweep must not commit: an expired-but-still-there
   // subscription is in the plan (mapped 'expired'), so its externalId is in
   // notIn and it is never swept.
-  const db = stubSync(t, {
+  const db = stubSync(t, ok({
     subscriptions: { [RC_PRODUCT_MONTHLY]: { expires_date: PAST, period_type: "normal" } },
-  });
+  }));
 
   await syncUserFromRevenueCat(USER);
 
@@ -364,7 +372,7 @@ test("a normally-expired subscription is PRESENT in the snapshot, so it is spare
 });
 
 test("the sweep is idempotent: a second identical sync issues the same scoped writes", async (t) => {
-  const db = stubSync(t, {});
+  const db = stubSync(t, ok({}));
 
   await syncUserFromRevenueCat(USER);
   await syncUserFromRevenueCat(USER);
@@ -372,4 +380,54 @@ test("the sweep is idempotent: a second identical sync issues the same scoped wr
   assert.equal(db.subSweep.length, 2);
   assert.deepEqual(db.subSweep[0][0].where, db.subSweep[1][0].where);
   assert.equal(db.subSweep[1][0].data.status, "expired");
+});
+
+/* ── we only revoke on a response we actually understood ────────────────── */
+
+/*
+ * The interaction that made the sweep dangerous. While the sync was additive,
+ * every "degrade to an empty subscriber" path was harmless — it just mirrored
+ * nothing. With the sweep, an empty subscriber REVOKES EVERYTHING, so each of
+ * those paths became a way for an upstream anomaly to strip paid access from
+ * every account that syncs. Uncertainty must fail the sync, never revoke.
+ */
+
+test("a 404 revokes NOTHING — an unreadable customer is not an empty one", async (t) => {
+  const db = stubSync(t, () => new Response("", { status: 404 }));
+
+  await syncUserFromRevenueCat(USER);
+
+  assert.equal(db.subSweep.length, 0, "a 404 must never revoke a licence");
+  assert.equal(db.purchaseSweep.length, 0);
+  assert.equal(db.subUpsert.length, 0, "and there is nothing to mirror either");
+});
+
+test("a 200 whose body has no `subscriber` wrapper FAILS the sync instead of revoking", async (t) => {
+  // The mass-revocation scenario: RevenueCat changes its response shape, or
+  // returns a partial body during an incident. Degrading that to `{}` would
+  // revoke every paying account that syncs. It must throw so the webhook parks
+  // the event as `failed` and retries.
+  for (const body of ['{"request_date":"2026-08-12"}', '{"subscriber":null}', '"a string"', "[]"]) {
+    const db = stubSync(t, () => new Response(body, { status: 200 }));
+
+    await assert.rejects(
+      () => syncUserFromRevenueCat(USER),
+      (err: unknown) => {
+        assert.equal((err as Error).name, "RevenueCatApiError");
+        return true;
+      },
+      `body ${body} must fail the sync`,
+    );
+
+    assert.equal(db.subSweep.length, 0, "no revocation may be written on a body we cannot read");
+    assert.equal(db.purchaseSweep.length, 0);
+  }
+});
+
+test("an unreadable JSON body likewise fails rather than revoking", async (t) => {
+  const db = stubSync(t, () => new Response("not json at all", { status: 200 }));
+
+  await assert.rejects(() => syncUserFromRevenueCat(USER), /RevenueCatApiError|not JSON/);
+  assert.equal(db.subSweep.length, 0);
+  assert.equal(db.purchaseSweep.length, 0);
 });

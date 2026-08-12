@@ -489,3 +489,39 @@ test("a RevenueCat outage marks the event failed and asks for redelivery", async
   assert.equal(res.status, 500, "a state we failed to mirror must be redelivered");
   assert.equal(finalStatus(db.eventMark), "failed");
 });
+
+test("a body whose shape we do not recognise fails the event — it NEVER mass-revokes", async (t) => {
+  // If RevenueCat's response shape ever changes, the old degrade-to-empty
+  // behaviour would have swept every syncing account's rows. It must park and
+  // retry instead, writing no revocation at all.
+  configured(t);
+  const db = stubDb(t);
+  stubMethod(
+    t,
+    globalThis as any,
+    "fetch",
+    async () => new Response(JSON.stringify({ request_date: "2026-08-12" }), { status: 200 }),
+  );
+
+  const res = await deliver(eventBody({ id: "evt-badshape" }));
+
+  assert.equal(res.status, 500, "an unreadable upstream must be redelivered, not acted on");
+  assert.equal(finalStatus(db.eventMark), "failed");
+  assert.equal(db.subSweep.length, 0, "no revocation on a response we could not read");
+  assert.equal(db.purchaseSweep.length, 0);
+});
+
+test("a 404 subscriber sweeps nothing — the account keeps what it holds", async (t) => {
+  configured(t);
+  const db = stubDb(t);
+  stubMethod(t, globalThis as any, "fetch", async () => new Response("", { status: 404 }));
+
+  const res = await deliver(eventBody({ id: "evt-404" }));
+
+  // Processed, not failed: a 404 is a coherent answer, just not an
+  // authoritative empty one. Nothing to mirror, and nothing to revoke.
+  assert.equal(res.status, 200);
+  assert.equal(res.body.status, "processed");
+  assert.equal(db.subSweep.length, 0, "a 404 must never revoke a licence");
+  assert.equal(db.purchaseSweep.length, 0);
+});

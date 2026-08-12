@@ -105,20 +105,57 @@ export class RevenueCatApiError extends Error {
 }
 
 /**
- * Fetch the authoritative state of one subscriber.
+ * What one fetch told us — and, crucially, whether we UNDERSTOOD it.
  *
- * A 404 is answered as an EMPTY subscriber rather than an error, and that is a
- * judgement call worth writing down: RevenueCat creates subscribers on first
- * contact, so a genuinely unknown app_user_id is near-impossible — but if one
- * ever arrives, "this identity has no purchases" is exactly what an empty
- * subscriber means, and mirroring nothing is the correct, convergent outcome.
- * Treating it as a failure would park the event as `failed` forever over an
- * identity that will never have anything to say.
+ * The flag exists because an empty subscriber is now two very different
+ * things. See `fetchSubscriber` and the sweep in `syncUserFromRevenueCat`.
+ */
+export type RcFetchResult = {
+  subscriber: RcSubscriber;
+  /**
+   * May this snapshot be used to REVOKE — i.e. is its emptiness a fact about
+   * the customer rather than a gap in what we could read?
+   *
+   * True only for a 200 whose body we fully understood. The upserts run
+   * either way (an unauthoritative snapshot is empty, so they write nothing);
+   * only the sweep consults this.
+   */
+  authoritative: boolean;
+};
+
+/**
+ * Fetch the state of one subscriber.
+ *
+ * ⚠️ WE ONLY REVOKE ON A RESPONSE WE ACTUALLY UNDERSTOOD. This function's
+ * contract changed the day the sweep landed, and the danger is worth spelling
+ * out: while the sync was additive, returning `{}` meant "mirror nothing" and
+ * every degrade-to-empty path was harmless. With the sweep, `{}` means
+ * "REVOKE EVERYTHING THIS USER HAS" (notIn: [] matches all their RC rows). So
+ * an upstream anomaly that used to be invisible would now be a mass-revocation
+ * event across the entire paying base — one malformed body shape during a
+ * RevenueCat incident, and every account that syncs loses access.
+ *
+ * Hence: uncertainty must FAIL the sync (park the event, retry later), never
+ * withdraw paid access.
+ *
+ *   unreachable / non-2xx / unparsable JSON / MISSING `subscriber` WRAPPER
+ *       → throw. The webhook marks the event `failed` and answers 500 so
+ *         RevenueCat redelivers; the refresh route answers a clean 502.
+ *   404 → an empty subscriber, but NOT authoritative. RevenueCat creates
+ *         subscribers on first contact, so this is near-impossible and far
+ *         more likely to mean a misrouted key or project than "this customer
+ *         owns nothing" — and it must never be the thing that revokes a
+ *         licence. Mirrors nothing, sweeps nothing.
+ *   200 with empty collections → authoritative and empty. THIS is the real
+ *         transfer-loser: the account still exists at RevenueCat and is
+ *         genuinely saying "I hold nothing now", which is exactly what the
+ *         sweep is for. The fix for the transfer leak loses nothing by
+ *         refusing to sweep on the two paths above.
  *
  * Never logs or rethrows response bodies wholesale, and never echoes the
  * request (it carried the secret key).
  */
-export async function fetchSubscriber(appUserId: string): Promise<RcSubscriber> {
+export async function fetchSubscriber(appUserId: string): Promise<RcFetchResult> {
   if (!env.revenuecatSecretApiKey) {
     throw new RevenueCatApiError("RevenueCat is not configured");
   }
@@ -144,7 +181,8 @@ export async function fetchSubscriber(appUserId: string): Promise<RcSubscriber> 
     clearTimeout(timer);
   }
 
-  if (response.status === 404) return {};
+  // Empty, but NOT a licence to revoke — see the contract above.
+  if (response.status === 404) return { subscriber: {}, authoritative: false };
   if (!response.ok) {
     throw new RevenueCatApiError(`RevenueCat answered HTTP ${response.status}`, response.status);
   }
@@ -155,11 +193,20 @@ export async function fetchSubscriber(appUserId: string): Promise<RcSubscriber> 
   } catch {
     throw new RevenueCatApiError("RevenueCat answered a body that is not JSON", response.status);
   }
-  // The v1 API wraps the object: { request_date, subscriber: {...} }. Parsed
-  // defensively — a missing wrapper degrades to an empty subscriber, which
-  // mirrors nothing rather than throwing inside the write loop.
+  // The v1 API wraps the object: { request_date, subscriber: {...} }. A MISSING
+  // wrapper is a failure, not an empty customer: it means the response shape is
+  // not the one this code was written against, and the only safe reading of
+  // "we do not recognise this" is to retry — degrading it to `{}` would let a
+  // single upstream shape change revoke every paying account that syncs.
+  // Same treatment as the unparsable JSON just above, for the same reason.
   const subscriber = (body as { subscriber?: RcSubscriber } | null)?.subscriber;
-  return subscriber && typeof subscriber === "object" ? subscriber : {};
+  if (!subscriber || typeof subscriber !== "object") {
+    throw new RevenueCatApiError(
+      "RevenueCat answered a body with no `subscriber` object",
+      response.status,
+    );
+  }
+  return { subscriber, authoritative: true };
 }
 
 /* ── the pure projection: subscriber JSON → write plan ──────────────────── */
@@ -460,7 +507,7 @@ export function projectSubscriber(userId: string, subscriber: RcSubscriber, now:
  */
 export async function syncUserFromRevenueCat(userId: string): Promise<{ managementUrl: string | null }> {
   const now = new Date();
-  const subscriber = await fetchSubscriber(userId);
+  const { subscriber, authoritative } = await fetchSubscriber(userId);
   const plan = projectSubscriber(userId, subscriber, now);
 
   for (const sub of plan.subscriptions) {
@@ -478,11 +525,20 @@ export async function syncUserFromRevenueCat(userId: string): Promise<{ manageme
     });
   }
 
+  // ONLY REVOKE ON A RESPONSE WE UNDERSTOOD. An unauthoritative snapshot (a
+  // 404) is empty because we could not read the customer's state, not because
+  // they have none — and `notIn: []` would turn that uncertainty into total
+  // revocation. The upserts above already ran and wrote nothing, which is the
+  // right no-op; the sweep is the part that must not fire. Every other
+  // unreadable answer never reaches here at all: fetchSubscriber throws, the
+  // event parks as `failed`, and the redelivery tries again.
+  if (!authoritative) return { managementUrl: plan.managementUrl };
+
   // The sweep. `notIn` an empty list is the whole point on a transfer-loser:
   // it matches every one of this user's RC rows, which is exactly right when
-  // the snapshot came back empty. Revoke, never delete — a revoked row is the
-  // audit trail of what was taken back and when, and `revokedAt`/`isRefunded`
-  // are what the resolver reads to stop granting.
+  // the snapshot came back 200-with-empty-collections. Revoke, never delete —
+  // a revoked row is the audit trail of what was taken back and when, and
+  // `revokedAt`/`isRefunded` are what the resolver reads to stop granting.
   const subExternalIds = plan.subscriptions.map((s) => s.externalId);
   await prisma.subscription.updateMany({
     where: { userId, provider: RC_PROVIDER, externalId: { notIn: subExternalIds } },

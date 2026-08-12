@@ -23,7 +23,9 @@ import { onboardingRouter } from "./routes/onboarding";
 import { checkoutRouter } from "./routes/checkout";
 import { subscriptionRouter } from "./routes/subscription";
 import { lemonSqueezyWebhookRouter } from "./routes/webhooks-lemonsqueezy";
+import { revenueCatWebhookRouter } from "./routes/webhooks-revenuecat";
 import { entitlementRouter } from "./routes/entitlement";
+import { billingRouter } from "./routes/billing";
 import { purchasesRouter } from "./routes/purchases";
 import { adminPageHtml } from "./admin/page";
 import { sessionsRouter } from "./routes/sessions";
@@ -140,9 +142,17 @@ export function createApp(): Express {
   // deliberately outside the requireAuth surface. (This comment used to sit one
   // line higher, over the checkout mount, which it never described.)
   app.use("/api/webhooks/lemonsqueezy", lemonSqueezyWebhookRouter);
+  // Authenticated by the Authorization token RevenueCat was configured with,
+  // not by a user bearer token — outside the requireAuth surface like its
+  // Lemon Squeezy sibling above.
+  app.use("/api/webhooks/revenuecat", revenueCatWebhookRouter);
   // Session-freshness only: a locked-out client must always be able to read WHY
   // it is locked. A paywall that cannot fetch its own reason is a blank screen.
   app.use("/api/entitlement", requireAuth, requireCurrentSession, entitlementRouter);
+  // Same gate and for the same reason as /api/entitlement — the refresh runs
+  // right after a purchase and on the paywall itself, both places a stale
+  // session must fail as a session problem, never as a payment one.
+  app.use("/api/billing", requireAuth, requireCurrentSession, billingRouter);
   // Recording a purchase that Apple has ALREADY taken money for must never be
   // refused for want of a verified email: the payment happened, and the only
   // effect of blocking it is a customer who paid and got nothing. iOS has no

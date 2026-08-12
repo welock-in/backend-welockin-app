@@ -61,7 +61,7 @@ test("Apple purchases are closed unless APPLE_PURCHASES_ENABLED says otherwise",
  */
 test("the provider ids are the ones already written to the database", () => {
   const ids = PROVIDERS.map((p) => p.id).sort();
-  assert.deepEqual(ids, ["app_store", "lemonsqueezy"]);
+  assert.deepEqual(ids, ["app_store", "lemonsqueezy", "revenuecat"]);
 });
 
 test("every provider is uniquely addressable", () => {

@@ -110,8 +110,12 @@ function stubDb(t: Ctx, overrides: Record<string, (...args: any[]) => any> = {})
     eventMark: stubMethod(t, prisma.webhookEvent as any, "updateMany", pick("eventMark", async () => ({ count: 1 }))),
     subUpsert: stubMethod(t, prisma.subscription as any, "upsert", pick("subUpsert", async () => ({}))),
     subFindMany: stubMethod(t, prisma.subscription as any, "findMany", pick("subFindMany", async () => [])),
+    // The authoritative sweep: revoke this user's RC rows the fresh snapshot
+    // no longer names. Baseline "nothing to revoke".
+    subSweep: stubMethod(t, prisma.subscription as any, "updateMany", pick("subSweep", async () => ({ count: 0 }))),
     purchaseUpsert: stubMethod(t, prisma.purchase as any, "upsert", pick("purchaseUpsert", async () => ({}))),
     purchaseFindMany: stubMethod(t, prisma.purchase as any, "findMany", pick("purchaseFindMany", async () => [])),
+    purchaseSweep: stubMethod(t, prisma.purchase as any, "updateMany", pick("purchaseSweep", async () => ({ count: 0 }))),
     claimFindFirst: stubMethod(t, prisma.trialClaim as any, "findFirst", pick("claimFindFirst", async () => null)),
     userFind: stubMethod(
       t,
@@ -433,7 +437,14 @@ test("a TRANSFER re-syncs BOTH sides — the loser must lose access too", async 
       ? subscriber() // the receiving account now holds the subscription…
       : subscriber({ subscriptions: {}, entitlements: {} }), // …and the losing one holds nothing
   );
-  const db = stubDb(t);
+  // Record every sweep with the userId it targeted and the externalIds it spared.
+  const sweeps: { userId: string; notIn: string[] }[] = [];
+  const db = stubDb(t, {
+    subSweep: async (args: any) => {
+      sweeps.push({ userId: args.where.userId, notIn: args.where.externalId.notIn });
+      return { count: 1 };
+    },
+  });
 
   const res = await deliver(
     eventBody({
@@ -453,9 +464,19 @@ test("a TRANSFER re-syncs BOTH sides — the loser must lose access too", async 
   const urls = fetches.map((c) => String(c[0]));
   assert.ok(urls.some((u) => u.includes(USER)));
   assert.ok(urls.some((u) => u.includes(OTHER_USER)));
-  // Only the receiver had state to mirror; the loser's empty snapshot writes nothing.
+  // The receiver's snapshot mirrors its subscription.
   assert.equal(db.subUpsert.length, 1);
   assert.equal(db.subUpsert[0][0].create.userId, USER);
+
+  // THE FIX: the loser's empty snapshot does NOT write nothing — it SWEEPS.
+  // Its sweep spares no externalId (notIn: []), so every RC row it holds is
+  // revoked; the receiver's sweep spares exactly the row it just wrote.
+  const loserSweep = sweeps.find((s) => s.userId === OTHER_USER);
+  assert.ok(loserSweep, "the losing account must be swept");
+  assert.deepEqual(loserSweep!.notIn, [], "an empty snapshot spares nothing — every RC row is revoked");
+  const winnerSweep = sweeps.find((s) => s.userId === USER);
+  assert.ok(winnerSweep, "the winner is swept too, sparing what it just mirrored");
+  assert.deepEqual(winnerSweep!.notIn, [`${USER}:${RC_PRODUCT_MONTHLY}`]);
 });
 
 test("a RevenueCat outage marks the event failed and asks for redelivery", async (t) => {

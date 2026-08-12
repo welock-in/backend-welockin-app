@@ -6,10 +6,13 @@ import {
   RC_PRODUCT_YEARLY,
   projectSubscriber,
   statusForSubscription,
+  syncUserFromRevenueCat,
   type RcSubscriber,
   type RcSubscriptionState,
 } from "./revenuecat";
 import { subscriptionGrants } from "./subscription";
+import { env } from "./env";
+import { prisma } from "./prisma";
 
 /*
  * The projection is where iOS money becomes rows, and the one catastrophic
@@ -265,4 +268,108 @@ test("the projection is a pure snapshot: same subscriber in, same rows out", () 
 test("the management URL rides along for the billing view", () => {
   const plan = projectSubscriber(USER, subscriberWith({ expires_date: FUTURE }), NOW);
   assert.equal(plan.managementUrl, "https://apps.apple.com/account/subscriptions");
+});
+
+/* ── the authoritative sweep (the transfer-loser leak) ──────────────────── */
+
+type Ctx = { after: (fn: () => void) => void };
+
+function stubMethod(t: Ctx, target: Record<string, any>, name: string, impl: (...a: any[]) => any) {
+  const original = target[name];
+  const calls: any[][] = [];
+  target[name] = (...args: any[]) => {
+    calls.push(args);
+    return impl(...args);
+  };
+  t.after(() => {
+    target[name] = original;
+  });
+  return calls;
+}
+
+/** Stub the RC API to answer one fixed subscriber, plus every write the sync
+ *  makes. Returns the recorded sweep calls so tests can read their WHERE. */
+function stubSync(t: Ctx, subscriber: RcSubscriber) {
+  const before = env.revenuecatSecretApiKey;
+  (env as any).revenuecatSecretApiKey = "sk_test";
+  t.after(() => {
+    (env as any).revenuecatSecretApiKey = before;
+  });
+
+  stubMethod(t, globalThis as any, "fetch", async () =>
+    new Response(JSON.stringify({ subscriber }), { status: 200 }),
+  );
+  return {
+    subUpsert: stubMethod(t, prisma.subscription as any, "upsert", async () => ({})),
+    purchaseUpsert: stubMethod(t, prisma.purchase as any, "upsert", async () => ({})),
+    subSweep: stubMethod(t, prisma.subscription as any, "updateMany", async () => ({ count: 1 })),
+    purchaseSweep: stubMethod(t, prisma.purchase as any, "updateMany", async () => ({ count: 1 })),
+  };
+}
+
+test("an EMPTY snapshot sweeps ALL of this user's RC rows — the transfer-loser fix", async (t) => {
+  const db = stubSync(t, {}); // the losing account after a full transfer
+
+  await syncUserFromRevenueCat(USER);
+
+  assert.equal(db.subUpsert.length, 0, "nothing to mirror");
+  // Both sweeps fire, scoped to THIS user + provider, sparing nothing.
+  for (const sweep of [db.subSweep, db.purchaseSweep]) {
+    assert.equal(sweep.length, 1);
+    const where = sweep[0][0].where;
+    assert.equal(where.userId, USER);
+    assert.equal(where.provider, "revenuecat");
+    assert.deepEqual(where.externalId.notIn, [], "an empty snapshot spares no row");
+  }
+  // Subscription revoked to a non-granting state; purchase marked refunded.
+  assert.equal(db.subSweep[0][0].data.status, "expired");
+  assert.ok(db.subSweep[0][0].data.revokedAt instanceof Date);
+  assert.equal(db.subSweep[0][0].data.willRenew, false);
+  assert.equal(db.purchaseSweep[0][0].data.isRefunded, true);
+  assert.ok(db.purchaseSweep[0][0].data.revokedAt instanceof Date);
+});
+
+test("the sweep is scoped: never lemonsqueezy, never a comp, never another user", async (t) => {
+  const db = stubSync(t, {});
+
+  await syncUserFromRevenueCat(USER);
+
+  for (const sweep of [db.subSweep, db.purchaseSweep]) {
+    const where = sweep[0][0].where;
+    // The three things the WHERE must pin, so a Lemon Squeezy lifetime, an
+    // admin comp on User, or anyone else's rows can never fall in range.
+    assert.equal(where.provider, "revenuecat");
+    assert.equal(where.userId, USER);
+    assert.ok("notIn" in where.externalId);
+    assert.equal(Object.keys(where).sort().join(","), "externalId,provider,userId");
+  }
+});
+
+test("a normally-expired subscription is PRESENT in the snapshot, so it is spared", async (t) => {
+  // The false-positive the sweep must not commit: an expired-but-still-there
+  // subscription is in the plan (mapped 'expired'), so its externalId is in
+  // notIn and it is never swept.
+  const db = stubSync(t, {
+    subscriptions: { [RC_PRODUCT_MONTHLY]: { expires_date: PAST, period_type: "normal" } },
+  });
+
+  await syncUserFromRevenueCat(USER);
+
+  assert.equal(db.subUpsert.length, 1, "the expired row is still mirrored, not dropped");
+  assert.deepEqual(
+    db.subSweep[0][0].where.externalId.notIn,
+    [`${USER}:${RC_PRODUCT_MONTHLY}`],
+    "the still-present row is spared from the sweep",
+  );
+});
+
+test("the sweep is idempotent: a second identical sync issues the same scoped writes", async (t) => {
+  const db = stubSync(t, {});
+
+  await syncUserFromRevenueCat(USER);
+  await syncUserFromRevenueCat(USER);
+
+  assert.equal(db.subSweep.length, 2);
+  assert.deepEqual(db.subSweep[0][0].where, db.subSweep[1][0].where);
+  assert.equal(db.subSweep[1][0].data.status, "expired");
 });

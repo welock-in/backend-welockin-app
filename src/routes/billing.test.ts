@@ -103,6 +103,9 @@ function stubResolver(
     userUpdate: stubMethod(t, prisma.user as any, "update", async () => ({})),
     subUpsert: stubMethod(t, prisma.subscription as any, "upsert", async () => ({})),
     purchaseUpsert: stubMethod(t, prisma.purchase as any, "upsert", async () => ({})),
+    // The sync's authoritative sweep runs before the resolver reads.
+    subSweep: stubMethod(t, prisma.subscription as any, "updateMany", async () => ({ count: 0 })),
+    purchaseSweep: stubMethod(t, prisma.purchase as any, "updateMany", async () => ({ count: 0 })),
   };
 }
 
@@ -270,6 +273,33 @@ test("an RC lifetime purchase outranks an expired subscription", async (t) => {
   assert.equal(res.body.validUntil, null, "a lifetime has no end date to count down");
   assert.equal(db.purchaseUpsert.length, 1);
   assert.equal(db.purchaseUpsert[0][0].update.isRefunded, false);
+});
+
+test("a transferred-away lifetime loser is swept refunded — but a same-user LS lifetime still grants", async (t) => {
+  // The HIGH-severity leak, at the route: the loser re-fetches to an EMPTY
+  // subscriber, so the sweep must revoke its RC lifetime — while a Lemon
+  // Squeezy lifetime (or a comp) the sweep is scoped away from keeps granting.
+  providerOpen(t);
+  stubFetch(t, () => ({ subscriptions: {}, non_subscriptions: {}, entitlements: {} }));
+  const db = stubResolver(t, {
+    // Post-sweep state the resolver sees: the RC lifetime is now refunded, and
+    // a SEPARATE Lemon Squeezy lifetime remains granting.
+    purchases: [{ isRefunded: true }, { isRefunded: false }],
+  });
+
+  const res = await request(app).post("/api/billing/revenuecat/refresh").set(auth).send({});
+
+  assert.equal(res.status, 200);
+  // The sweep fired, scoped to this user's RC rows only, sparing nothing.
+  assert.equal(db.purchaseSweep.length, 1);
+  const where = db.purchaseSweep[0][0].where;
+  assert.equal(where.userId, USER);
+  assert.equal(where.provider, "revenuecat");
+  assert.deepEqual(where.externalId.notIn, []);
+  assert.equal(db.purchaseSweep[0][0].data.isRefunded, true);
+  // …and the LS lifetime the sweep never touched still grants.
+  assert.equal(res.body.status, "active");
+  assert.equal(res.body.plan, "lifetime");
 });
 
 test("a RevenueCat outage is a clean 502 the client can retry — never a fake view", async (t) => {

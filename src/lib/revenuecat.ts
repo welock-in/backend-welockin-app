@@ -436,10 +436,32 @@ export function projectSubscriber(userId: string, subscriber: RcSubscriber, now:
  * `userId` appears only in `create`: ownership is decided once, and a later
  * sync can never MOVE a row to another account — same rule as every other
  * billing writer in this repo.
+ *
+ * THE SNAPSHOT IS AUTHORITATIVE IN BOTH DIRECTIONS — the upserts alone are not
+ * enough, and the gap was a HIGH-severity licence leak. `projectSubscriber`
+ * only ever names the products PRESENT in the fetched subscriber, so a product
+ * that has DISAPPEARED from it produces no write and its existing granting row
+ * survives untouched. The way it disappears is a TRANSFER: RevenueCat moves the
+ * receipt to the new app_user_id, so the LOSING account re-fetches to an EMPTY
+ * subscriber — empty plan, nothing swept, and its old subscription keeps
+ * granting to validUntil while a lifetime Purchase (isRefunded:false) grants
+ * for ever. Buy lifetime on A, Restore onto a fresh B with the same Apple ID,
+ * and both are pro — repeatable into N lifetimes from one purchase.
+ *
+ * So after the upserts, every `revenuecat` row for THIS user whose externalId
+ * the fresh snapshot did not mention is revoked. The scope is deliberately
+ * narrow: this user, this provider only — a Lemon Squeezy lifetime, an admin
+ * comp, or anyone else's rows are never in range. And it is safe under replay
+ * and reordering precisely because it is derived from the CURRENT re-fetch: a
+ * simply-expired subscription is still PRESENT in the snapshot (with a past
+ * expires_date, mapped 'expired'), so it stays in the plan and is never swept
+ * — only genuinely transferred-away receipts vanish. Re-running the same
+ * TRANSFER re-fetches the same empty snapshot and re-revokes idempotently.
  */
 export async function syncUserFromRevenueCat(userId: string): Promise<{ managementUrl: string | null }> {
+  const now = new Date();
   const subscriber = await fetchSubscriber(userId);
-  const plan = projectSubscriber(userId, subscriber, new Date());
+  const plan = projectSubscriber(userId, subscriber, now);
 
   for (const sub of plan.subscriptions) {
     await prisma.subscription.upsert({
@@ -455,6 +477,29 @@ export async function syncUserFromRevenueCat(userId: string): Promise<{ manageme
       update: purchase.data,
     });
   }
+
+  // The sweep. `notIn` an empty list is the whole point on a transfer-loser:
+  // it matches every one of this user's RC rows, which is exactly right when
+  // the snapshot came back empty. Revoke, never delete — a revoked row is the
+  // audit trail of what was taken back and when, and `revokedAt`/`isRefunded`
+  // are what the resolver reads to stop granting.
+  const subExternalIds = plan.subscriptions.map((s) => s.externalId);
+  await prisma.subscription.updateMany({
+    where: { userId, provider: RC_PROVIDER, externalId: { notIn: subExternalIds } },
+    // status → expired and revokedAt set is what stops `subscriptionGrants`
+    // (expired is not in its granting set). validUntil and the audit columns
+    // are left as they were: the licence's history is not the licence, and
+    // rewriting a past date would only lose information.
+    data: { status: "expired", revokedAt: now, willRenew: false },
+  });
+
+  const purchaseExternalIds = plan.purchases.map((p) => p.externalId);
+  await prisma.purchase.updateMany({
+    where: { userId, provider: RC_PROVIDER, externalId: { notIn: purchaseExternalIds } },
+    // isRefunded is what the resolver counts as "no longer granting"; revokedAt
+    // records that it was pulled rather than never granted.
+    data: { isRefunded: true, revokedAt: now },
+  });
 
   return { managementUrl: plan.managementUrl };
 }

@@ -58,6 +58,14 @@ const GRANTING: readonly string[] = ["on_trial", "active", "paused", "past_due",
 export type SubscriptionLike = {
   status: string;
   validUntil: Date | null;
+  /**
+   * Which store this row mirrors. OPTIONAL, unlike every other field, because
+   * the historical callers are all Lemon Squeezy-scoped queries and that is the
+   * default: absent means "lemonsqueezy". Callers that read MIXED rows (the
+   * entitlement resolver) must select and pass it, or the Lemon Squeezy variant
+   * allowlist below would judge Apple product ids it can never contain.
+   */
+  provider?: string;
   /** Which plan was bought — checked against what we actually sell. */
   variantId: string;
   /** "void" | "free" while paused — they mean opposite things for access. */
@@ -200,7 +208,16 @@ export function subscriptionGrants(sub: SubscriptionLike, now: Date): boolean {
   // A real subscription, in our store, for something we do not sell. The store
   // is the only thing the webhook checked before, which made every variant in it
   // a full licence at whatever price that variant happened to carry.
-  if (!variantIsSellable(sub.variantId)) return false;
+  //
+  // LEMON SQUEEZY ROWS ONLY. The allowlist is built from LEMONSQUEEZY_* ids, and
+  // a RevenueCat row carries an Apple product id ("in.welock.app.monthly") that
+  // could never legitimately appear in it — the moment the gate arms, judging
+  // those rows here would cut off every paying Apple subscriber at once.
+  // RevenueCat rows are vetted at WRITE time instead: the sync only mirrors the
+  // expected entitlement, from the allowed app ids, under the sandbox policy.
+  if ((sub.provider ?? "lemonsqueezy") === "lemonsqueezy" && !variantIsSellable(sub.variantId)) {
+    return false;
+  }
   // Paused, and paused to SUSPEND rather than to stop being charged. Lemon
   // Squeezy's two pause modes are opposites here: `free` means "keep using it,
   // we will not bill you", `void` means the subscription is suspended. Treating

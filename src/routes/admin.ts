@@ -514,6 +514,11 @@ adminRouter.get(
   requireAdmin,
   asyncHandler(async (_req, res) => {
     const rows = await prisma.subscription.findMany({
+      // Lemon Squeezy rows only: this report exists to feed
+      // LEMONSQUEEZY_VARIANTS_GRANTING, and a RevenueCat row's Apple product id
+      // would show up as permanently "at risk" — and poison the suggested env
+      // value with an id the boot check rejects as non-numeric.
+      where: { provider: "lemonsqueezy" },
       select: { variantId: true, interval: true, status: true },
     });
 

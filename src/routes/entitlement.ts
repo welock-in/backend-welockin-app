@@ -87,6 +87,10 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
       select: {
         status: true,
         validUntil: true,
+        // Load-bearing for `subscriptionGrants`: this query reads BOTH providers'
+        // rows, and without the provider the Lemon Squeezy variant allowlist
+        // would silently judge RevenueCat rows too (see SubscriptionLike).
+        provider: true,
         // Load-bearing for `subscriptionGrants`: a subscription cancelled while
         // its trial is still running grants nothing (a trial buys no grace).
         // Without this column selected, that rule silently never fires.

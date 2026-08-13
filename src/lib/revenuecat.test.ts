@@ -5,6 +5,7 @@ import {
   RC_LIFETIME_PRODUCT_IDS,
   RC_PRODUCT_MONTHLY,
   RC_PRODUCT_YEARLY,
+  RC_PROVIDER,
   projectSubscriber,
   statusForSubscription,
   syncUserFromRevenueCat,
@@ -337,31 +338,107 @@ function stubMethod(t: Ctx, target: Record<string, any>, name: string, impl: (..
   return calls;
 }
 
+type Row = Record<string, any> & { userId: string; provider: string; externalId: string };
+
+/**
+ * Two in-memory tables that answer `upsert` and `updateMany` with the semantics
+ * Prisma gives the exact WHEREs this module writes.
+ *
+ * Recording the calls (what `stubSync` alone does) proves the sweep is SCOPED;
+ * APPLYING them proves what that scope actually spares, which is the part a
+ * customer feels — a Lemon Squeezy lifetime still granting after an Apple
+ * receipt moved away is a claim about rows, not about a `where` object.
+ */
+function tables(seed: { subscriptions?: Row[]; purchases?: Row[] } = {}) {
+  const subscriptions = seed.subscriptions ?? [];
+  const purchases = seed.purchases ?? [];
+  const upsertInto = (rows: Row[]) => async (args: any) => {
+    const { provider, externalId } = args.where.provider_externalId;
+    const found = rows.find((r) => r.provider === provider && r.externalId === externalId);
+    if (found) Object.assign(found, args.update);
+    else rows.push({ ...args.create });
+    return {};
+  };
+  const updateManyIn = (rows: Row[]) => async (args: any) => {
+    const { userId, provider, externalId } = args.where;
+    let count = 0;
+    for (const row of rows) {
+      if (row.userId !== userId || row.provider !== provider) continue;
+      if (externalId?.notIn?.includes(row.externalId)) continue;
+      Object.assign(row, args.data);
+      count += 1;
+    }
+    return { count };
+  };
+  const find = (rows: Row[], userId: string, provider: string) =>
+    rows.find((r) => r.userId === userId && r.provider === provider)!;
+  return { subscriptions, purchases, upsertInto, updateManyIn, find };
+}
+
+type Tables = ReturnType<typeof tables>;
+
 /**
  * Stub the RC API and every write the sync makes. `respond` returns the raw
  * HTTP answer, so a test can produce a 404 or a body of the wrong SHAPE —
  * the two paths that must never be mistaken for "this customer owns nothing".
  * Returns the recorded calls so tests can read each WHERE.
+ *
+ * Pass `store` to have those writes actually LAND in a pair of tables, for the
+ * tests that assert on the surviving rows rather than on the calls.
  */
-function stubSync(t: Ctx, respond: () => Response) {
+function stubSync(
+  t: Ctx,
+  respond: (url?: string, init?: any) => Response | Promise<Response>,
+  store?: Tables,
+) {
   const before = env.revenuecatSecretApiKey;
   (env as any).revenuecatSecretApiKey = "sk_test";
   t.after(() => {
     (env as any).revenuecatSecretApiKey = before;
   });
 
-  stubMethod(t, globalThis as any, "fetch", async () => respond());
+  stubMethod(t, globalThis as any, "fetch", async (url: any, init: any) =>
+    respond(String(url), init),
+  );
+  const noop = async () => ({ count: 1 });
   return {
-    subUpsert: stubMethod(t, prisma.subscription as any, "upsert", async () => ({})),
-    purchaseUpsert: stubMethod(t, prisma.purchase as any, "upsert", async () => ({})),
-    subSweep: stubMethod(t, prisma.subscription as any, "updateMany", async () => ({ count: 1 })),
-    purchaseSweep: stubMethod(t, prisma.purchase as any, "updateMany", async () => ({ count: 1 })),
+    subUpsert: stubMethod(
+      t,
+      prisma.subscription as any,
+      "upsert",
+      store ? store.upsertInto(store.subscriptions) : noop,
+    ),
+    purchaseUpsert: stubMethod(
+      t,
+      prisma.purchase as any,
+      "upsert",
+      store ? store.upsertInto(store.purchases) : noop,
+    ),
+    subSweep: stubMethod(
+      t,
+      prisma.subscription as any,
+      "updateMany",
+      store ? store.updateManyIn(store.subscriptions) : noop,
+    ),
+    purchaseSweep: stubMethod(
+      t,
+      prisma.purchase as any,
+      "updateMany",
+      store ? store.updateManyIn(store.purchases) : noop,
+    ),
   };
 }
 
 /** The ordinary case: a 200 whose body has the documented wrapper. */
 const ok = (subscriber: RcSubscriber) => () =>
   new Response(JSON.stringify({ subscriber }), { status: 200 });
+
+/** The same answer, chosen by app_user_id: anyone unnamed owns NOTHING (200,
+ *  empty collections) — the authoritative shape a transfer-loser re-fetches. */
+const okFor = (byUser: Record<string, RcSubscriber>) => (url?: string) => {
+  const named = Object.entries(byUser).find(([id]) => String(url).includes(id));
+  return new Response(JSON.stringify({ subscriber: named?.[1] ?? {} }), { status: 200 });
+};
 
 test("an EMPTY snapshot sweeps ALL of this user's RC rows — the transfer-loser fix", async (t) => {
   // A 200 with empty collections: the losing account still EXISTS at
@@ -480,4 +557,279 @@ test("an unreadable JSON body likewise fails rather than revoking", async (t) =>
   await assert.rejects(() => syncUserFromRevenueCat(USER), /RevenueCatApiError|not JSON/);
   assert.equal(db.subSweep.length, 0);
   assert.equal(db.purchaseSweep.length, 0);
+});
+
+test("a refused or broken HTTP answer fails the sync — 401/403/429/5xx revoke NOTHING", async (t) => {
+  // Every one of these is a way for an incident (a rotated key, a rate limit, a
+  // bad gateway) to look like "this customer owns nothing" if the code ever
+  // degraded an error to an empty subscriber. One stub, re-aimed per status, so
+  // the global `fetch` is restored exactly once.
+  let status = 500;
+  const db = stubSync(t, () => new Response("", { status }));
+
+  for (status of [400, 401, 403, 409, 429, 500, 502, 503, 504]) {
+    await assert.rejects(
+      () => syncUserFromRevenueCat(USER),
+      (err: unknown) => {
+        assert.equal((err as Error).name, "RevenueCatApiError");
+        assert.equal((err as { status?: number }).status, status, "the status is carried, for the log");
+        return true;
+      },
+      `HTTP ${status} must fail the sync`,
+    );
+    assert.equal(db.subSweep.length, 0, `HTTP ${status} must revoke nothing`);
+    assert.equal(db.purchaseSweep.length, 0);
+    assert.equal(db.subUpsert.length, 0);
+    assert.equal(db.purchaseUpsert.length, 0);
+  }
+});
+
+test("a network error fails the sync — the throw carries no status and no body", async (t) => {
+  const db = stubSync(t, () => {
+    throw new Error("ECONNRESET");
+  });
+
+  await assert.rejects(
+    () => syncUserFromRevenueCat(USER),
+    (err: unknown) => {
+      assert.equal((err as Error).name, "RevenueCatApiError");
+      assert.equal((err as { status?: number }).status, undefined);
+      assert.match((err as Error).message, /unreachable/);
+      return true;
+    },
+  );
+  assert.equal(db.subSweep.length, 0);
+  assert.equal(db.purchaseSweep.length, 0);
+});
+
+test("a HUNG RevenueCat aborts on the deadline, fails the sync, and revokes nothing", async (t) => {
+  // The failure with no HTTP answer at all. Driven by mock timers rather than a
+  // real ten-second wait: the point is that the AbortController fires, the
+  // rejection is caught as an unreachable upstream, and — the part that matters
+  // — a request that never answered cannot be read as an empty customer.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let signal: AbortSignal | undefined;
+  const db = stubSync(
+    t,
+    (_url, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        signal = init.signal;
+        assert.ok(signal instanceof AbortSignal, "the request must carry a deadline at all");
+        assert.equal(signal.aborted, false, "…and must not start already aborted");
+        signal.addEventListener("abort", () => reject(signal!.reason ?? new Error("aborted")));
+      }),
+  );
+
+  const pending = syncUserFromRevenueCat(USER);
+  t.mock.timers.tick(10_000);
+  assert.equal(signal?.aborted, true, "the ten-second deadline is what ended it");
+
+  await assert.rejects(pending, (err: unknown) => {
+    assert.equal((err as Error).name, "RevenueCatApiError");
+    assert.match((err as Error).message, /unreachable/);
+    return true;
+  });
+  assert.equal(db.subSweep.length, 0, "a request that never answered must not revoke a licence");
+  assert.equal(db.purchaseSweep.length, 0);
+});
+
+/* ── the transfer policy: "Transfer to new App User ID" ─────────────────── */
+
+/*
+ * The RevenueCat dashboard is configured with TRANSFER TO NEW APP USER ID, and
+ * that choice is what these tests describe. It means one Apple receipt belongs
+ * to exactly one of our accounts at a time: sign into the app as B on a phone
+ * whose Apple ID bought as A, and RevenueCat MOVES the receipt — B's subscriber
+ * gains it and A's loses it. (The alternative policy, keeping it on the original
+ * app_user_id, would make "Restore" on a second account a no-op instead.)
+ *
+ * Everything below is the consequence: our mirror must move the licence too, in
+ * both directions, from nothing but the two re-fetched snapshots.
+ */
+
+const OTHER_USER = "507f1f77bcf86cd799439022";
+const LIFETIME = RC_LIFETIME_PRODUCT_IDS[0];
+
+/** A subscriber holding the one Apple lifetime. */
+const lifetimeSubscriber = (): RcSubscriber => ({
+  subscriptions: {},
+  non_subscriptions: {
+    [LIFETIME]: [{ id: "txn-life", purchase_date: PAST, store: "app_store", is_sandbox: false }],
+  },
+  entitlements: { pro: { product_identifier: LIFETIME } },
+});
+
+/** The row USER held before the receipt moved: a granting Apple lifetime. */
+const lifetimeRow = (userId: string): Row => ({
+  userId,
+  provider: RC_PROVIDER,
+  externalId: `${userId}:${LIFETIME}`,
+  productId: LIFETIME,
+  isRefunded: false,
+  revokedAt: null,
+});
+
+/**
+ * The transfer, run in a chosen order. RevenueCat has moved the receipt from
+ * USER to OTHER_USER, so OTHER_USER's re-fetch holds the lifetime and USER's
+ * comes back 200-with-empty-collections — "I own nothing now", authoritatively.
+ */
+async function runTransfer(t: Ctx, syncOrder: readonly string[]) {
+  const store = tables({ purchases: [lifetimeRow(USER)] });
+  const db = stubSync(t, okFor({ [OTHER_USER]: lifetimeSubscriber() }), store);
+  for (const userId of syncOrder) await syncUserFromRevenueCat(userId);
+  return { store, db };
+}
+
+/** Rows that still grant: a Purchase grants while it is not refunded. */
+const granting = (purchases: Row[]) => purchases.filter((p) => !p.isRefunded);
+
+test("a transferred lifetime MOVES: the new account gains it, the old one loses it", async (t) => {
+  const { store } = await runTransfer(t, [OTHER_USER, USER]);
+
+  assert.equal(granting(store.purchases).length, 1, "one Apple receipt grants to ONE account");
+  assert.equal(granting(store.purchases)[0].userId, OTHER_USER);
+  assert.equal(granting(store.purchases)[0].externalId, `${OTHER_USER}:${LIFETIME}`);
+
+  const loser = store.purchases.find((p) => p.userId === USER)!;
+  assert.equal(loser.isRefunded, true, "the leak was this row staying granting for ever");
+  assert.ok(loser.revokedAt instanceof Date, "revoked, never deleted — the row is the audit trail");
+});
+
+test("the same transfer with the events REVERSED converges on the same one owner", async (t) => {
+  // The loser's event arriving first is the ordinary case, not the exotic one:
+  // RevenueCat sends one TRANSFER naming both sides, and nothing promises which
+  // half we process first. Neither order may leave two live lifetimes.
+  const { store } = await runTransfer(t, [USER, OTHER_USER]);
+
+  assert.equal(granting(store.purchases).length, 1);
+  assert.equal(granting(store.purchases)[0].userId, OTHER_USER);
+});
+
+test("a DUPLICATE delivery of the transfer changes nothing — re-running is a no-op", async (t) => {
+  const { store, db } = await runTransfer(t, [OTHER_USER, USER, OTHER_USER, USER]);
+
+  assert.equal(granting(store.purchases).length, 1);
+  assert.equal(granting(store.purchases)[0].userId, OTHER_USER);
+  assert.equal(db.purchaseSweep.length, 4, "each sync sweeps; the second pair simply finds it done");
+});
+
+test("the sweep of a transfer-loser spares Lemon Squeezy, other accounts and the comp", async (t) => {
+  const store = tables({
+    subscriptions: [
+      { userId: USER, provider: RC_PROVIDER, externalId: `${USER}:${RC_PRODUCT_MONTHLY}`, status: "active", willRenew: true },
+      { userId: USER, provider: "lemonsqueezy", externalId: "ls-sub-77", status: "active", willRenew: true },
+      { userId: OTHER_USER, provider: RC_PROVIDER, externalId: `${OTHER_USER}:${RC_PRODUCT_MONTHLY}`, status: "active", willRenew: true },
+    ],
+    purchases: [
+      lifetimeRow(USER),
+      { userId: USER, provider: "lemonsqueezy", externalId: "ls-order-42", isRefunded: false, revokedAt: null },
+      lifetimeRow(OTHER_USER),
+    ],
+  });
+  // An admin comp is not a billing row at all — it is `User.compActive`. The
+  // only way this sync could take one away is by writing to User, so that is
+  // what is watched.
+  const userUpdate = stubMethod(t, prisma.user as any, "update", async () => ({}));
+  const db = stubSync(t, ok({}), store);
+
+  await syncUserFromRevenueCat(USER);
+
+  // THE WHERE ITSELF: one provider, one user, and no third clause that could
+  // widen it. Asserted explicitly because it is the guarantee, not an artefact.
+  for (const sweep of [db.subSweep, db.purchaseSweep]) {
+    const where = sweep[0][0].where;
+    assert.equal(where.provider, RC_PROVIDER, "never inter-provider");
+    assert.equal(where.userId, USER, "never inter-user");
+    assert.equal(Object.keys(where).sort().join(","), "externalId,provider,userId");
+  }
+
+  // …and what that scope spares once the writes are actually applied.
+  assert.equal(store.find(store.subscriptions, USER, RC_PROVIDER).status, "expired");
+  assert.equal(
+    store.find(store.subscriptions, USER, "lemonsqueezy").status,
+    "active",
+    "a valid Lemon Squeezy subscription is not RevenueCat's to revoke",
+  );
+  assert.equal(
+    store.find(store.subscriptions, OTHER_USER, RC_PROVIDER).status,
+    "active",
+    "another account's rows are never in range",
+  );
+  assert.equal(store.find(store.purchases, USER, RC_PROVIDER).isRefunded, true);
+  assert.equal(
+    store.find(store.purchases, USER, "lemonsqueezy").isRefunded,
+    false,
+    "a desktop lifetime survives an Apple receipt moving away",
+  );
+  assert.equal(store.find(store.purchases, OTHER_USER, RC_PROVIDER).isRefunded, false);
+  assert.equal(userUpdate.length, 0, "the sweep cannot reach an admin grant");
+});
+
+test("two refreshes racing on one account never tear a snapshot in half", async (t) => {
+  /*
+   * HONEST LIMIT FIRST: this harness interleaves only at await points, so what
+   * follows is not proof against a genuine two-process race — that needs the
+   * database, and Mongo gives no cross-document transaction here. What it does
+   * pin is the property that makes such a race survivable: every write is a
+   * WHOLE snapshot (upserts then a sweep derived from the same fetch), so two
+   * racers can only leave one of their two coherent outcomes, never a mixture
+   * — and because each sync re-reads the truth, the next one converges.
+   *
+   * The interleaving forced here is the worst one available: the SLOW reader
+   * saw the pre-transfer state and gets to write it AFTER the fast reader has
+   * already swept everything away.
+   */
+  const store = tables({
+    subscriptions: [
+      { userId: USER, provider: RC_PROVIDER, externalId: `${USER}:${RC_PRODUCT_MONTHLY}`, status: "active", willRenew: true },
+    ],
+    purchases: [lifetimeRow(USER)],
+  });
+  const stale: RcSubscriber = {
+    subscriptions: { [RC_PRODUCT_MONTHLY]: { expires_date: FUTURE, period_type: "normal" } },
+    non_subscriptions: lifetimeSubscriber().non_subscriptions,
+    entitlements: { pro: { product_identifier: LIFETIME } },
+  };
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let call = 0;
+  stubSync(
+    t,
+    async () => {
+      call += 1;
+      if (call === 1) await gate; // the slow reader, holding the pre-transfer truth
+      const subscriber = call === 1 ? stale : {};
+      return new Response(JSON.stringify({ subscriber }), { status: 200 });
+    },
+    store,
+  );
+
+  const slow = syncUserFromRevenueCat(USER);
+  const fast = syncUserFromRevenueCat(USER);
+  await fast; // sweeps everything: the transfer already happened
+  release();
+  await slow; // …and writes its whole stale snapshot on top
+
+  // One coherent outcome, whichever won. What must NEVER appear is a mixture:
+  // a live subscription beside a revoked lifetime, or the reverse — that would
+  // be one snapshot's subscriptions with the other's purchases.
+  const shape = {
+    sub: store.subscriptions[0].status,
+    lifetimeGone: store.purchases[0].isRefunded,
+  };
+  assert.ok(
+    [
+      { sub: "active", lifetimeGone: false }, // the stale snapshot, whole
+      { sub: "expired", lifetimeGone: true }, // the fresh one, whole
+    ].some((c) => c.sub === shape.sub && c.lifetimeGone === shape.lifetimeGone),
+    `torn state: ${JSON.stringify(shape)}`,
+  );
+
+  // …and the next sync is authoritative, whatever the race left behind.
+  await syncUserFromRevenueCat(USER);
+  assert.equal(store.subscriptions[0].status, "expired");
+  assert.equal(store.purchases[0].isRefunded, true);
 });

@@ -833,3 +833,126 @@ test("two refreshes racing on one account never tear a snapshot in half", async 
   assert.equal(store.subscriptions[0].status, "expired");
   assert.equal(store.purchases[0].isRefunded, true);
 });
+
+/* ── sandbox and production, side by side ───────────────────────────────── */
+
+/*
+ * There is no staging deploy: one Vercel project, one Atlas database. So
+ * sandbox transactions arrive at the SAME backend, for the same accounts, as
+ * real money — and the only thing that separates them is the `testMode` stamp
+ * these rows carry plus the read-time gate that hides it. Which makes the
+ * cohabitation of the two worlds on ONE account a first-class case, not a
+ * curiosity: the customer it happens to is the one who paid us and then helped
+ * us test.
+ */
+
+test("a sandbox lifetime and a paid one are SEPARATE rows — testing never stamps the paid one", () => {
+  // The bug this shape exists to prevent: `non_subscriptions[product]` is a
+  // LIST, so a TestFlight purchase sits in it beside the real one. Taking the
+  // last entry would land the sandbox purchase on the paid row, stamp it
+  // testMode, and hide a licence the customer owns.
+  const plan = projectSubscriber(
+    USER,
+    {
+      non_subscriptions: {
+        [LIFETIME]: [
+          { id: "txn-paid", purchase_date: PAST, is_sandbox: false },
+          { id: "txn-testflight", purchase_date: "2026-08-12T09:00:00.000Z", is_sandbox: true },
+        ],
+      },
+      entitlements: { pro: { product_identifier: LIFETIME } },
+    },
+    NOW,
+  );
+
+  assert.equal(plan.purchases.length, 2, "one row per environment, never one row for both");
+  const paid = plan.purchases.find((p) => p.data.environment === "production")!;
+  const sandbox = plan.purchases.find((p) => p.data.environment === "sandbox")!;
+  assert.equal(paid.externalId, `${USER}:${LIFETIME}`);
+  assert.equal(paid.data.testMode, false, "the paid row is untouched by the TestFlight session");
+  assert.equal(paid.data.isRefunded, false, "and still grants");
+  assert.equal(paid.data.purchasedAt.toISOString(), PAST, "…with its own purchase date");
+  assert.equal(sandbox.externalId, `${USER}:${LIFETIME}:sandbox`);
+  assert.equal(sandbox.data.testMode, true);
+});
+
+test("both rows stay in the plan, so the sweep revokes neither", async (t) => {
+  const store = tables({
+    purchases: [lifetimeRow(USER), { ...lifetimeRow(USER), externalId: `${USER}:${LIFETIME}:sandbox` }],
+  });
+  const db = stubSync(
+    t,
+    ok({
+      non_subscriptions: {
+        [LIFETIME]: [
+          { id: "txn-paid", purchase_date: PAST, is_sandbox: false },
+          { id: "txn-testflight", purchase_date: PAST, is_sandbox: true },
+        ],
+      },
+      entitlements: { pro: { product_identifier: LIFETIME } },
+    }),
+    store,
+  );
+
+  await syncUserFromRevenueCat(USER);
+
+  assert.deepEqual(
+    [...db.purchaseSweep[0][0].where.externalId.notIn].sort(),
+    [`${USER}:${LIFETIME}`, `${USER}:${LIFETIME}:sandbox`].sort(),
+  );
+  assert.equal(store.purchases.every((p) => !p.isRefunded), true, "neither row is swept");
+});
+
+test("within one environment the LAST entry still wins — a re-buy updates its own row", () => {
+  const plan = projectSubscriber(
+    USER,
+    {
+      non_subscriptions: {
+        [LIFETIME]: [
+          { id: "txn-refunded", purchase_date: PAST, is_refunded: true },
+          { id: "txn-rebought", purchase_date: "2026-08-10T00:00:00.000Z" },
+        ],
+      },
+      entitlements: { pro: { product_identifier: LIFETIME } },
+    },
+    NOW,
+  );
+
+  assert.equal(plan.purchases.length, 1, "one environment, one row");
+  assert.equal(plan.purchases[0].externalId, `${USER}:${LIFETIME}`);
+  assert.equal(plan.purchases[0].data.isRefunded, false, "the re-buy restores the same row");
+});
+
+test("nothing in the projection can turn a sandbox transaction into a production right", () => {
+  // The environment is read from RevenueCat's own `is_sandbox` and from
+  // nothing else — no combination of dates, period types or refund flags may
+  // launder a free StoreKit purchase into a production row.
+  for (const expires of [FUTURE, PAST, null])
+    for (const period of ["normal", "trial", "intro", undefined])
+      for (const refunded of [PAST, null]) {
+        const row = onlySub(
+          subscriberWith({
+            expires_date: expires,
+            period_type: period,
+            refunded_at: refunded,
+            is_sandbox: true,
+          }),
+        );
+        assert.equal(row.data.environment, "sandbox");
+        assert.equal(row.data.testMode, true);
+      }
+
+  for (const refunded of [true, false, undefined]) {
+    const plan = projectSubscriber(
+      USER,
+      {
+        non_subscriptions: { [LIFETIME]: [{ id: "t", purchase_date: PAST, is_sandbox: true, is_refunded: refunded }] },
+        entitlements: { pro: { product_identifier: LIFETIME } },
+      },
+      NOW,
+    );
+    assert.equal(plan.purchases[0].data.environment, "sandbox");
+    assert.equal(plan.purchases[0].data.testMode, true);
+    assert.equal(plan.purchases[0].externalId, `${USER}:${LIFETIME}:sandbox`);
+  }
+});

@@ -413,12 +413,11 @@ export function projectSubscriber(userId: string, subscriber: RcSubscriber, now:
 
   for (const [productId, entries] of Object.entries(subscriber.non_subscriptions ?? {})) {
     if (!(RC_LIFETIME_PRODUCT_IDS as readonly string[]).includes(productId)) continue;
-    if (!Array.isArray(entries) || entries.length === 0) continue;
-    // The LAST entry is the most recent purchase of this product; one row per
-    // (user, product) mirrors the subscription key shape, so a re-buy after a
-    // refund updates the same row back to granting.
-    const latest = entries[entries.length - 1];
-    if (!latest || typeof latest !== "object") continue;
+    if (!Array.isArray(entries)) continue;
+    const usable = entries.filter(
+      (e): e is RcNonSubscription => e != null && typeof e === "object",
+    );
+    if (usable.length === 0) continue;
 
     // The subscriber's non_subscriptions entry does not carry refund state in
     // the v1 API today; read it defensively if it ever appears, and fall back
@@ -435,7 +434,6 @@ export function projectSubscriber(userId: string, subscriber: RcSubscriber, now:
     // lifetime. The moment that subscription lapses, a genuinely refunded
     // lifetime stops being masked and the next sync records it. Convergent,
     // and every ambiguous state fails toward access.
-    const refundedAt = parseDate(latest.refunded_at);
     const entitlementsReported = Object.keys(subscriber.entitlements ?? {}).length > 0;
     const liveSubElsewhere = Object.entries(subscriber.subscriptions ?? {}).some(
       ([pid, s]) =>
@@ -446,20 +444,59 @@ export function projectSubscriber(userId: string, subscriber: RcSubscriber, now:
     );
     const droppedFromEntitlements =
       entitlementsReported && entitlementFor(subscriber, productId) == null && !liveSubElsewhere;
-    const isRefunded = latest.is_refunded === true || refundedAt != null || droppedFromEntitlements;
 
-    purchases.push({
-      externalId: `${userId}:${productId}`,
-      data: {
-        store: "app_store",
-        productId,
-        purchasedAt: parseDate(latest.purchase_date) ?? now,
-        isRefunded,
-        revokedAt: isRefunded ? (refundedAt ?? now) : null,
-        environment: latest.is_sandbox === true ? "sandbox" : "production",
-        testMode: testModeFor(latest.is_sandbox),
-      },
-    });
+    /*
+     * ONE ROW PER ENVIRONMENT, and this is a correctness rule rather than
+     * tidiness. `non_subscriptions[productId]` is a LIST, and a customer who
+     * bought the lifetime for real and later opens a TestFlight build with a
+     * StoreKit sandbox account has BOTH kinds of entry sitting in it. Taking
+     * simply the last one would let the sandbox purchase land on the paid row
+     * and stamp it `testMode: true` — at which point `hideTestRows` stops
+     * showing it and a paying customer loses the licence they own, because
+     * they helped us test. The reverse mistake is just as bad in the other
+     * direction: a sandbox entry occupying the production key is a free
+     * lifetime one flag-flip away.
+     *
+     * So the environment is part of the key. The rows never meet, the sweep
+     * spares both (each externalId is in the plan), and the read-time gate
+     * decides the sandbox one's fate per account without ever touching the
+     * paid one. Within an environment the LAST entry still wins — it is the
+     * most recent purchase of that product, so a re-buy after a refund updates
+     * the same row back to granting.
+     *
+     * `subscriptions` cannot be treated this way, and does not need to be:
+     * RevenueCat keys it by product id, so it can only ever report ONE state
+     * per product. There is no second row to protect — but note the residual
+     * consequence, which is upstream and not ours to fix: if a sandbox
+     * subscription of the SAME product supersedes a production one in
+     * RevenueCat's own snapshot, the mirror faithfully follows it to sandbox.
+     */
+    const perEnvironment: [sandbox: boolean, entry: RcNonSubscription | undefined][] = [
+      [false, usable.filter((e) => e.is_sandbox !== true).at(-1)],
+      [true, usable.filter((e) => e.is_sandbox === true).at(-1)],
+    ];
+
+    for (const [sandbox, latest] of perEnvironment) {
+      if (!latest) continue;
+      const refundedAt = parseDate(latest.refunded_at);
+      const isRefunded =
+        latest.is_refunded === true || refundedAt != null || droppedFromEntitlements;
+
+      purchases.push({
+        externalId: sandbox ? `${userId}:${productId}:sandbox` : `${userId}:${productId}`,
+        data: {
+          store: "app_store",
+          productId,
+          purchasedAt: parseDate(latest.purchase_date) ?? now,
+          isRefunded,
+          revokedAt: isRefunded ? (refundedAt ?? now) : null,
+          // Both read from RevenueCat's own `is_sandbox` and from nothing else:
+          // no client parameter, and no webhook field, reaches this line.
+          environment: sandbox ? "sandbox" : "production",
+          testMode: testModeFor(latest.is_sandbox),
+        },
+      });
+    }
   }
 
   return {

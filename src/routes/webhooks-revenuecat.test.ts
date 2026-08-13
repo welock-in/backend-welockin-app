@@ -586,3 +586,98 @@ test("a 404 subscriber sweeps nothing — the account keeps what it holds", asyn
   assert.equal(db.subSweep.length, 0, "a 404 must never revoke a licence");
   assert.equal(db.purchaseSweep.length, 0);
 });
+
+/* ── sandbox: recorded, isolated, and never a production right ──────────── */
+
+/*
+ * With no staging deploy (one Vercel project, one Atlas database), sandbox
+ * transactions land at the SAME backend as real money, for the same accounts.
+ * Whether they GRANT is decided at read time per account
+ * (REVENUECAT_SANDBOX_ALLOWED_USER_IDS — see routes/billing.test.ts). What the
+ * webhook owes is the other half: writing rows that can be told apart at all,
+ * from RevenueCat's data rather than from the delivery's claims.
+ */
+
+test("the row's environment comes from the re-fetched subscriber, never from the event", async (t) => {
+  configured(t);
+  // The delivery CLAIMS production. The subscriber we re-fetch says sandbox —
+  // and the re-fetch is the state, so sandbox is what gets written.
+  stubFetch(t, () =>
+    subscriber({
+      subscriptions: {
+        [RC_PRODUCT_MONTHLY]: { expires_date: FUTURE, period_type: "normal", is_sandbox: true },
+      },
+    }),
+  );
+  const db = stubDb(t);
+
+  const res = await deliver(eventBody({ id: "evt-env-claims-prod", environment: "PRODUCTION" }));
+
+  assert.equal(res.status, 200);
+  assert.equal(db.subUpsert[0][0].update.environment, "sandbox");
+  assert.equal(db.subUpsert[0][0].update.testMode, true, "an event cannot launder a free purchase");
+});
+
+test("…and the reverse: an event crying SANDBOX cannot hide a production purchase", async (t) => {
+  configured(t);
+  stubFetch(t); // the default subscriber: a real, paid monthly
+  const db = stubDb(t);
+
+  const res = await deliver(eventBody({ id: "evt-env-claims-sandbox", environment: "SANDBOX" }));
+
+  assert.equal(res.status, 200);
+  assert.equal(db.subUpsert[0][0].update.environment, "production");
+  assert.equal(db.subUpsert[0][0].update.testMode, false);
+});
+
+test("a SANDBOX lifetime lands on its OWN row — the paid lifetime is untouched", async (t) => {
+  // The cohabitation that actually happens: a customer who bought the lifetime
+  // for real installs a TestFlight build and buys it again in the sandbox.
+  // Both entries sit in the same `non_subscriptions` list, and if the sandbox
+  // one landed on the paid row it would stamp it testMode — hiding, from a
+  // paying customer, the licence they own, because they helped us test.
+  configured(t);
+  const lifetime = RC_LIFETIME_PRODUCT_IDS[0];
+  stubFetch(t, () =>
+    subscriber({
+      subscriptions: {},
+      non_subscriptions: {
+        [lifetime]: [
+          { id: "txn-paid", purchase_date: "2026-07-01T00:00:00.000Z", is_sandbox: false },
+          { id: "txn-testflight", purchase_date: "2026-08-12T09:00:00.000Z", is_sandbox: true },
+        ],
+      },
+      entitlements: { pro: { product_identifier: lifetime } },
+    }),
+  );
+  const db = stubDb(t);
+
+  const res = await deliver(
+    eventBody({
+      id: "evt-sandbox-lifetime",
+      type: "NON_RENEWING_PURCHASE",
+      environment: "SANDBOX",
+      product_id: lifetime,
+    }),
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.status, "processed");
+  assert.equal(db.purchaseUpsert.length, 2, "two environments, two rows");
+  const byId = Object.fromEntries(
+    db.purchaseUpsert.map((c) => [c[0].where.provider_externalId.externalId, c[0]]),
+  );
+  const paid = byId[`${USER}:${lifetime}`];
+  const sandbox = byId[`${USER}:${lifetime}:sandbox`];
+  assert.ok(paid && sandbox, "the paid row and the sandbox row are distinct");
+  assert.equal(paid.update.testMode, false, "the paid row is never stamped test");
+  assert.equal(paid.update.isRefunded, false, "…and never stops granting");
+  assert.equal(paid.update.environment, "production");
+  assert.equal(sandbox.update.testMode, true);
+  assert.equal(sandbox.update.environment, "sandbox");
+  // …and the sweep spares BOTH, so neither is revoked on the way past.
+  assert.deepEqual(
+    [...db.purchaseSweep[0][0].where.externalId.notIn].sort(),
+    [`${USER}:${lifetime}`, `${USER}:${lifetime}:sandbox`].sort(),
+  );
+});

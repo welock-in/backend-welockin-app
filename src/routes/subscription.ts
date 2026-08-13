@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
-import { hideTestRows, subscriptionGrants, variantForPlan } from "../lib/subscription";
+import { hideTestRowsFor, subscriptionGrants, variantForPlan } from "../lib/subscription";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { badRequest, conflict } from "../lib/http-error";
@@ -56,7 +56,7 @@ subscriptionRouter.post(
     // must stop existing everywhere at once — and this endpoint in particular
     // would otherwise try to INVOICE a test subscription through the live key.
     const subs = await prisma.subscription.findMany({
-      where: { userId, provider: PROVIDER, ...hideTestRows({ lemonSqueezy: env.lemonSqueezyAllowTestMode, revenuecat: env.revenuecatAllowSandbox }) },
+      where: { userId, provider: PROVIDER, ...hideTestRowsFor(userId, env) },
       select: { externalId: true, status: true, validUntil: true, trialEndsAt: true },
     });
 
@@ -138,11 +138,12 @@ subscriptionRouter.get(
   "/",
   requireAuth,
   asyncHandler(async (req, res) => {
+    const userId = req.user!.id;
     const subs = await prisma.subscription.findMany({
       where: {
-        userId: req.user!.id,
+        userId,
         provider: PROVIDER,
-        ...hideTestRows({ lemonSqueezy: env.lemonSqueezyAllowTestMode, revenuecat: env.revenuecatAllowSandbox }),
+        ...hideTestRowsFor(userId, env),
       },
       select: {
         status: true,
@@ -210,7 +211,7 @@ subscriptionRouter.post(
 
     const userId = req.user!.id;
     const subs = await prisma.subscription.findMany({
-      where: { userId, provider: PROVIDER, ...hideTestRows({ lemonSqueezy: env.lemonSqueezyAllowTestMode, revenuecat: env.revenuecatAllowSandbox }) },
+      where: { userId, provider: PROVIDER, ...hideTestRowsFor(userId, env) },
       select: { id: true, externalId: true, status: true, validUntil: true, trialEndsAt: true },
     });
 
@@ -324,7 +325,7 @@ subscriptionRouter.post(
 
     const userId = req.user!.id;
     const subs = await prisma.subscription.findMany({
-      where: { userId, provider: PROVIDER, ...hideTestRows({ lemonSqueezy: env.lemonSqueezyAllowTestMode, revenuecat: env.revenuecatAllowSandbox }) },
+      where: { userId, provider: PROVIDER, ...hideTestRowsFor(userId, env) },
       select: { externalId: true, status: true, validUntil: true, endsAt: true },
     });
 
@@ -442,7 +443,7 @@ subscriptionRouter.post(
 
     const userId = req.user!.id;
     const subs = await prisma.subscription.findMany({
-      where: { userId, provider: PROVIDER, ...hideTestRows({ lemonSqueezy: env.lemonSqueezyAllowTestMode, revenuecat: env.revenuecatAllowSandbox }) },
+      where: { userId, provider: PROVIDER, ...hideTestRowsFor(userId, env) },
       select: { externalId: true, status: true, validUntil: true, variantId: true },
     });
 

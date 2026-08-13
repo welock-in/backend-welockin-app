@@ -125,6 +125,32 @@ export function intFromEnv(name: string, fallback: number): number {
   return n;
 }
 
+/**
+ * A CSV of OUR OWN account ids (24-hex Mongo ObjectIds) — the shape every
+ * narrow allow-list in this file takes.
+ *
+ * Entries are shape-checked and anything else is DROPPED, loudly. A value that
+ * is not an account id can never match a user, so silently keeping it would
+ * only make the list look longer than it is — and a list like this OPENS a
+ * door, which is exactly the setting where an operator must be told that the
+ * door did not open for the entry they typed. The count is logged and never
+ * the values: an account id is not a secret, but it is not log fodder either.
+ */
+export function parseAccountIdList(raw: string | undefined, name: string): string[] {
+  const entries = (raw ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const ids = entries.filter((e) => /^[0-9a-f]{24}$/i.test(e));
+  if (ids.length !== entries.length) {
+    console.warn(
+      `[env] ${name}: ${entries.length - ids.length} of ${entries.length} entries are not ` +
+        `account ids (24-hex) and were ignored — those accounts get NOTHING.`,
+    );
+  }
+  return ids;
+}
+
 export const env = {
   port: intFromEnv("PORT", 8787),
   databaseUrl: required("DATABASE_URL", "mongodb://localhost:27017/welockin"),
@@ -295,6 +321,29 @@ export const env = {
    * sandbox row ever granting in production.
    */
   revenuecatAllowSandbox: process.env.REVENUECAT_ALLOW_SANDBOX === "true",
+  /**
+   * The NARROW form of the switch above: the accounts whose sandbox rows may
+   * grant, as a CSV of our own 24-hex user ids.
+   *
+   * It exists because this deploy has no staging environment — one Vercel
+   * project, one Atlas database (see the deployment section of the README) —
+   * so `REVENUECAT_ALLOW_SANDBOX=true` is not "open the sandbox for testers",
+   * it is "let any Apple ID mint free lifetimes against the production
+   * database, for everyone, at once". Sandbox purchases cost nothing and are
+   * signed by the same Apple chain as real ones; the only thing standing
+   * between a StoreKit sandbox account and a free licence IS this gate.
+   *
+   * So the list names WHO, and the answer is a handful of internal testers.
+   * Everything else is unchanged: sandbox rows are still always RECORDED with
+   * `testMode`, and this still decides only whether they GRANT — at READ time,
+   * per account, with no migration and nothing deleted when it is emptied
+   * again. `REVENUECAT_ALLOW_SANDBOX=true` stays as the blunt instrument for
+   * the day a real staging deploy exists, and it simply outranks this list.
+   */
+  revenuecatSandboxAllowedUserIds: parseAccountIdList(
+    process.env.REVENUECAT_SANDBOX_ALLOWED_USER_IDS,
+    "REVENUECAT_SANDBOX_ALLOWED_USER_IDS",
+  ),
   /**
    * Webhook events older than this are acknowledged and skipped as replays.
    * RevenueCat retries failed deliveries for up to ~72h, so the default leaves

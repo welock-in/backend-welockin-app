@@ -177,3 +177,66 @@ export function hideTestRows(allow: {
     ],
   };
 }
+
+/**
+ * May THIS account's StoreKit SANDBOX rows grant? The `revenuecat` half of
+ * `hideTestRows`, decided per user rather than per deploy.
+ *
+ * WHY IT IS PER USER. `REVENUECAT_ALLOW_SANDBOX=true` is the right switch for a
+ * staging deploy talking to a staging database — and there is no such deploy
+ * here: one Vercel project, one Atlas database. On that shape the flag does not
+ * mean "let the testers in", it means "let every Apple ID in the world mint
+ * free lifetimes against production", because a StoreKit sandbox purchase costs
+ * nothing, is signed by the same Apple chain as a real one, and arrives through
+ * the same webhook. This gate is the only thing between the two.
+ *
+ * So the deploy names the testers instead, by account id, and everyone else is
+ * refused BY DEFAULT — a missing or malformed list opens nothing (see
+ * `parseAccountIdList`, which drops entries that are not account ids). The
+ * blunt flag still wins when it is set, so the day a real staging environment
+ * exists nothing here has to change.
+ *
+ * READ-time only, like the fragment it feeds: a sandbox row is written and kept
+ * whatever this says, and removing an account from the list hides its test rows
+ * again without deleting anything. Nothing about a PRODUCTION purchase is
+ * affected in either direction — those rows are not testMode, so they are
+ * visible through the `NOT` clause no matter who is listed.
+ */
+export function revenuecatSandboxAllows(
+  userId: string,
+  gate: {
+    revenuecatAllowSandbox: boolean;
+    revenuecatSandboxAllowedUserIds: readonly string[];
+  },
+): boolean {
+  if (gate.revenuecatAllowSandbox) return true;
+  return gate.revenuecatSandboxAllowedUserIds.includes(userId);
+}
+
+/**
+ * The whole test-row filter for ONE account, resolved from the environment.
+ *
+ * Every billing read in the API is already scoped to a user, and each of them
+ * used to spell the same two-flag object out in full. That duplication was
+ * survivable while both halves were deploy-wide booleans and became a hazard
+ * the moment one of them started depending on WHO is asking: eight copies of a
+ * gate is eight chances for one of them to keep the old, wider answer.
+ *
+ * So there is one call — `where: { userId, ...hideTestRowsFor(userId, env) }` —
+ * and the pure pieces above stay separately testable. Takes the environment as
+ * an argument rather than importing it, exactly like `checkPaymentConfig`, so
+ * this file remains a set of rules a test can drive directly.
+ */
+export function hideTestRowsFor(
+  userId: string,
+  gate: {
+    lemonSqueezyAllowTestMode: boolean;
+    revenuecatAllowSandbox: boolean;
+    revenuecatSandboxAllowedUserIds: readonly string[];
+  },
+): Record<string, unknown> {
+  return hideTestRows({
+    lemonSqueezy: gate.lemonSqueezyAllowTestMode,
+    revenuecat: revenuecatSandboxAllows(userId, gate),
+  });
+}

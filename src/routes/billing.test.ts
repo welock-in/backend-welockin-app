@@ -82,6 +82,20 @@ function stubFetch(t: Ctx, answer: () => RcSubscriber | { boom: true }) {
   });
 }
 
+/**
+ * Apply the test-row fragment the route built to a fixture row, the way Mongo
+ * would. Without this the stubs would hand every row back whatever the `where`
+ * said, and a test claiming "a sandbox purchase grants nothing" would be
+ * asserting on a query it never ran.
+ */
+function visibleUnder(where: any, row: Record<string, any>): boolean {
+  const clauses = where?.OR as Record<string, any>[] | undefined;
+  if (!clauses) return true;
+  return clauses.some((clause) =>
+    "NOT" in clause ? row.testMode !== true : clause.provider === row.provider,
+  );
+}
+
 /** The resolver's reads, stubbed to a chosen set of billing rows. */
 function stubResolver(
   t: Ctx,
@@ -100,8 +114,12 @@ function stubResolver(
   }));
   return {
     userFind,
-    purchaseFindMany: stubMethod(t, prisma.purchase as any, "findMany", async () => rows.purchases ?? []),
-    subFindMany: stubMethod(t, prisma.subscription as any, "findMany", async () => rows.subscriptions ?? []),
+    purchaseFindMany: stubMethod(t, prisma.purchase as any, "findMany", async (args: any) =>
+      (rows.purchases ?? []).filter((r) => visibleUnder(args?.where, r)),
+    ),
+    subFindMany: stubMethod(t, prisma.subscription as any, "findMany", async (args: any) =>
+      (rows.subscriptions ?? []).filter((r) => visibleUnder(args?.where, r)),
+    ),
     claimFindFirst: stubMethod(t, prisma.trialClaim as any, "findFirst", async () => null),
     userUpdate: stubMethod(t, prisma.user as any, "update", async () => ({})),
     subUpsert: stubMethod(t, prisma.subscription as any, "upsert", async () => ({})),
@@ -372,4 +390,106 @@ test("with the sandbox flag OFF, a testMode row is invisible to the reads", asyn
   await request(app).get("/api/billing/entitlement").set(auth);
 
   assert.deepEqual(db.subFindMany[0][0].where.OR, [{ NOT: { testMode: true } }]);
+});
+
+/* ── the sandbox allow-list ─────────────────────────────────────────────── */
+
+/*
+ * WHY A LIST AND NOT THE FLAG. There is no staging deploy to point TestFlight
+ * at: one Vercel project, one Atlas database (README, "Deployment"). So
+ * REVENUECAT_ALLOW_SANDBOX=true would not open the sandbox "for the testers",
+ * it would open it for every account at once — and a StoreKit sandbox purchase
+ * costs nothing while being signed by the same Apple chain as a real one. The
+ * deploy therefore names the testers, and these tests are the guarantees that
+ * naming buys.
+ */
+
+/** A granting lifetime bought in the StoreKit SANDBOX, mirrored as a test row. */
+const sandboxLifetime = () => ({ isRefunded: false, testMode: true, provider: "revenuecat" });
+/** The same product, bought for real. */
+const paidLifetime = () => ({ isRefunded: false, provider: "revenuecat" });
+
+test("a sandbox purchase grants NOTHING to an account nobody listed", async (t) => {
+  setEnv(t, { revenuecatAllowSandbox: false, revenuecatSandboxAllowedUserIds: [] });
+  stubResolver(t, { purchases: [sandboxLifetime()] });
+
+  const res = await request(app).get("/api/billing/entitlement").set(auth);
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.isPro, false, "a free sandbox purchase is not a licence");
+  assert.equal(res.body.status, "expired");
+});
+
+test("…and grants to the tester the deploy named, by account id", async (t) => {
+  setEnv(t, { revenuecatAllowSandbox: false, revenuecatSandboxAllowedUserIds: [USER] });
+  const db = stubResolver(t, { purchases: [sandboxLifetime()] });
+
+  const res = await request(app).get("/api/billing/entitlement").set(auth);
+
+  assert.equal(res.body.isPro, true);
+  assert.equal(res.body.plan, "lifetime");
+  assert.deepEqual(db.purchaseFindMany[0][0].where.OR, [
+    { NOT: { testMode: true } },
+    { provider: "revenuecat" },
+  ]);
+});
+
+test("naming ANOTHER account opens nothing for this one", async (t) => {
+  // The whole point of a list over a flag: one tester, not the user base.
+  setEnv(t, { revenuecatAllowSandbox: false, revenuecatSandboxAllowedUserIds: [OTHER] });
+  const db = stubResolver(t, { purchases: [sandboxLifetime()] });
+
+  const res = await request(app).get("/api/billing/entitlement").set(auth);
+
+  assert.equal(res.body.isPro, false);
+  assert.deepEqual(db.purchaseFindMany[0][0].where.OR, [{ NOT: { testMode: true } }]);
+});
+
+test("closing the gate DELETES nothing — the paid row never depended on it", async (t) => {
+  // The flag acts at READ time and only ever ADDS a clause. Proof in three
+  // parts: with the gate shut the paid lifetime still grants beside an
+  // invisible sandbox row; opening the gate makes the same untouched row
+  // visible again; and neither read writes anything at all.
+  const rows = { purchases: [paidLifetime(), sandboxLifetime()] };
+
+  setEnv(t, { revenuecatAllowSandbox: false, revenuecatSandboxAllowedUserIds: [] });
+  const shut = stubResolver(t, rows);
+  const deletes = stubMethod(t, prisma.purchase as any, "deleteMany", async () => ({ count: 0 }));
+  const shutRes = await request(app).get("/api/billing/entitlement").set(auth);
+
+  assert.equal(shutRes.body.isPro, true, "the money the customer actually spent still counts");
+  assert.equal(shut.purchaseFindMany[0][1] ?? undefined, undefined);
+  assert.equal(shut.purchaseFindMany.length, 1);
+  assert.equal(shut.purchaseUpsert.length, 0, "reading access writes no billing row");
+  assert.equal(shut.purchaseSweep.length, 0, "…and revokes none");
+  assert.equal(deletes.length, 0, "…and deletes none");
+
+  // Re-open it: the SAME fixture rows are still there to be found.
+  setEnv(t, { revenuecatSandboxAllowedUserIds: [USER] });
+  const openRes = await request(app).get("/api/billing/entitlement").set(auth);
+  assert.equal(openRes.body.isPro, true);
+  assert.equal(shut.purchaseFindMany.length, 2);
+  assert.deepEqual(shut.purchaseFindMany[1][0].where.OR, [
+    { NOT: { testMode: true } },
+    { provider: "revenuecat" },
+  ]);
+  assert.equal(rows.purchases.length, 2, "nothing was removed from the table by either read");
+});
+
+test("a body cannot ask for the sandbox: the gate is the account's, not the request's", async (t) => {
+  // Same rule as the refresh subject above. The client is never a source of
+  // environment — not the row's, and not the gate's.
+  setEnv(t, { revenuecatAllowSandbox: false, revenuecatSandboxAllowedUserIds: [] });
+  providerOpen(t);
+  stubFetch(t, yearlySubscriber);
+  const db = stubResolver(t, { purchases: [sandboxLifetime()] });
+
+  const res = await request(app)
+    .post("/api/billing/revenuecat/refresh")
+    .set(auth)
+    .send({ environment: "SANDBOX", allowSandbox: true, testMode: true });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.isPro, false);
+  assert.deepEqual(db.purchaseFindMany[0][0].where.OR, [{ NOT: { testMode: true } }]);
 });

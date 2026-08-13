@@ -149,3 +149,35 @@ test("the Lemon Squeezy env aliases are read, and the canonical names win", asyn
     }
   }
 });
+
+/*
+ * The account allow-lists. A list like this OPENS a door — sandbox rows that
+ * would otherwise grant nothing — so the parsing rule is that anything which is
+ * not an account id is DROPPED, never kept hopefully: a typo that silently
+ * matched nobody would be indistinguishable from a working entry until someone
+ * complained they were still locked out.
+ */
+import { parseAccountIdList } from "./env";
+
+const ID_A = "507f1f77bcf86cd799439011";
+const ID_B = "507f1f77bcf86cd799439022";
+
+test("an unset or empty list opens nothing", () => {
+  assert.deepEqual(parseAccountIdList(undefined, "X"), []);
+  assert.deepEqual(parseAccountIdList("", "X"), []);
+  assert.deepEqual(parseAccountIdList("  , ,, ", "X"), []);
+});
+
+test("a CSV of account ids survives whitespace and case", () => {
+  assert.deepEqual(parseAccountIdList(` ${ID_A} , ${ID_B}`, "X"), [ID_A, ID_B]);
+  assert.deepEqual(parseAccountIdList(ID_A.toUpperCase(), "X"), [ID_A.toUpperCase()]);
+});
+
+test("anything that is not an account id is dropped, and the rest still works", () => {
+  // An email, a RevenueCat anonymous id, a truncated id: each would match no
+  // user anyway, and a malformed id reaching Prisma is a P2023 throw.
+  assert.deepEqual(
+    parseAccountIdList(`me@example.com,${ID_A},$RCAnonymousID:87c6,${ID_B.slice(0, 20)}`, "X"),
+    [ID_A],
+  );
+});

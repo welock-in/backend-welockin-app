@@ -168,3 +168,82 @@ test("both flags open both — and STILL nothing beyond those two providers", ()
     ],
   });
 });
+
+/*
+ * The SANDBOX gate, per account.
+ *
+ * `REVENUECAT_ALLOW_SANDBOX=true` is the right switch for a staging deploy
+ * talking to a staging database, and there is none here — one Vercel project,
+ * one Atlas database. On that shape the flag does not mean "let the testers
+ * in", it means "let any Apple ID mint free lifetimes against production", so
+ * the deploy names the testers by account id instead. Everything the rest of
+ * the system does is unchanged: the rows are still written, and this still only
+ * decides whether they are READ.
+ */
+import { hideTestRowsFor, revenuecatSandboxAllows } from "./subscription";
+
+const TESTER = "507f1f77bcf86cd799439011";
+const STRANGER = "507f1f77bcf86cd799439022";
+const SHUT = { revenuecatAllowSandbox: false, revenuecatSandboxAllowedUserIds: [] as string[] };
+
+test("with no list and no flag, NOBODY's sandbox rows grant", () => {
+  assert.equal(revenuecatSandboxAllows(TESTER, SHUT), false);
+  assert.equal(revenuecatSandboxAllows(STRANGER, SHUT), false);
+});
+
+test("the list opens exactly the accounts it names, and no other", () => {
+  const gate = { ...SHUT, revenuecatSandboxAllowedUserIds: [TESTER] };
+  assert.equal(revenuecatSandboxAllows(TESTER, gate), true);
+  assert.equal(
+    revenuecatSandboxAllows(STRANGER, gate),
+    false,
+    "naming one tester must never open the sandbox for the whole user base",
+  );
+});
+
+test("the deploy-wide flag still outranks the list — for the day a staging deploy exists", () => {
+  const gate = { revenuecatAllowSandbox: true, revenuecatSandboxAllowedUserIds: [] as string[] };
+  assert.equal(revenuecatSandboxAllows(STRANGER, gate), true);
+});
+
+test("the per-account filter opens the sandbox for the tester and for nobody else", () => {
+  const gate = {
+    lemonSqueezyAllowTestMode: false,
+    revenuecatAllowSandbox: false,
+    revenuecatSandboxAllowedUserIds: [TESTER],
+  };
+  assert.deepEqual(hideTestRowsFor(TESTER, gate), {
+    OR: [{ NOT: { testMode: true } }, { provider: "revenuecat" }],
+  });
+  assert.deepEqual(hideTestRowsFor(STRANGER, gate), {
+    OR: [{ NOT: { testMode: true } }],
+  });
+});
+
+test("an allow-listed tester does NOT thereby reopen Lemon Squeezy test mode", () => {
+  // The isolation the per-provider gate exists for, now with a second key: an
+  // iOS tester's account must not resurrect desktop test orders as a side effect.
+  assert.deepEqual(
+    hideTestRowsFor(TESTER, {
+      lemonSqueezyAllowTestMode: false,
+      revenuecatAllowSandbox: false,
+      revenuecatSandboxAllowedUserIds: [TESTER],
+    }),
+    { OR: [{ NOT: { testMode: true } }, { provider: "revenuecat" }] },
+  );
+});
+
+test("a PRODUCTION row is visible to everyone, listed or not — the gate only ever adds", () => {
+  // The guarantee behind "turning test mode off deletes nothing": the shut gate
+  // is one clause, `NOT testMode`, which every real purchase satisfies. Closing
+  // it can only ever remove test rows from a READ.
+  for (const gate of [
+    { lemonSqueezyAllowTestMode: false, revenuecatAllowSandbox: false, revenuecatSandboxAllowedUserIds: [] },
+    { lemonSqueezyAllowTestMode: false, revenuecatAllowSandbox: false, revenuecatSandboxAllowedUserIds: [TESTER] },
+    { lemonSqueezyAllowTestMode: true, revenuecatAllowSandbox: true, revenuecatSandboxAllowedUserIds: [TESTER] },
+  ]) {
+    const or = (hideTestRowsFor(TESTER, gate) as { OR: Record<string, any>[] }).OR;
+    assert.deepEqual(or[0], { NOT: { testMode: true } }, "the production clause is never removed");
+    assert.ok(or.length >= 1);
+  }
+});

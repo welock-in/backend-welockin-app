@@ -2,7 +2,7 @@ import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { ledgerHash } from "../lib/hash";
-import { hideTestRows, subscriptionGrants } from "../lib/subscription";
+import { hideTestRowsFor, subscriptionGrants } from "../lib/subscription";
 import { issueReceipt } from "../lib/entitlement-receipt";
 import { readDeviceId } from "../lib/device";
 import { parseFingerprint } from "../lib/fingerprint";
@@ -65,7 +65,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     prisma.purchase.findMany({
       // Same filter as the subscriptions below and as the checkout guards: a
       // test purchase must stop granting the moment test mode is shut.
-      where: { userId, ...hideTestRows({ lemonSqueezy: env.lemonSqueezyAllowTestMode, revenuecat: env.revenuecatAllowSandbox }) },
+      where: { userId, ...hideTestRowsFor(userId, env) },
       select: { isRefunded: true },
     }),
     // This machine's claim OR this account's, oldest first so a later row can
@@ -79,7 +79,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     // grants is `subscriptionGrants`'s question, not this query's.
     prisma.subscription.findMany({
       // Test rows stop granting the moment test mode is shut — see hideTestRows.
-      where: { userId, ...hideTestRows({ lemonSqueezy: env.lemonSqueezyAllowTestMode, revenuecat: env.revenuecatAllowSandbox }) },
+      where: { userId, ...hideTestRowsFor(userId, env) },
       select: {
         status: true,
         validUntil: true,

@@ -205,7 +205,11 @@ async function attemptReserve(
 
       // A lock whose holder vanished is not a lock. Take it over rather than
       // stranding the account for ever on a row that no longer exists.
-      if (holder && (lock.expiresAt.getTime() > now.getTime() || holder.state === "uncertain")) {
+      // THE SAME WINDOW, and the `|| holder.state === "uncertain"` that used to
+      // sit here was the other half of the permanent lockout: it kept the lock
+      // alive past its own expiry, so a single dropped response barred the
+      // account from every plan for ever.
+      if (holder && lock.expiresAt.getTime() > now.getTime()) {
         return classifyExisting(holder, input.plan, now);
       }
 
@@ -403,8 +407,20 @@ export async function outstandingAcquisition(
     select: SELECT,
   });
   if (!intent) return null;
-  if (intent.state === "uncertain") return intent; // holds regardless of the clock
   if (!HOLDING.includes(intent.state as IntentState)) return null;
+  // THE HOLD IS A WINDOW, NOT A LIFE SENTENCE — including for `uncertain`.
+  //
+  // This used to return an `uncertain` intent regardless of the clock, which
+  // made the window `markUncertain` computes meaningless: one dropped response
+  // during a checkout and the account could never buy anything again, with a
+  // message telling the customer to cancel something the product gives them no
+  // way to cancel. Reported from the real app by an active subscriber who could
+  // no longer reach lifetime or yearly.
+  //
+  // `UNCERTAIN_HOLD_MS` already answers the only question that matters: after
+  // the full life the invisible link could have, plus the clock-skew margin, it
+  // can no longer be paid — so a fresh purchase is safe. Honouring that instant
+  // is the fix; ignoring it was never safer, only permanent.
   return lock.expiresAt.getTime() > now.getTime() ? intent : null;
 }
 

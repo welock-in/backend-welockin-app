@@ -1142,3 +1142,65 @@ test("an uncertain acquisition only frees after the provider expiry plus the mar
   assert.equal(freed.status, 201, freed.text);
   assert.equal(calls.length, 1);
 });
+
+/**
+ * P1 — an `uncertain` intent locked the account out of buying FOR EVER.
+ *
+ * `markUncertain` computes a hold window and writes it to both rows:
+ * `UNCERTAIN_HOLD_MS`, the full life the invisible checkout could have plus the
+ * clock-skew margin. That window is the whole point — it is the instant after
+ * which a link we never saw can no longer be paid, so a fresh purchase is safe.
+ *
+ * `outstandingAcquisition` then ignored it: `if (state === "uncertain") return
+ * intent` with no clock comparison at all. One dropped response during a
+ * checkout and the customer could never buy anything again — every plan refused,
+ * and the message told them to "finish or cancel it first" with nothing in the
+ * product that can do either.
+ *
+ * Reported from the real app: an active monthly subscriber saw "A checkout is
+ * already in progress on this account" on Get lifetime and Switch to yearly.
+ */
+test("an uncertain acquisition stops blocking once its hold window has passed", async (t) => {
+  silenceErrors(t);
+  const f = await makeAccount("uncertain-forever");
+  let calls = stubProvider(t, {
+    respond: () => {
+      throw new Error("socket hang up");
+    },
+  });
+  assert.equal((await checkout(f.auth, "monthly")).status, 503);
+  assert.equal(calls.length, 1);
+
+  const [intent] = await intentsOf(f.user.id);
+  assert.equal(intent.state, "uncertain");
+
+  // Inside the window, nothing may be created. That part was always right.
+  calls = stubProvider(t);
+  assert.equal((await checkout(f.auth, "lifetime")).status, 409);
+  assert.equal(calls.length, 0);
+
+  // Now push both rows past the hold the product itself computed — exactly what
+  // the passage of time does.
+  const past = new Date(Date.now() - 1000);
+  await prisma.checkoutIntent.update({ where: { id: intent.id }, data: { expiresAt: past } });
+  await prisma.acquisitionLock.updateMany({
+    where: { userId: f.user.id },
+    data: { expiresAt: past },
+  });
+
+  const freed = await checkout(f.auth, "lifetime");
+  assert.equal(
+    freed.status,
+    201,
+    `the hold expired, so buying must be possible again: ${freed.text}`,
+  );
+  assert.equal(calls.length, 1);
+
+  // And the status read agrees with the endpoint.
+  const status = await request(app).get("/api/subscription").set(f.auth);
+  assert.notEqual(
+    status.body.purchaseEligibility.monthly.reasonCode,
+    "CHECKOUT_STATE_UNCERTAIN",
+    "an expired hold must not still report an unknown checkout",
+  );
+});

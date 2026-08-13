@@ -7,6 +7,7 @@ import {
   PLAN,
   TRIAL_PRODUCT_ID,
   effectiveTrialEndsAt,
+  isSellableProductId,
   purchaseEffect,
 } from "./entitlement";
 
@@ -131,6 +132,35 @@ test("a product we do not sell changes nothing", () => {
   assert.equal(
     purchaseEffect({ productId: "com.someone.else", purchaseDate: T0, revoked: false }, 14).kind,
     "ignored",
+  );
+});
+
+/* ── the legacy route's allow-list ───────────────────────────────────────
+   `POST /api/purchases` refuses anything outside it with
+   TRANSACTION_UNKNOWN_PRODUCT, before a single row is written. The route
+   itself cannot be exercised here — reaching that line needs a transaction
+   Apple actually signed, which is the one thing the verifier above makes
+   impossible to fake — so the rule it calls is tested directly instead. */
+
+test("the allow-list is exactly the two products, spelled the only way they exist", () => {
+  assert.equal(isSellableProductId(TRIAL_PRODUCT_ID), true);
+  assert.equal(isSellableProductId(LIFETIME_PRODUCT_ID), true);
+  assert.equal(LIFETIME_PRODUCT_ID, "in.welock.app.life", "the id App Store Connect holds");
+});
+
+test("the RETIRED lifetime spelling is TRANSACTION_UNKNOWN_PRODUCT here too", () => {
+  // Two doors sell the same lifetime — this JWS route and the RevenueCat
+  // mirror — and a spelling refused by one but honoured by the other is a way
+  // in. Concatenated, never written out, so the repo-wide purge grep stays
+  // meaningful.
+  const retired = `${LIFETIME_PRODUCT_ID}time`;
+  assert.equal(isSellableProductId(retired), false);
+  assert.equal(isSellableProductId("com.evil.app.pro"), false);
+  // …and even if the allow-list were bypassed, the effect is still nothing.
+  assert.equal(
+    purchaseEffect({ productId: retired, purchaseDate: T0, revoked: false }, 14).kind,
+    "ignored",
+    "defence in depth: the retired id buys nothing at either layer",
   );
 });
 

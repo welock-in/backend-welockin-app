@@ -2,7 +2,7 @@ import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { ledgerHash } from "../lib/hash";
-import { hideTestRows, subscriptionGrants } from "../lib/subscription";
+import { hideTestRowsFor, subscriptionGrants } from "../lib/subscription";
 import { issueReceipt } from "../lib/entitlement-receipt";
 import { readDeviceId } from "../lib/device";
 import { parseFingerprint } from "../lib/fingerprint";
@@ -65,7 +65,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     prisma.purchase.findMany({
       // Same filter as the subscriptions below and as the checkout guards: a
       // test purchase must stop granting the moment test mode is shut.
-      where: { userId, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
+      where: { userId, ...hideTestRowsFor(userId, env) },
       select: { isRefunded: true },
     }),
     // This machine's claim OR this account's, oldest first so a later row can
@@ -79,7 +79,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     // grants is `subscriptionGrants`'s question, not this query's.
     prisma.subscription.findMany({
       // Test rows stop granting the moment test mode is shut — see hideTestRows.
-      where: { userId, ...hideTestRows(env.lemonSqueezyAllowTestMode) },
+      where: { userId, ...hideTestRowsFor(userId, env) },
       select: {
         status: true,
         validUntil: true,
@@ -87,6 +87,9 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
         // its trial is still running grants nothing (a trial buys no grace).
         // Without this column selected, that rule silently never fires.
         trialEndsAt: true,
+        // "monthly" | "yearly" — written by the Lemon Squeezy webhook and the
+        // RevenueCat sync alike, read back as the view's `plan`.
+        interval: true,
         // For `billingUrl` below. Both are refreshed on every webhook because
         // Lemon Squeezy signs them with an expiry.
         customerPortalUrl: true,
@@ -102,9 +105,11 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     user.compActive === true &&
     (user.compedUntil == null || user.compedUntil.getTime() > now.getTime());
 
+  const hasLifetime = purchases.some((p) => !p.isRefunded);
+
   const view = computeEntitlement({
     now,
-    hasActivePurchase: purchases.some((p) => !p.isRefunded),
+    hasActivePurchase: hasLifetime,
     hasActiveSubscription: subs.some((sub) => subscriptionGrants(sub, now)),
     // Only when the granting one is the trial. A customer with a live paid
     // subscription AND an old lapsed trial row must not read as trialing.
@@ -150,6 +155,20 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   const liveSub = subs.find((sub) => subscriptionGrants(sub, now));
   const billingUrl = liveSub?.customerPortalUrl ?? liveSub?.updatePaymentUrl ?? null;
 
+  // What actually GRANTS, mirroring the resolver's precedence: the lifetime
+  // purchase outranks a live subscription, and a subscription's window only
+  // becomes the view's `validUntil` when the subscription is the granter. A
+  // comped or machine-trial user has no plan and no validUntil — their window
+  // is `trialEndsAt`, which the client already counts down against.
+  const grantingSub = view.isPro && !hasLifetime ? liveSub : null;
+  const plan: "monthly" | "yearly" | "lifetime" | null = !view.isPro
+    ? null
+    : hasLifetime
+      ? "lifetime"
+      : grantingSub?.interval === "monthly" || grantingSub?.interval === "yearly"
+        ? grantingSub.interval
+        : null;
+
   const trialSub = subs.find((sub) => sub.status === "on_trial" && subscriptionGrants(sub, now));
   const grantingUntil = trialSub ? (trialSub.validUntil ?? null) : view.trialEndsAt ? new Date(view.trialEndsAt) : null;
 
@@ -161,6 +180,8 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
 
   return {
     ...view,
+    plan,
+    validUntil: grantingSub?.validUntil?.toISOString() ?? null,
     billingUrl,
     everHadAccess,
     receipt: issueReceipt({

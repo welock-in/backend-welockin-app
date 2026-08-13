@@ -93,6 +93,26 @@ export const PROVIDERS: readonly PurchaseProvider[] = [
      */
     enabled: env.applePurchasesEnabled,
   },
+  {
+    id: "revenuecat",
+    // The money is Apple's: RevenueCat is plumbing in front of StoreKit, not a
+    // storefront of its own, so rows say where the charge actually happened.
+    store: "app_store",
+    label: "RevenueCat (App Store)",
+    /**
+     * Follows the derived `revenuecatEnabled` (webhook token AND secret API
+     * key both set) rather than adding a second switch that could disagree
+     * with the first — the same posture as the Lemon Squeezy entry above.
+     *
+     * Gates POST /api/billing/revenuecat/refresh, the one CLIENT-callable
+     * route that writes these rows. The webhook deliberately does not call
+     * `assertCanWrite`, exactly like the Lemon Squeezy webhook and for the
+     * same reason — except that unlike LS, a disabled RevenueCat webhook
+     * cannot even authenticate a delivery (the token is half of `enabled`),
+     * so the question never arises.
+     */
+    enabled: env.revenuecatEnabled,
+  },
 ] as const;
 
 const BY_ID = new Map(PROVIDERS.map((p) => [p.id, p]));

@@ -37,6 +37,22 @@ const REQUIRED = [
   },
   {
     collection: "CheckoutIntent",
+    key: { token: 1 },
+    unique: true,
+    protects:
+      "the public resume handle. Two intents sharing a token would make " +
+      "'resume this checkout' ambiguous — on a link that takes money.",
+  },
+  {
+    collection: "CheckoutIntent",
+    key: { userId: 1, idempotencyKey: 1 },
+    unique: true,
+    protects:
+      "a retry being the SAME intent rather than a new one. Without it a " +
+      "retried request mints a second payable checkout.",
+  },
+  {
+    collection: "CheckoutIntent",
     key: { userId: 1, state: 1 },
     unique: false,
     protects:
@@ -44,6 +60,30 @@ const REQUIRED = [
       "answers correctly, but scans the collection to do it.",
   },
 ];
+
+/**
+ * Rows that would REFUSE a unique index if it were created now.
+ *
+ * A unique build fails on existing duplicates, and the failure message names one
+ * pair rather than the extent of the problem. Reporting them up front turns
+ * "createIndex failed" into a list of exactly what to reconcile first — and it
+ * reads only, so it is safe to run before deciding anything.
+ */
+async function duplicatesFor(db, spec) {
+  const fields = Object.keys(spec.key);
+  const id = Object.fromEntries(fields.map((f) => [f, `$${f}`]));
+  return db
+    .collection(spec.collection)
+    .aggregate(
+      [
+        { $group: { _id: id, n: { $sum: 1 } } },
+        { $match: { n: { $gt: 1 } } },
+        { $limit: 20 },
+      ],
+      { allowDiskUse: true },
+    )
+    .toArray();
+}
 
 const sameKey = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
@@ -90,6 +130,30 @@ async function main() {
       continue;
     }
     console.log(`ok       ${want.collection} ${keyStr}${found.unique ? " unique" : ""}`);
+  }
+
+  // Only for what is actually missing, and only when a unique build is at stake:
+  // this is the question that decides whether createIndex can succeed at all.
+  for (const m of missing.filter((x) => x.unique)) {
+    let dups;
+    try {
+      dups = await duplicatesFor(db, m);
+    } catch (e) {
+      console.log(`\n${m.collection} ${JSON.stringify(m.key)}: duplicate scan failed — ${e?.message}`);
+      continue;
+    }
+    if (dups.length === 0) {
+      console.log(`\n${m.collection} ${JSON.stringify(m.key)}: no duplicates — a unique build can succeed.`);
+    } else {
+      // The KEYS, never the documents: these carry account ids, which are not
+      // secrets but are not log fodder either, and nothing else is needed to
+      // find them again.
+      console.log(
+        `\n${m.collection} ${JSON.stringify(m.key)}: ${dups.length} duplicate key(s) BLOCK a unique build:`,
+      );
+      for (const d of dups) console.log(`  ${JSON.stringify(d._id)} x${d.n}`);
+      console.log("  Reconcile these before creating the index. Do not drop the index that exists.");
+    }
   }
 
   if (missing.length > 0 && process.argv.includes("--print-fix")) {

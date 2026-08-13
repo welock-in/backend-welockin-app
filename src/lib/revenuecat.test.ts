@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  RC_KNOWN_PRODUCT_IDS,
   RC_LIFETIME_PRODUCT_IDS,
   RC_PRODUCT_MONTHLY,
   RC_PRODUCT_YEARLY,
@@ -10,6 +11,7 @@ import {
   type RcSubscriber,
   type RcSubscriptionState,
 } from "./revenuecat";
+import { LIFETIME_PRODUCT_ID } from "./entitlement";
 import { subscriptionGrants } from "./subscription";
 import { env } from "./env";
 import { prisma } from "./prisma";
@@ -205,24 +207,72 @@ test("the yearly product labels its row yearly", () => {
   assert.equal(row.data.interval, "yearly");
 });
 
-test("BOTH lifetime spellings mint a Purchase — the ASC id is still ambiguous", () => {
-  for (const productId of RC_LIFETIME_PRODUCT_IDS) {
+/*
+ * THE PRODUCT IDS THEMSELVES. Pinned as literals exactly once, here, because
+ * every other fixture in the suite now spells them through the constants —
+ * which means a typo in a constant would be copied faithfully into every test
+ * and prove nothing. Apple never lets a Product ID change after creation, so
+ * these three strings are as immutable as anything in the codebase.
+ */
+test("the Apple catalogue is exactly three product ids, and they are final", () => {
+  assert.equal(RC_PRODUCT_MONTHLY, "in.welock.app.monthly");
+  assert.equal(RC_PRODUCT_YEARLY, "in.welock.app.yearly");
+  assert.deepEqual([...RC_LIFETIME_PRODUCT_IDS], ["in.welock.app.life"]);
+  // The whole allow-list, so a fourth id cannot be added without a test saying so.
+  assert.deepEqual([...RC_KNOWN_PRODUCT_IDS].sort(), [
+    "in.welock.app.life",
+    "in.welock.app.monthly",
+    "in.welock.app.yearly",
+  ]);
+  // The RC mirror and the legacy JWS route must name the SAME lifetime product.
+  assert.equal(RC_LIFETIME_PRODUCT_IDS[0], LIFETIME_PRODUCT_ID);
+});
+
+test("the lifetime product mints a Purchase", () => {
+  const productId = RC_LIFETIME_PRODUCT_IDS[0];
+  const plan = projectSubscriber(
+    USER,
+    {
+      non_subscriptions: {
+        [productId]: [{ id: "txn1", purchase_date: PAST, store: "app_store", is_sandbox: false }],
+      },
+      entitlements: { pro: { product_identifier: productId, expires_date: null } },
+    },
+    NOW,
+  );
+  assert.equal(plan.purchases.length, 1);
+  const purchase = plan.purchases[0];
+  assert.equal(purchase.externalId, `${USER}:${productId}`);
+  assert.equal(purchase.data.store, "app_store");
+  assert.equal(purchase.data.isRefunded, false);
+  assert.equal(purchase.data.purchasedAt.toISOString(), PAST);
+});
+
+test("the RETIRED lifetime spelling is a product we do not sell — nothing is written", () => {
+  // It was never sold: App Store Connect has only ever had `….life`, so a
+  // subscriber naming the long spelling is either a stale fixture or someone
+  // else's catalogue. Either way it must project to NOTHING, exactly like any
+  // other foreign product — an alias kept "for compatibility" would be a
+  // second, unaudited way to be granted a lifetime licence.
+  // Built by concatenation, not written out: the purge is verified by a
+  // repo-wide grep for the retired id coming back EMPTY, and a fixture that
+  // spelled it would defeat the very check it is here to protect.
+  const retired = `${LIFETIME_PRODUCT_ID}time`;
+  for (const productId of [retired, "com.evil.app.pro"]) {
     const plan = projectSubscriber(
       USER,
       {
         non_subscriptions: {
-          [productId]: [{ id: "txn1", purchase_date: PAST, store: "app_store", is_sandbox: false }],
+          [productId]: [{ id: "txn1", purchase_date: PAST, is_sandbox: false }],
         },
-        entitlements: { pro: { product_identifier: productId, expires_date: null } },
+        subscriptions: { [productId]: { expires_date: FUTURE, period_type: "normal" } },
+        entitlements: { pro: { product_identifier: productId } },
       },
       NOW,
     );
-    assert.equal(plan.purchases.length, 1, `${productId} must be recognised`);
-    const purchase = plan.purchases[0];
-    assert.equal(purchase.externalId, `${USER}:${productId}`);
-    assert.equal(purchase.data.store, "app_store");
-    assert.equal(purchase.data.isRefunded, false);
-    assert.equal(purchase.data.purchasedAt.toISOString(), PAST);
+    assert.deepEqual(plan.purchases, [], `${productId} must mint no Purchase`);
+    assert.deepEqual(plan.subscriptions, [], `${productId} must mint no Subscription`);
+    assert.equal(RC_KNOWN_PRODUCT_IDS.includes(productId), false, "nor pass the allow-list");
   }
 });
 
@@ -244,7 +294,7 @@ test("a lifetime dropped from a reported entitlements object reads as refunded",
 test("an ABSENT entitlements object never revokes anyone", () => {
   // Fail toward access: inferring "refunded" from a thin fetch would revoke
   // every paying customer over a missing field.
-  const productId = RC_LIFETIME_PRODUCT_IDS[1];
+  const productId = RC_LIFETIME_PRODUCT_IDS[0];
   const plan = projectSubscriber(
     USER,
     { non_subscriptions: { [productId]: [{ id: "txn1", purchase_date: PAST }] } },

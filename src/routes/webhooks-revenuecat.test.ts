@@ -6,7 +6,12 @@ import { Prisma } from "@prisma/client";
 import { createApp } from "../app";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
-import { RC_PRODUCT_MONTHLY, RC_PRODUCT_YEARLY, type RcSubscriber } from "../lib/revenuecat";
+import {
+  RC_LIFETIME_PRODUCT_IDS,
+  RC_PRODUCT_MONTHLY,
+  RC_PRODUCT_YEARLY,
+  type RcSubscriber,
+} from "../lib/revenuecat";
 
 /*
  * The RevenueCat webhook turns iOS money into access, and its perimeter is an
@@ -265,6 +270,62 @@ test("a product we do not sell is acknowledged and skipped", async (t) => {
   assert.match(res.body.skipped, /not one we sell/);
   assert.equal(fetches.length, 0);
   assert.equal(db.subUpsert.length, 0);
+});
+
+test("the RETIRED lifetime spelling is refused by the allow-list, like any foreign id", async (t) => {
+  // `….life` is the ONE lifetime Product ID and no purchase of the longer
+  // spelling exists anywhere — so a delivery naming it is not history to
+  // honour, it is a product we do not sell. Concatenated rather than written
+  // out so `git grep` can keep proving the purge (see lib/revenuecat.test.ts).
+  configured(t);
+  const db = stubDb(t);
+  const fetches = stubFetch(t);
+
+  for (const productId of [`${RC_LIFETIME_PRODUCT_IDS[0]}time`, "com.evil.app.pro"]) {
+    const res = await deliver(eventBody({ id: `evt-${productId}`, product_id: productId }));
+
+    assert.equal(res.status, 200, "a refusal is terminal — redelivering changes nothing");
+    assert.match(res.body.skipped, /not one we sell/);
+  }
+  // Not a single row, and not even a subscriber fetch: the refusal lands
+  // before the claim, so there is nothing to write and nothing to retry.
+  assert.equal(fetches.length, 0);
+  assert.equal(db.eventCreate.length, 0);
+  assert.equal(db.subUpsert.length, 0);
+  assert.equal(db.purchaseUpsert.length, 0);
+  assert.equal(db.subSweep.length, 0);
+  assert.equal(db.purchaseSweep.length, 0);
+});
+
+test("the lifetime product IS sold: it is claimed, fetched and written", async (t) => {
+  // The other half of the allow-list test above — proof that the id the purge
+  // settled on is the one that actually works end to end.
+  configured(t);
+  const lifetime = RC_LIFETIME_PRODUCT_IDS[0];
+  stubFetch(t, () =>
+    subscriber({
+      subscriptions: {},
+      non_subscriptions: {
+        [lifetime]: [{ id: "txn1", purchase_date: "2026-08-01T00:00:00.000Z", is_sandbox: false }],
+      },
+      entitlements: { pro: { product_identifier: lifetime } },
+    }),
+  );
+  const db = stubDb(t);
+
+  const res = await deliver(
+    eventBody({ id: "evt-lifetime", type: "NON_RENEWING_PURCHASE", product_id: lifetime }),
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.status, "processed");
+  assert.equal(db.purchaseUpsert.length, 1);
+  const written = db.purchaseUpsert[0][0];
+  assert.equal(written.create.userId, USER);
+  assert.equal(written.create.externalId, `${USER}:${lifetime}`);
+  assert.equal(written.update.productId, lifetime);
+  assert.equal(written.update.isRefunded, false, "a live lifetime grants");
+  assert.equal(written.update.testMode, false);
 });
 
 test("someone else's app is refused once an allow-list is configured", async (t) => {

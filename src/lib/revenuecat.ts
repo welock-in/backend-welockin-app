@@ -1,5 +1,6 @@
 import { prisma } from "./prisma";
 import { env } from "./env";
+import { LIFETIME_PRODUCT_ID } from "./entitlement";
 
 /**
  * RevenueCat — the iOS purchase path (StoreKit, via RevenueCat's plumbing).
@@ -27,13 +28,17 @@ export const RC_PROVIDER = "revenuecat";
 export const RC_PRODUCT_MONTHLY = "in.welock.app.monthly";
 export const RC_PRODUCT_YEARLY = "in.welock.app.yearly";
 /**
- * The lifetime product — BOTH spellings, deliberately. The App Store Connect
- * product does not exist yet and the final id is still ambiguous between
- * `.life` and `.lifetime`, so both are recognised: whichever ships is honoured,
- * and the other simply never appears in a subscriber. Trim this to one entry
- * once ASC has made the decision permanent.
+ * The lifetime product — ONE id, and it is final.
+ *
+ * This list briefly carried a second, longer spelling of the suffix while App
+ * Store Connect had no product yet and the choice was open. The choice is
+ * made: the id is `in.welock.app.life`, immutable like every Apple Product ID,
+ * and the alias is GONE rather than kept as a courtesy — no purchase of it
+ * exists anywhere, so honouring it could only ever mean granting on a product
+ * we do not sell. It is taken from lib/entitlement.ts so the two places that
+ * name Apple's catalogue cannot drift into disagreeing about what we sell.
  */
-export const RC_LIFETIME_PRODUCT_IDS = ["in.welock.app.life", "in.welock.app.lifetime"] as const;
+export const RC_LIFETIME_PRODUCT_IDS = [LIFETIME_PRODUCT_ID] as const;
 
 export const RC_SUBSCRIPTION_PRODUCT_IDS = [RC_PRODUCT_MONTHLY, RC_PRODUCT_YEARLY] as const;
 

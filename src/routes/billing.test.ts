@@ -6,7 +6,7 @@ import { signToken } from "../lib/jwt";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { getProvider } from "../lib/purchase-providers";
-import { RC_PRODUCT_YEARLY, type RcSubscriber } from "../lib/revenuecat";
+import { RC_LIFETIME_PRODUCT_IDS, RC_PRODUCT_YEARLY, type RcSubscriber } from "../lib/revenuecat";
 import { stubAccountGuard } from "./test-helpers";
 
 /*
@@ -23,6 +23,9 @@ const app = createApp();
 const USER = "507f1f77bcf86cd799439011";
 const OTHER = "507f1f77bcf86cd799439022";
 const FUTURE = new Date("2026-09-01T00:00:00.000Z");
+/** The one lifetime product. Never a literal here — the literal is pinned once,
+ *  in lib/revenuecat.test.ts, so a typo cannot be copied into a fixture. */
+const RC_LIFETIME = RC_LIFETIME_PRODUCT_IDS[0];
 const auth = { authorization: `Bearer ${signToken({ sub: USER, email: "user@example.com" })}` };
 
 type Ctx = { after: (fn: () => void) => void };
@@ -254,11 +257,9 @@ test("an RC lifetime purchase outranks an expired subscription", async (t) => {
   providerOpen(t);
   stubFetch(t, () => ({
     non_subscriptions: {
-      "in.welock.app.lifetime": [
-        { id: "txn9", purchase_date: "2026-08-01T00:00:00.000Z", is_sandbox: false },
-      ],
+      [RC_LIFETIME]: [{ id: "txn9", purchase_date: "2026-08-01T00:00:00.000Z", is_sandbox: false }],
     },
-    entitlements: { pro: { product_identifier: "in.welock.app.lifetime" } },
+    entitlements: { pro: { product_identifier: RC_LIFETIME } },
   }));
   const db = stubResolver(t, {
     subscriptions: [rcYearlyRow({ status: "expired" })],

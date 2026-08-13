@@ -12,12 +12,7 @@ import {
   transactionInvalid,
   transactionUnknownProduct,
 } from "../lib/http-error";
-import {
-  APP_STORE,
-  LIFETIME_PRODUCT_ID,
-  TRIAL_PRODUCT_ID,
-  purchaseEffect,
-} from "../lib/entitlement";
+import { APP_STORE, isSellableProductId, purchaseEffect } from "../lib/entitlement";
 import { InvalidTransaction, verifySignedTransaction } from "../lib/apple-jws";
 import { assertCanWrite } from "../lib/purchase-providers";
 import { resolveAndCache } from "./entitlement";
@@ -101,9 +96,7 @@ purchasesRouter.post(
 
     // Someone else's app, or a transaction lifted from another bundle.
     if (tx.bundleId !== env.appleBundleId) throw transactionForeign();
-    if (tx.productId !== TRIAL_PRODUCT_ID && tx.productId !== LIFETIME_PRODUCT_ID) {
-      throw transactionUnknownProduct();
-    }
+    if (!isSellableProductId(tx.productId)) throw transactionUnknownProduct();
 
     // A SANDBOX transaction is signed by the same Apple chain as a real one, and
     // carries the real bundle id and the real product id — every check above

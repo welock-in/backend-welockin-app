@@ -23,10 +23,34 @@
  * A client never computes when a trial ends. It asks.
  */
 
-/** The App Store products, mirrored in the app's src/services/purchase.ts.
- *  IMMUTABLE — Apple never lets a Product ID change after creation. */
-export const LIFETIME_PRODUCT_ID = "in.welock.app.lifetime";
+/**
+ * The App Store products, mirrored in the app's src/services/purchase.ts.
+ * IMMUTABLE — Apple never lets a Product ID change after creation.
+ *
+ * THE LIFETIME ID IS `in.welock.app.life`, AND IT IS FINAL. It was written
+ * `.lifetime` here while App Store Connect had no product yet and the spelling
+ * was still open. The decision is made; the old spelling is DELETED rather than
+ * kept as an alias, because no purchase of it exists anywhere in the world —
+ * so the only thing recognising it could ever do is admit a product we do not
+ * sell. Do not reintroduce it "for compatibility": there is nothing to be
+ * compatible with.
+ */
+export const LIFETIME_PRODUCT_ID = "in.welock.app.life";
 export const TRIAL_PRODUCT_ID = "in.welock.app.trial14";
+
+/**
+ * The allow-list of the legacy StoreKit-JWS route (`POST /api/purchases`):
+ * every Apple product a signed transaction may name. Anything else is
+ * TRANSACTION_UNKNOWN_PRODUCT — a valid Apple signature proves where a
+ * transaction came from, never that it is for something we sell.
+ *
+ * A named predicate rather than two comparisons inside the route, so the rule
+ * can be exercised without forging Apple's signature (which is precisely what
+ * the verifier exists to make impossible).
+ */
+export function isSellableProductId(productId: string): boolean {
+  return productId === TRIAL_PRODUCT_ID || productId === LIFETIME_PRODUCT_ID;
+}
 
 /**
  * `User.plan` values. This column is a DENORMALIZED MIRROR, never the authority:

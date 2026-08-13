@@ -28,10 +28,10 @@ export type SubscriptionStatus = (typeof SUBSCRIPTION_STATUSES)[number];
  *
  * `cancelled` IS in this list, and that is the whole reason this function
  * exists. Lemon Squeezy marks a subscription cancelled the moment the customer
- * turns off renewal, but keeps it VALID until the end of the period they already
- * paid for. Treating cancelled as "no access" takes the product away from
- * someone who has paid through the end of the month — and they are right to
- * complain. `expired` is the status that means gone.
+ * turns off renewal, but keeps it VALID until the end of the current access
+ * period. Treating cancelled as "no access" takes the product away in the middle
+ * of a period the customer is entitled to — and they are right to complain.
+ * `expired` is the status that means gone.
  *
  * `paused` is here because Lemon Squeezy's own documentation says payment
  * collection is paused while the subscription stays active.
@@ -170,6 +170,343 @@ export function subscriptionGrantsUntil(sub: SubscriptionLike): Date | null {
  *
  * Access is a question about entitlement. This is a question about billing.
  */
+/**
+ * What an operator may be told when a cancellation does NOT cut access off now.
+ *
+ * The wording is exact on purpose. "Keeps access until the paid period ends" was
+ * the obvious phrasing and it is not something we can assert: `active` is
+ * produced by a 100% discount coupon, a free plan and a manual provider
+ * adjustment just as readily as by a payment, and there is no payment ledger in
+ * this codebase to check. Saying "paid" turns an unknown into a claim, in the
+ * one place an operator is deciding what to tell a customer.
+ *
+ * Exported so the console shows THIS sentence rather than reinventing a
+ * paraphrase that quietly reintroduces the claim.
+ */
+export const ACCESS_CONTINUES_MESSAGE =
+  "The customer keeps access until the current access period ends.";
+
+/**
+ * The only case where an operator may promise access stopped at once — and the
+ * only one the data supports. A trial buys no remaining period, so revoking it
+ * ends access immediately; every other status keeps whatever period it has.
+ */
+export const ACCESS_REVOKED_NOW_MESSAGE =
+  "Access ended immediately — a cancelled trial keeps no remaining period.";
+
+/**
+ * Where a cancellation has actually got to at the payment provider.
+ *
+ * Reconstructed, NOT stored — and that is a deliberate refusal to add a column.
+ * The three states are already distinguishable from rows we keep:
+ *
+ *   · `none`         no outbox row exists. The provider answered synchronously
+ *                    and there was never anything to owe. This is the 200 path.
+ *   · `pending`      a cancel task is still owed, still inside its attempts.
+ *   · `settled`      the drain got through; the provider has been told.
+ *   · `dead_lettered` every attempt was spent and the provider never accepted.
+ *
+ * A stored "confirmed" flag would have to be written by three paths, survive a
+ * late webhook, and be reconciled when the drain later succeeds — four ways to
+ * be wrong about the one fact that decides whether we may bill someone twice.
+ * The outbox already answers it, and the outbox is the thing that is true.
+ */
+export type CancellationState = "none" | "pending" | "settled" | "dead_lettered";
+
+/**
+ * Every answer the purchase decision can give, as a code the client branches on.
+ *
+ * ONE FLAT SET rather than "blocked" and "allowed" kept apart, because the two
+ * eligible cases carry real information: `ELIGIBLE_WITH_TRIAL` is a first-time
+ * buyer who will get the free days, `ELIGIBLE_WITHOUT_TRIAL` is someone who has
+ * spent theirs. A paywall renders those differently, and inferring which from a
+ * boolean plus a sentence is what this type exists to stop.
+ */
+export type EligibilityReason =
+  | "ELIGIBLE_WITH_TRIAL"
+  | "ELIGIBLE_WITHOUT_TRIAL"
+  | "ACTIVE_SUBSCRIPTION"
+  | "CANCELLED_ACCESS_REMAINING"
+  | "CANCELLATION_PENDING"
+  | "BILLING_SUPPORT_REQUIRED"
+  | "LIFETIME_ALREADY_OWNED"
+  | "CHECKOUT_RESUMABLE"
+  | "CHECKOUT_IN_PROGRESS"
+  | "CHECKOUT_STATE_UNCERTAIN";
+
+/** The reasons that REFUSE. Kept as its own type so a block cannot be typoed. */
+export type CheckoutBlockReason = Extract<
+  EligibilityReason,
+  | "ACTIVE_SUBSCRIPTION"
+  | "CANCELLED_ACCESS_REMAINING"
+  | "CANCELLATION_PENDING"
+  | "BILLING_SUPPORT_REQUIRED"
+  | "LIFETIME_ALREADY_OWNED"
+  | "CHECKOUT_IN_PROGRESS"
+  | "CHECKOUT_STATE_UNCERTAIN"
+>;
+
+/** What happens to the trial if this plan is bought right now. */
+export type TrialMode = "eligible" | "skip" | "none";
+
+export type PurchasePlan = "monthly" | "yearly" | "lifetime";
+
+export type PlanEligibility = {
+  canPurchase: boolean;
+  reasonCode: EligibilityReason;
+  trialMode: TrialMode;
+  /** Days of trial this plan would grant — 0 unless `trialMode` is "eligible". */
+  trialDays: number;
+};
+
+/** Prose for humans; the client branches on the code, never on this. */
+export const ELIGIBILITY_MESSAGES: Record<EligibilityReason, string> = {
+  ELIGIBLE_WITH_TRIAL: "Start your free trial.",
+  ELIGIBLE_WITHOUT_TRIAL: "Your free trial has been used — this plan starts right away.",
+  ACTIVE_SUBSCRIPTION: "You already have an active subscription.",
+  CANCELLED_ACCESS_REMAINING:
+    "Your subscription is cancelled but still running until the end of the current " +
+    "access period. Resume it or change plan instead of buying a second one.",
+  CANCELLATION_PENDING:
+    "Your cancellation is still being confirmed with the payment provider. " +
+    "Refresh in a moment — buying now could bill you twice.",
+  BILLING_SUPPORT_REQUIRED:
+    "We could not confirm your cancellation with the payment provider. " +
+    "Contact support before buying again so you are not billed twice.",
+  LIFETIME_ALREADY_OWNED: "You already own the lifetime licence.",
+  CHECKOUT_RESUMABLE: "You have a payment page open for this plan — finish it here.",
+  CHECKOUT_IN_PROGRESS:
+    "A checkout is already in progress on this account. Finish or cancel it first.",
+  CHECKOUT_STATE_UNCERTAIN:
+    "A previous checkout could not be confirmed with the payment provider. " +
+    "Please wait a few minutes or contact support.",
+};
+
+/**
+ * Which refusal wins when an account carries several subscription rows.
+ *
+ * Most severe first. An account with an abandoned cancellation AND a live
+ * subscription must hear about the abandoned one: "contact support" is
+ * actionable, "you already have a subscription" sends them to a Change plan
+ * button that will not help.
+ */
+const BLOCK_SEVERITY: readonly CheckoutBlockReason[] = [
+  "CHECKOUT_STATE_UNCERTAIN",
+  "CHECKOUT_IN_PROGRESS",
+  "BILLING_SUPPORT_REQUIRED",
+  "CANCELLATION_PENDING",
+  "ACTIVE_SUBSCRIPTION",
+  "CANCELLED_ACCESS_REMAINING",
+];
+
+/**
+ * Does THIS subscription row stand in the way of a new recurring purchase?
+ *
+ * A SEPARATE QUESTION FROM `subscriptionIsLive`, and the separation is the whole
+ * point. That predicate answers six billing questions elsewhere — can this trial
+ * be converted, which row does the portal link to, what can be cancelled, what
+ * can be changed, which subscriptions must be auto-cancelled when a lifetime
+ * licence lands — and every one of them means "can Lemon Squeezy still charge
+ * this?". None of them is "may this person buy". Widening it would change all six.
+ *
+ * THE ORDER OF THE FIRST TWO CHECKS IS LOAD-BEARING. A row Lemon Squeezy has
+ * finished with blocks nothing, no matter what our own bookkeeping still says
+ * about it: an outbox task left over from an old, long-expired subscription is
+ * our problem, not a reason to refuse someone's money. Testing the outbox first
+ * let a stale task on a dead row lock an entire account out of buying.
+ *
+ * THE TOMBSTONE ALONE IS NOT ENOUGH to unlock buying, which is the subtle half.
+ * It means "this trial's access is revoked locally". It does NOT mean "Lemon
+ * Squeezy accepted the cancellation" — on the queued path we write it before the
+ * provider has been reached at all. Selling a second subscription while the first
+ * is still cancellable-but-not-cancelled is how someone pays twice.
+ */
+export function blocksNewRecurringCheckout(
+  sub: { status: string; trialCancelledAt: Date | null },
+  cancellation: CancellationState,
+): CheckoutBlockReason | null {
+  // Lemon Squeezy is done with this row. Nothing about it can double-bill.
+  if (!subscriptionIsLive(sub)) return null;
+
+  // Owed or abandoned work at the provider outranks everything below: until the
+  // cancellation is accepted, a second subscription can double-bill.
+  if (cancellation === "dead_lettered") return "BILLING_SUPPORT_REQUIRED";
+  if (cancellation === "pending") return "CANCELLATION_PENDING";
+
+  // A revoked trial with nothing owed IS a confirmed cancellation — whether the
+  // provider answered 200 synchronously (no task was ever created) or the drain
+  // settled it later. Neither waits on a webhook.
+  if (sub.trialCancelledAt != null) return null;
+
+  // A PAID subscription the customer cancelled, running out its remaining
+  // period. Its own code, not `ACTIVE_SUBSCRIPTION`: the actions that help are
+  // Resume and Change plan, which is a different screen from "you already have
+  // one". Blocking is the existing policy, kept deliberately — quietly selling
+  // a second subscription here produces a "charged twice" ticket. Only a trial
+  // gets the fast path above, because a trial keeps no period worth protecting.
+  if (sub.status === "cancelled") return "CANCELLED_ACCESS_REMAINING";
+
+  return "ACTIVE_SUBSCRIPTION";
+}
+
+/**
+ * The whole paywall, decided server-side, plan by plan.
+ *
+ * ONE FUNCTION FOR TWO CALLERS, and that is the point of it existing at all.
+ * `GET /api/subscription` renders the paywall from this, and `POST /api/checkout`
+ * enforces it from the same call — so the API cannot advertise "you may buy
+ * yearly" and then refuse it for a reason the screen never mentioned. A single
+ * account-wide verdict could not express this: a customer on a live monthly plan
+ * may not buy yearly (Change plan is the route) yet may buy lifetime, and one
+ * `canPurchase` boolean has to be wrong about one of them.
+ *
+ * LIFETIME IS DELIBERATELY NOT GATED BY THE RECURRING RULES. It is not a
+ * subscription, so it cannot become a second one, and the webhook cancels any
+ * live subscription through the outbox when a lifetime order lands — the saga
+ * that already exists. That means lifetime stays purchasable during a pending or
+ * dead-lettered recurring cancellation. It is safe for the reason above and NOT
+ * by accident: it never touches `blocksNewRecurringCheckout`.
+ */
+export function planEligibility(input: {
+  subs: ReadonlyArray<{ externalId: string; status: string; trialCancelledAt: Date | null }>;
+  cancellations: ReadonlyMap<string, CancellationState>;
+  ownsLifetime: boolean;
+  deviceHadTrial: boolean;
+  trialDays: { monthly: number; yearly: number };
+  /**
+   * The account's outstanding acquisition, if it has one. Null when nothing is
+   * in flight — an expired one counts as nothing, see `outstandingAcquisition`.
+   */
+  outstanding?: { plan: string; state: string; resumable: boolean } | null;
+}): Record<PurchasePlan, PlanEligibility> {
+  const blocked = (): CheckoutBlockReason | null => {
+    const hits = new Set<CheckoutBlockReason>();
+    for (const sub of input.subs) {
+      const reason = blocksNewRecurringCheckout(
+        sub,
+        input.cancellations.get(sub.externalId) ?? "none",
+      );
+      if (reason) hits.add(reason);
+    }
+    return BLOCK_SEVERITY.find((r) => hits.has(r)) ?? null;
+  };
+
+  const refuse = (reasonCode: CheckoutBlockReason): PlanEligibility => ({
+    canPurchase: false,
+    reasonCode,
+    trialMode: "none",
+    trialDays: 0,
+  });
+
+  if (input.ownsLifetime) {
+    const owned = refuse("LIFETIME_ALREADY_OWNED");
+    return { monthly: owned, yearly: owned, lifetime: owned };
+  }
+
+  // AN OUTSTANDING CHECKOUT OUTRANKS EVERY OTHER ANSWER, lifetime included.
+  //
+  // Lifetime is exempt from the recurring rules because it cannot become a
+  // second subscription — but it can absolutely become a second PAYMENT, and a
+  // customer holding a payable monthly link who is also handed a payable
+  // lifetime link is the exact failure this whole mechanism exists to stop. So
+  // this gate is the one place all three plans are treated identically.
+  const held = input.outstanding;
+  if (held) {
+    if (held.state === "uncertain") {
+      // We do not know whether a payable link exists, so we may not create one.
+      const unknown = refuse("CHECKOUT_STATE_UNCERTAIN");
+      return { monthly: unknown, yearly: unknown, lifetime: unknown };
+    }
+    const busy = refuse("CHECKOUT_IN_PROGRESS");
+    const resume: PlanEligibility = {
+      // TRUE, and deliberately: pressing Buy again returns the SAME link rather
+      // than minting a second. The screen offers "finish paying", not "buy".
+      canPurchase: true,
+      reasonCode: "CHECKOUT_RESUMABLE",
+      trialMode: "none",
+      trialDays: 0,
+    };
+    const forPlan = (plan: PurchasePlan): PlanEligibility =>
+      held.resumable && held.plan === plan ? resume : busy;
+    return {
+      monthly: forPlan("monthly"),
+      yearly: forPlan("yearly"),
+      lifetime: forPlan("lifetime"),
+    };
+  }
+
+  const lifetime: PlanEligibility = {
+    canPurchase: true,
+    reasonCode: "ELIGIBLE_WITHOUT_TRIAL",
+    trialMode: "none",
+    trialDays: 0,
+  };
+
+  const block = blocked();
+  if (block) {
+    return { monthly: refuse(block), yearly: refuse(block), lifetime };
+  }
+
+  // The account leg and the device leg, exactly as the checkout computes them:
+  // ANY subscription row means the trial is spent, and so does a claim from this
+  // machine. Kept here so the paywall and the checkout cannot disagree.
+  const spent = input.subs.length > 0 || input.deviceHadTrial;
+  const recurring = (days: number): PlanEligibility =>
+    spent
+      ? { canPurchase: true, reasonCode: "ELIGIBLE_WITHOUT_TRIAL", trialMode: "skip", trialDays: 0 }
+      : {
+          canPurchase: true,
+          reasonCode: "ELIGIBLE_WITH_TRIAL",
+          trialMode: "eligible",
+          trialDays: days,
+        };
+
+  return {
+    monthly: recurring(input.trialDays.monthly),
+    yearly: recurring(input.trialDays.yearly),
+    lifetime,
+  };
+}
+
+/**
+ * Is this subscription CURRENTLY inside a provider trial?
+ *
+ * The only claim this makes — and the only one the status can support — is that
+ * Lemon Squeezy says a trial is running right now. It deliberately says nothing
+ * about payment history: `active` does NOT prove money was collected (a 100%
+ * discount, a free plan or a manual provider adjustment all produce `active`),
+ * and there is no payment ledger here to ask. Anyone needing "has this customer
+ * ever paid?" must build that from Purchase/payment records, not from a status.
+ *
+ * Independent of the tombstone on purpose — see `isLiveUnpaidTrial`. A retry
+ * after a first cancellation must still recognise the row AS a trial, or it
+ * would reclassify it as a non-trial and report that nothing was revoked.
+ */
+export function isCurrentTrial(
+  sub: { status: string; trialEndsAt: Date | null },
+  now: Date = new Date(),
+): boolean {
+  if (sub.status !== "on_trial") return false;
+  return sub.trialEndsAt != null && sub.trialEndsAt.getTime() > now.getTime();
+}
+
+/**
+ * A trial that is running AND has not yet been cancelled — i.e. one there is
+ * still something to revoke for.
+ *
+ * The tombstone check is what makes the write set-once. Cancelling a trial ends
+ * access at once (a trial buys no grace, nobody was charged for it), and this is
+ * the single definition of "which rows that applies to" — three writers had
+ * three different ones, and the admin path's was the dates alone, which would
+ * have tombstoned a customer whose subscription had already left `on_trial`.
+ */
+export function isLiveUnpaidTrial(
+  sub: { status: string; trialEndsAt: Date | null; trialCancelledAt: Date | null },
+  now: Date = new Date(),
+): boolean {
+  return isCurrentTrial(sub, now) && sub.trialCancelledAt == null;
+}
+
 export function subscriptionIsLive(sub: { status: string }): boolean {
   return !["expired", "unpaid"].includes(sub.status);
 }

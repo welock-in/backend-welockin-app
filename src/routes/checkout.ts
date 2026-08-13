@@ -4,11 +4,23 @@ import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { checkoutConfirmSchema, checkoutSchema } from "../validation/schemas";
 import {
+  ELIGIBILITY_MESSAGES,
   hideTestRowsFor,
-  subscriptionGrants,
+  planEligibility,
   variantForPlan,
-  subscriptionIsLive,
 } from "../lib/subscription";
+import { cancellationStates } from "../lib/billing-tasks";
+import {
+  CHECKOUT_TTL_MS,
+  conflictingKeyPlan,
+  EXPIRY_MARGIN_MS,
+  IdempotencyConflict,
+  markFailed,
+  markReady,
+  markUncertain,
+  outstandingAcquisition,
+  reserveAcquisition,
+} from "../lib/checkout-intent";
 import {
   parseOrderEvent,
   parseSubscriptionEvent,
@@ -21,7 +33,7 @@ import { readDeviceId, isReliableDeviceId } from "../lib/device";
 import { ledgerHash } from "../lib/hash";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
-import { accountGone, conflict, badRequest, notFound } from "../lib/http-error";
+import { HttpError, accountGone, badRequest, conflict, notFound } from "../lib/http-error";
 import { mirrorSubscriptionState, recordPaidOrder } from "./webhooks-lemonsqueezy";
 import { resolveAndCache } from "./entitlement";
 
@@ -52,6 +64,15 @@ checkoutRouter.post(
   requireAuth,
   asyncHandler(async (req, res) => {
     const { plan } = checkoutSchema.parse(req.body ?? {});
+
+    // OPTIONAL, and verified so rather than assumed: the Tauri desktop is the
+    // only caller of this endpoint and sends exactly three headers, none of them
+    // this one. Requiring it would break the entire installed base for no gain —
+    // the per-account lock below already makes a double checkout impossible.
+    // Bounded because it becomes a database key.
+    const rawKey = req.header("Idempotency-Key");
+    const idempotencyKey =
+      typeof rawKey === "string" && rawKey.trim() ? rawKey.trim().slice(0, 200) : null;
 
     // The NAME becomes an id here and nowhere else — via the shared helper, so
     // checkout and change-plan can never disagree about what "monthly" is. A
@@ -93,7 +114,6 @@ checkoutRouter.post(
       where: { userId, isRefunded: false, ...hideTestRowsFor(userId, env) },
       select: { id: true },
     });
-    if (owned) throw conflict("You already own the lifetime licence.");
 
     // A live subscription blocks a SECOND subscription, but never the upgrade to
     // lifetime: someone paying monthly who wants to stop paying monthly is the
@@ -121,48 +141,171 @@ checkoutRouter.post(
     // "unidentified" fallback is treated as no id (see isReliableDeviceId).
     const rawDeviceId = readDeviceId(req);
     const deviceId = isReliableDeviceId(rawDeviceId) ? rawDeviceId : "";
-    let skipTrial = false;
-    if (plan !== "lifetime") {
-      const subs = await prisma.subscription.findMany({
-        where: { userId, ...hideTestRowsFor(userId, env) },
-        select: {
-          status: true,
-          validUntil: true,
-          trialEndsAt: true,
-          trialCancelledAt: true,
-          pauseMode: true,
-          providerUpdatedAt: true,
-          createdAt: true,
-          variantId: true,
-          updatedAt: true,
-        },
-      });
-      // EXISTENCE, not access. This guard stops us selling a second
-      // subscription to someone who already has one — a billing question. Using
-      // the ACCESS predicate here meant a subscription Lemon Squeezy is still
-      // charging for (unknown variant, cancelled trial, void pause) no longer
-      // blocked the checkout, and the customer ended up paying twice.
-      if (subs.some(subscriptionIsLive)) {
-        throw conflict("You already have an active subscription.");
-      }
-      const accountHadSubscription = subs.length > 0;
+    // ONE DECISION, SHARED WITH THE PAYWALL.
+    //
+    // `planEligibility` is exactly what `GET /api/subscription` renders from, so
+    // this endpoint cannot refuse a purchase the status call has just advertised
+    // — nor refuse it for a reason the screen never mentioned. Two copies of
+    // this rule is how an API ends up saying "you may buy yearly" and then
+    // answering 409 with something else.
+    //
+    // EVERY PLAN is evaluated, not just the requested one, because the answers
+    // are not independent: a lifetime licence already owned refuses all three,
+    // while a pending recurring cancellation refuses monthly and yearly and
+    // leaves lifetime alone (it is not a subscription, so it cannot become a
+    // second one — see the saga note on `planEligibility`).
+    const subs = await prisma.subscription.findMany({
+      where: { userId, ...hideTestRowsFor(userId, env) },
+      select: {
+        externalId: true,
+        status: true,
+        validUntil: true,
+        // Mixed-provider query: without this, the Lemon Squeezy variant
+        // allowlist inside `subscriptionGrants` would judge RevenueCat rows
+        // too (see SubscriptionLike.provider).
+        provider: true,
+        trialEndsAt: true,
+        trialCancelledAt: true,
+        pauseMode: true,
+        providerUpdatedAt: true,
+        createdAt: true,
+        variantId: true,
+        updatedAt: true,
+      },
+    });
 
-      // The device leg. A TrialClaim for this machine — written when its last
-      // trial started (see the webhook), or by the legacy cardless-trial path —
-      // means this computer has had its trial. Fails OPEN: no device id (an old
-      // client, or a machine that could not identify itself) simply falls back
-      // to the account leg, never a refusal.
-      let deviceHadTrial = false;
-      if (deviceId) {
-        const claim = await prisma.trialClaim.findUnique({
-          where: { deviceIdHash: ledgerHash(deviceId) },
-          select: { id: true },
+    // The device leg. A TrialClaim for this machine — written when its last
+    // trial started (see the webhook), or by the legacy cardless-trial path —
+    // means this computer has had its trial. Fails OPEN: no device id (an old
+    // client, or a machine that could not identify itself) simply falls back to
+    // the account leg, never a refusal.
+    const [cancellations, deviceClaim, outstanding] = await Promise.all([
+      cancellationStates(subs.map((sub) => sub.externalId)),
+      deviceId
+        ? prisma.trialClaim.findUnique({
+            where: { deviceIdHash: ledgerHash(deviceId) },
+            select: { id: true },
+          })
+        : Promise.resolve(null),
+      // What the paywall would advertise. The LOCK below is what enforces it —
+      // two simultaneous callers both read "nothing outstanding" here and only
+      // one can win the reservation. This read exists so the refusal a second
+      // request gets is the same one the status screen was already showing.
+      outstandingAcquisition(userId),
+    ]);
+
+    // BEFORE the eligibility gate: a key that no longer matches its payload is a
+    // broken request, not an ineligible account, and conflating the two hands the
+    // client a reason code about a lock its own first call created.
+    if (idempotencyKey) {
+      const otherPlan = await conflictingKeyPlan(userId, idempotencyKey, plan);
+      if (otherPlan) {
+        throw new HttpError(409, "This Idempotency-Key was already used for a different plan.", {
+          code: "IDEMPOTENCY_CONFLICT",
+          details: { existingPlan: otherPlan },
         });
-        deviceHadTrial = claim != null;
       }
-
-      skipTrial = accountHadSubscription || deviceHadTrial;
     }
+
+    const decision = planEligibility({
+      subs,
+      cancellations,
+      ownsLifetime: owned != null,
+      deviceHadTrial: deviceClaim != null,
+      trialDays: {
+        monthly: env.lemonSqueezyTrialDaysMonthly,
+        yearly: env.lemonSqueezyTrialDaysYearly,
+      },
+      outstanding: outstanding
+        ? {
+            plan: outstanding.plan,
+            state: outstanding.state,
+            resumable: outstanding.state === "ready" && outstanding.checkoutUrl != null,
+          }
+        : null,
+    })[plan];
+
+    if (!decision.canPurchase) {
+      throw new HttpError(409, ELIGIBILITY_MESSAGES[decision.reasonCode], {
+        code: decision.reasonCode,
+      });
+    }
+    const skipTrial = decision.trialMode === "skip";
+
+    // ── one payable acquisition per account ──────────────────────────────────
+    //
+    // Taken BEFORE the provider is called and committed before it, because the
+    // whole point is that a second request must find the lock already held. The
+    // transaction is short and touches only our own rows: an HTTP call inside it
+    // would hold a database transaction open across a network round trip, and a
+    // slow provider would become a stalled database.
+    const now = new Date();
+    let reservation;
+    try {
+      reservation = await reserveAcquisition({
+        userId,
+        plan,
+        idempotencyKey,
+        now,
+      });
+    } catch (e) {
+      if (e instanceof IdempotencyConflict) {
+        // The key promised "this exact request again" and the request changed.
+        // Answering with the first intent would sell the wrong plan; minting a
+        // second would break the promise. Refusing is the only honest option.
+        throw new HttpError(
+          409,
+          "This Idempotency-Key was already used for a different plan.",
+          { code: "IDEMPOTENCY_CONFLICT" },
+        );
+      }
+      throw e;
+    }
+
+    if (reservation.outcome === "reused") {
+      // Already minted, still payable, same plan. Handing back the same link is
+      // what makes a double-submit harmless — and it costs the provider nothing.
+      res.status(201).json({
+        url: reservation.intent.checkoutUrl,
+        reused: true,
+        intentToken: reservation.intent.token,
+        expiresAt: reservation.intent.expiresAt.toISOString(),
+      });
+      return;
+    }
+
+    if (reservation.outcome === "uncertain") {
+      // We do not know whether a payable link exists. Creating another one is
+      // exactly the double payment this guards against, so the customer waits
+      // until the invisible one can no longer be paid — or support settles it.
+      throw new HttpError(
+        409,
+        "A previous checkout could not be confirmed with the payment provider. " +
+          "Please wait a few minutes or contact support.",
+        {
+          code: "CHECKOUT_STATE_UNCERTAIN",
+          details: { retryAfter: reservation.intent.expiresAt.toISOString() },
+        },
+      );
+    }
+
+    if (reservation.outcome === "busy") {
+      throw new HttpError(
+        409,
+        "A checkout is already in progress on this account. Finish or cancel it first.",
+        {
+          code: "CHECKOUT_IN_PROGRESS",
+          details: { plan: reservation.intent.plan },
+        },
+      );
+    }
+
+    const intent = reservation.intent;
+    // The instant we and the provider agree the link dies. Sent to Lemon Squeezy
+    // and stored locally with a margin on top, so our row never says "free"
+    // while the link is still payable — that gap IS the double payment.
+    const linkExpiresAt = new Date(now.getTime() + CHECKOUT_TTL_MS);
+    const localExpiresAt = new Date(linkExpiresAt.getTime() + EXPIRY_MARGIN_MS);
 
     const body = {
       data: {
@@ -176,7 +319,15 @@ checkoutRouter.post(
             // the trial (see the skip_trial logic above). Omitted when the
             // client sent no device id — an old build, or a machine that could
             // not identify itself.
-            custom: deviceId ? { user_id: userId, device_id: deviceId } : { user_id: userId },
+            // `checkout_intent_id` comes back on the webhook and is how a
+            // payment is matched to the exact intent that minted it — so a late
+            // delivery closes ITS OWN acquisition and can never release a newer
+            // one the customer has since started.
+            custom: {
+              user_id: userId,
+              checkout_intent_id: intent.token,
+              ...(deviceId ? { device_id: deviceId } : {}),
+            },
           },
           product_options: {
             // The RETURN PATH. Lemon Squeezy's confirmation modal shows a
@@ -226,6 +377,19 @@ checkoutRouter.post(
           // entirely for a first-time subscriber so they get the trial the
           // paywall promised.
           ...(skipTrial ? { checkout_options: { skip_trial: true } } : {}),
+          // NOT OPTIONAL FOR US, however optional the API makes it.
+          //
+          // Lemon Squeezy documents `expires_at` as nullable and defaulting to
+          // null — "checkout URLs without an expires_at value can be used
+          // indefinitely" — and it publishes NO way to invalidate a checkout
+          // afterwards: the Checkouts resource has POST, GET one and GET many,
+          // and nothing else. So a link minted without this is payable for ever,
+          // and an account lock could never be released without risking a second
+          // payable link beside a first one that still works.
+          //
+          // Sending it makes the death of the link a fact we know in advance —
+          // including for a checkout we never saw the response to.
+          expires_at: linkExpiresAt.toISOString(),
         },
         relationships: {
           store: { data: { type: "stores", id: env.lemonSqueezyStoreId } },
@@ -255,9 +419,33 @@ checkoutRouter.post(
       // Never echo the failure verbatim: the request carried the API key in a
       // header, and some fetch errors quote the request back.
       console.error("[checkout] Lemon Squeezy unreachable:", err instanceof Error ? err.message : err);
-      throw badRequest("Could not reach the payment provider. Please try again.");
+      // AMBIGUOUS, NOT FAILED — and the distinction is the whole safety of this.
+      // A timeout or a dropped socket does not prove the checkout was not
+      // created: the request may have arrived and the reply been lost. The lock
+      // is kept until the link we cannot see stops being payable.
+      await markUncertain(intent.id, now);
+      throw new HttpError(
+        503,
+        "We could not confirm the checkout with the payment provider. " +
+          "Please wait a few minutes before trying again.",
+        { code: "CHECKOUT_STATE_UNCERTAIN" },
+      );
     } finally {
       clearTimeout(timer);
+    }
+
+    // A 5xx has the same problem as a timeout: Lemon Squeezy may have created
+    // the checkout and failed while telling us. Only a 4xx is a decision we can
+    // read, and only a decision releases the lock.
+    if (!response.ok && response.status >= 500) {
+      console.error(`[checkout] Lemon Squeezy answered HTTP ${response.status} — outcome unknown`);
+      await markUncertain(intent.id, now);
+      throw new HttpError(
+        503,
+        "We could not confirm the checkout with the payment provider. " +
+          "Please wait a few minutes before trying again.",
+        { code: "CHECKOUT_STATE_UNCERTAIN" },
+      );
     }
 
     if (!response.ok) {
@@ -293,6 +481,11 @@ checkoutRouter.post(
       // deploy that is being exercised by us. On a live storefront the person
       // reading this is a CUSTOMER, and an env var name is both meaningless to
       // them and an invitation to think the price is negotiable.
+      // A 4xx is an answer we can read: Lemon Squeezy looked at the request and
+      // refused it, so no checkout exists to collide with. Releasing the lock at
+      // once is safe, and making someone wait out a timeout because of a typo
+      // would be gratuitous. Anything 5xx took the ambiguous path above.
+      await markFailed(intent.id);
       throw badRequest(
         hint && env.lemonSqueezyAllowTestMode
           ? `Could not start the purchase — ${why} — ${hint}`
@@ -300,14 +493,40 @@ checkoutRouter.post(
       );
     }
 
-    const payload = (await response.json()) as { data?: { attributes?: { url?: string } } };
+    const payload = (await response.json()) as {
+      data?: { id?: string; attributes?: { url?: string } };
+    };
     const url = payload.data?.attributes?.url;
+    const providerCheckoutId = payload.data?.id ?? null;
     if (!url) {
+      // The provider accepted the request, so a payable checkout very likely
+      // exists — we simply cannot read its link. That is the ambiguous case, not
+      // a failure: releasing here would allow a second link beside it.
       console.error("[checkout] Lemon Squeezy returned no checkout url");
-      throw badRequest("Could not start the purchase. Please try again.");
+      await markUncertain(intent.id, now);
+      throw new HttpError(
+        503,
+        "We could not confirm the checkout with the payment provider. " +
+          "Please wait a few minutes before trying again.",
+        { code: "CHECKOUT_STATE_UNCERTAIN" },
+      );
     }
 
-    res.status(201).json({ url });
+    // The provider agreed to our expiry, so both rows now describe the same
+    // instant — plus a margin here, never less, so our side is the last to
+    // consider the link dead.
+    await markReady({
+      intentId: intent.id,
+      providerCheckoutId: providerCheckoutId ?? null,
+      checkoutUrl: url,
+      expiresAt: localExpiresAt,
+    });
+    res.status(201).json({
+      url,
+      reused: false,
+      intentToken: intent.token,
+      expiresAt: localExpiresAt.toISOString(),
+    });
   }),
 );
 
@@ -440,7 +659,29 @@ checkoutRouter.post(
       );
     }
 
-    if (order.variantId && order.variantId === env.lemonSqueezyVariantId) {
+    // WHICH BRANCH, and the test is deliberately inverted.
+    //
+    // It used to be `order.variantId === env.lemonSqueezyVariantId` — the one
+    // configured lifetime id and nothing else. A price change in Lemon Squeezy
+    // mints a NEW variant id, so every order placed on the OLD one fell through
+    // to the subscription branch, found no subscription for it, and answered 409
+    // for ever. The customer had paid.
+    //
+    // So the question asked is "is this a variant we sell a SUBSCRIPTION for?".
+    // Anything else is the one-time product, whatever id it happens to carry
+    // today — the same reasoning `isSellableOrder` already applies on the webhook
+    // side, where an unknown non-subscription variant is called "far more likely
+    // OUR configuration than a foreign product". The store and the buyer's email
+    // have both been verified above, so this is an order in our shop, paid by
+    // this customer; the only one-time thing it can be is the lifetime licence.
+    const subscriptionVariants = [
+      env.lemonSqueezyVariantMonthly,
+      env.lemonSqueezyVariantYearly,
+      ...env.lemonSqueezyVariantsGranting,
+    ].filter(Boolean);
+    const isSubscriptionOrder = order.variantId != null && subscriptionVariants.includes(order.variantId);
+
+    if (!isSubscriptionOrder) {
       // The lifetime licence. Refunded is checked HERE because recordPaidOrder
       // mints isRefunded:false — the webhook never meets this case (its refund
       // events revoke), but this endpoint can be called about an old order.

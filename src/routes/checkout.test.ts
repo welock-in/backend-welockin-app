@@ -72,6 +72,17 @@ test("checkout requires a bearer token", async () => {
 });
 
 test("a checkout carries the caller's own user id, not one the buyer chose", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
@@ -88,7 +99,7 @@ test("a checkout carries the caller's own user id, not one the buyer chose", asy
 
   const res = await request(app).post("/api/checkout").set(auth).send({ plan: "lifetime" });
 
-  assert.equal(res.status, 201);
+  assert.equal(res.status, 201, res.text);
   assert.equal(res.body.url, "https://the-hnh.lemonsqueezy.com/checkout/abc");
   // The whole reason this endpoint exists: the account is bound server-side,
   // from the token, before the payment page is created.
@@ -111,6 +122,17 @@ test("a checkout carries the caller's own user id, not one the buyer chose", asy
 });
 
 test("someone who already owns the licence is not sent to pay again", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => ({ id: "purchase-1" }));
@@ -125,6 +147,17 @@ test("someone who already owns the licence is not sent to pay again", async (t) 
 
 // A refunded purchase is not ownership: that customer may buy again.
 test("a refunded purchase does not block a new checkout", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   // The route asks only for a live one, so the refunded row is simply not found.
@@ -137,11 +170,23 @@ test("a refunded purchase does not block a new checkout", async (t) => {
 
   const res = await request(app).post("/api/checkout").set(auth).send({ plan: "lifetime" });
 
-  assert.equal(res.status, 201);
+  assert.equal(res.status, 201, res.text);
   assert.equal(calls[0][0].where.isRefunded, false);
 });
 
 test("an unconfigured storefront fails loudly instead of returning a dead button", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   const before = env.lemonSqueezyVariantId;
   (env as any).lemonSqueezyVariantId = "";
   t.after(() => {
@@ -154,6 +199,17 @@ test("an unconfigured storefront fails loudly instead of returning a dead button
 });
 
 test("a provider outage does not leak the request or hang the caller", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
@@ -163,7 +219,10 @@ test("a provider outage does not leak the request or hang the caller", async (t)
 
   const res = await request(app).post("/api/checkout").set(auth).send({ plan: "lifetime" });
 
-  assert.equal(res.status, 400);
+  // A dropped connection does not prove nothing was created — see the intent
+  // state machine. The lock is held and the caller told to wait.
+  assert.equal(res.status, 503, res.text);
+  assert.equal(res.body.code, "CHECKOUT_STATE_UNCERTAIN");
   // The upstream message quoted the Authorization header; it must not travel.
   assert.ok(!JSON.stringify(res.body).includes("test-key"));
 });
@@ -179,10 +238,20 @@ for (const [plan, variantId] of [
   ["lifetime", "1960881"],
 ] as const) {
   test(`the "${plan}" plan is minted against its own variant`, async (t) => {
+    stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+    stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+    stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+    stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+    stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+    stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+    stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+    stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+    stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
     configured(t);
     stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
     stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
     stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
 
     let sent: any = null;
     stubFetch(t, async (_url: string, init: any) => {
@@ -196,7 +265,7 @@ for (const [plan, variantId] of [
 
     const res = await request(app).post("/api/checkout").set(auth).send({ plan });
 
-    assert.equal(res.status, 201);
+    assert.equal(res.status, 201, res.text);
     assert.equal(sent.data.relationships.variant.data.id, variantId);
   });
 }
@@ -204,11 +273,21 @@ for (const [plan, variantId] of [
 /* ── One free trial per account (skip_trial) ────────────────────────────── */
 
 test("a first-time subscriber gets the trial (no skip_trial in the checkout)", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
   // No prior subscription rows.
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   let sent: any = null;
   stubFetch(t, async (_url: string, init: any) => {
     sent = JSON.parse(init.body);
@@ -224,6 +303,15 @@ test("a first-time subscriber gets the trial (no skip_trial in the checkout)", a
 });
 
 test("a returning account whose subscription lapsed gets NO second trial", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
@@ -231,6 +319,7 @@ test("a returning account whose subscription lapsed gets NO second trial", async
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { status: "expired", validUntil: new Date(Date.now() - 86_400_000) },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   let sent: any = null;
   stubFetch(t, async (_url: string, init: any) => {
     sent = JSON.parse(init.body);
@@ -247,11 +336,20 @@ test("a returning account whose subscription lapsed gets NO second trial", async
 });
 
 test("a NEW account on a machine that already trialed gets NO trial (per-device)", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "fresh@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
   // Brand-new account: no subscription rows of its own…
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   // …but THIS MACHINE already has a trial claim.
   stubMethod(t, prisma.trialClaim as any, "findUnique", async () => ({ id: "claim-1" }));
   let sent: any = null;
@@ -272,10 +370,19 @@ test("a NEW account on a machine that already trialed gets NO trial (per-device)
 });
 
 test("the shared 'unidentified' device id is treated as no device (fail open)", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   // If this were consulted with the shared id, one machine would burn the trial
   // for all of them. It must NOT be consulted at all.
   let claimLookups = 0;
@@ -301,10 +408,20 @@ test("the shared 'unidentified' device id is treated as no device (fail open)", 
 });
 
 test("a variant id supplied by the caller is ignored", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
 
   let sent: any = null;
   stubFetch(t, async (_url: string, init: any) => {
@@ -322,11 +439,23 @@ test("a variant id supplied by the caller is ignored", async (t) => {
     .set(auth)
     .send({ plan: "monthly", variantId: "1", variant_id: "1", price: 0 });
 
-  assert.equal(res.status, 201);
+  assert.equal(res.status, 201, res.text);
   assert.equal(sent.data.relationships.variant.data.id, "1986433");
 });
 
 test("an unknown plan never reaches the provider", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubFetch(t, async () => {
     throw new Error("must not reach Lemon Squeezy");
@@ -341,11 +470,21 @@ test("an unknown plan never reaches the provider", async (t) => {
 // One plan being unconfigured must not take the others down with it — the usual
 // shape of this mistake is shipping the yearly id and forgetting the monthly.
 test("a missing id disables only its own plan", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   (env as any).lemonSqueezyVariantMonthly = "";
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => ({
     ok: true,
     status: 201,
@@ -362,12 +501,23 @@ test("a missing id disables only its own plan", async (t) => {
 // --- Buying what you already have --------------------------------------------
 
 test("a live subscription blocks a second subscription", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
-    { status: "active", validUntil: new Date(Date.now() + 30 * 86_400_000) },
+    { externalId: "77001", status: "active", validUntil: new Date(Date.now() + 30 * 86_400_000) },
   ]);
+  // Nothing owed at the provider — see `blocksNewRecurringCheckout`.
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => {
     throw new Error("must not reach Lemon Squeezy");
   });
@@ -379,12 +529,22 @@ test("a live subscription blocks a second subscription", async (t) => {
 
 // Refusing this would be refusing money from the best customer there is.
 test("a live subscription does NOT block the upgrade to lifetime", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { status: "on_trial", validUntil: new Date(Date.now() + 3 * 86_400_000) },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => ({
     ok: true,
     status: 201,
@@ -393,16 +553,26 @@ test("a live subscription does NOT block the upgrade to lifetime", async (t) => 
 
   const res = await request(app).post("/api/checkout").set(auth).send({ plan: "lifetime" });
 
-  assert.equal(res.status, 201);
+  assert.equal(res.status, 201, res.text);
 });
 
 test("a lapsed subscription does not block resubscribing", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { status: "expired", validUntil: new Date(Date.now() - 86_400_000) },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => ({
     ok: true,
     status: 201,
@@ -411,10 +581,21 @@ test("a lapsed subscription does not block resubscribing", async (t) => {
 
   const res = await request(app).post("/api/checkout").set(auth).send({ plan: "monthly" });
 
-  assert.equal(res.status, 201);
+  assert.equal(res.status, 201, res.text);
 });
 
 test("a lifetime licence blocks every plan, subscriptions included", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => ({ id: "purchase-1" }));
@@ -437,10 +618,20 @@ test("a lifetime licence blocks every plan, subscriptions included", async (t) =
  * variant was at fault.
  */
 test("a refusal from Lemon Squeezy reports what Lemon Squeezy said", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => ({
     ok: false,
     status: 404,
@@ -456,10 +647,20 @@ test("a refusal from Lemon Squeezy reports what Lemon Squeezy said", async (t) =
 });
 
 test("an unreadable refusal still fails cleanly, without the API key", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => ({
     ok: false,
     status: 502,
@@ -470,8 +671,12 @@ test("an unreadable refusal still fails cleanly, without the API key", async (t)
 
   const res = await request(app).post("/api/checkout").set(auth).send({ plan: "yearly" });
 
-  assert.equal(res.status, 400);
-  assert.match(res.body.error, /HTTP 502/);
+  // 503 AND AMBIGUOUS, not 400. A 502 means Lemon Squeezy may well have created
+  // the checkout and failed while telling us — so the account's acquisition lock
+  // is KEPT rather than released, and the customer is asked to wait instead of
+  // being handed a second payable link beside an invisible first one.
+  assert.equal(res.status, 503, res.text);
+  assert.equal(res.body.code, "CHECKOUT_STATE_UNCERTAIN");
   assert.ok(!JSON.stringify(res.body).includes("test-key"));
 });
 
@@ -498,6 +703,7 @@ function stubGraphMismatch(t: { after: (fn: () => void) => void }) {
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async (url: string) => {
     if (String(url).includes("/v1/variants")) {
       return {
@@ -523,6 +729,18 @@ function stubGraphMismatch(t: { after: (fn: () => void) => void }) {
 }
 
 test("a 404 names the variant id that would have worked", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   withTestMode(t, true);
   stubGraphMismatch(t);
@@ -536,6 +754,18 @@ test("a 404 names the variant id that would have worked", async (t) => {
 });
 
 test("the yearly plan resolves to the yearly variant, not the monthly one", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   withTestMode(t, true);
   stubGraphMismatch(t);
@@ -551,6 +781,17 @@ test("the yearly plan resolves to the yearly variant, not the monthly one", asyn
  * one would decide which product a customer's money runs through, silently.
  */
 test("an ambiguous match refuses to choose, and says so", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   withTestMode(t, true);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
@@ -586,6 +827,18 @@ test("an ambiguous match refuses to choose, and says so", async (t) => {
  * variable is meaningless to them and reads like the price is negotiable.
  */
 test("the operator hint never reaches a live storefront", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   withTestMode(t, false);
   stubGraphMismatch(t);
@@ -603,11 +856,21 @@ test("the operator hint never reaches a live storefront", async (t) => {
  * hint pointing at the variant would send someone to change a correct value.
  */
 test("a present variant produces no hint", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   withTestMode(t, true);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async (url: string) => {
     if (String(url).includes("/v1/variants")) {
       return {
@@ -632,11 +895,21 @@ test("a present variant produces no hint", async (t) => {
 
 /* A hint that cannot be produced must never turn a clear 400 into a 500. */
 test("an unreachable catalogue still fails as a clean 400", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   withTestMode(t, true);
   stubMethod(t, prisma.user as any, "findUnique", async () => ({ email: "user@example.com" }));
   stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async (url: string) => {
     if (String(url).includes("/v1/variants")) throw new Error("network down");
     return {
@@ -678,6 +951,7 @@ function confirmStubs(t: { after: (fn: () => void) => void }) {
   stubMethod(t, prisma.purchase as any, "findMany", async () => []);
   stubMethod(t, prisma.trialClaim as any, "findFirst", async () => null);
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   // The shared writers (recordPaidOrder / mirrorSubscriptionState) read the
   // existing row + the consumed-order tombstone before writing. Baseline: no
   // prior row, never consumed → the grant proceeds; the upsert just records it.
@@ -732,6 +1006,18 @@ function lsSubList(over: Record<string, unknown> = {}) {
 }
 
 test("confirming a paid subscription order mirrors the subscription and answers 200", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   confirmStubs(t);
   stubMethod(t, prisma.subscription as any, "updateMany", async () => ({ count: 0 }));
   stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
@@ -758,6 +1044,18 @@ test("confirming a paid subscription order mirrors the subscription and answers 
 });
 
 test("confirming a paid lifetime order records the purchase", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   confirmStubs(t);
   const upserts = stubMethod(t, prisma.purchase as any, "upsert", async (args: any) => args.create);
   stubFetch(t, async () => ({ ok: true, status: 200, json: async () => lsOrder() }));
@@ -776,6 +1074,18 @@ test("confirming a paid lifetime order records the purchase", async (t) => {
  * the buyer email Lemon Squeezy recorded, checked server-side.
  */
 test("someone else's order id reads as not found and writes nothing (no oracle)", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   confirmStubs(t);
   const upserts = stubMethod(t, prisma.purchase as any, "upsert", async (args: any) => args.create);
   const created = stubMethod(t, prisma.subscription as any, "create", async (args: any) => args.data);
@@ -795,6 +1105,18 @@ test("someone else's order id reads as not found and writes nothing (no oracle)"
 });
 
 test("a spent order cannot be re-confirmed after its account was deleted", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   confirmStubs(t);
   // Purchase gone (account deleted), but the consumption tombstone remains.
   stubMethod(t, prisma.purchase as any, "findUnique", async () => null);
@@ -809,6 +1131,18 @@ test("a spent order cannot be re-confirmed after its account was deleted", async
 });
 
 test("a pending order answers 409 so the app's bounded retry keeps trying", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   confirmStubs(t);
   stubFetch(t, async () => ({
     ok: true,
@@ -822,6 +1156,18 @@ test("a pending order answers 409 so the app's bounded retry keeps trying", asyn
 });
 
 test("a test-mode order is refused while the test gate is closed", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   confirmStubs(t);
   withTestMode(t, false);
   const upserts = stubMethod(t, prisma.purchase as any, "upsert", async (args: any) => args.create);
@@ -835,6 +1181,18 @@ test("a test-mode order is refused while the test gate is closed", async (t) => 
 
 /* Same words as a true 404: an id in someone else's store must not be confirmable as existing. */
 test("an order from a foreign store reads as not found", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   confirmStubs(t);
   stubFetch(t, async () => ({
     ok: true,
@@ -848,6 +1206,18 @@ test("an order from a foreign store reads as not found", async (t) => {
 });
 
 test("a non-numeric order id never reaches Lemon Squeezy", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   confirmStubs(t);
   let fetched = 0;
   stubFetch(t, async () => {
@@ -862,4 +1232,136 @@ test("a non-numeric order id never reaches Lemon Squeezy", async (t) => {
 
   assert.equal(res.status, 400);
   assert.equal(fetched, 0);
+});
+
+/* ── BUG T1-03 — /confirm after a price change ────────────────────────────
+ *
+ * The lifetime branch is chosen by `order.variantId === env.lemonSqueezyVariantId`
+ * and nothing else. Change the lifetime price in Lemon Squeezy and it mints a NEW
+ * variant id; every order placed on the OLD one then falls through to the
+ * subscription branch, finds no subscription, and 409s — for ever, for a customer
+ * who has paid.
+ *
+ * The webhook already reasons about exactly this (`isSellableOrder`, which calls
+ * an unknown non-subscription variant "far more likely OUR configuration than a
+ * foreign product"). This route had no equivalent.
+ */
+test("a lifetime order on a RETIRED variant id still activates", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
+  confirmStubs(t);
+  const upserts = stubMethod(t, prisma.purchase as any, "upsert", async (args: any) => args.create);
+  // The store, the buyer and the payment all check out. Only the id has moved on.
+  stubFetch(t, async () => ({
+    ok: true,
+    status: 200,
+    json: async () => lsOrder({ first_order_item: { product_id: 1254414, variant_id: 1700000 } }),
+  }));
+
+  const res = await request(app).post("/api/checkout/confirm").set(auth).send({ orderId: 777 });
+
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(upserts.length, 1, "the customer paid; a rotated id is our problem, not theirs");
+});
+
+/*
+ * The other side of the same coin: a KNOWN subscription variant must still take
+ * the subscription branch. Widening the lifetime test must not swallow these.
+ */
+test("a monthly order still takes the subscription branch, not the lifetime one", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
+  confirmStubs(t);
+  const upserts = stubMethod(t, prisma.purchase as any, "upsert", async (args: any) => args.create);
+  let call = 0;
+  stubFetch(t, async () => {
+    call += 1;
+    if (call === 1) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => lsOrder({ first_order_item: { product_id: 1270398, variant_id: 1986433 } }),
+      };
+    }
+    // The subscription lookup for that order.
+    return { ok: true, status: 200, json: async () => ({ data: [] }) };
+  });
+
+  const res = await request(app).post("/api/checkout/confirm").set(auth).send({ orderId: 777 });
+
+  assert.equal(upserts.length, 0, "a subscription order must never mint a lifetime Purchase");
+  assert.equal(res.status, 409, "no subscription yet — a conflict to retry, not a licence");
+});
+
+/* ── BUG T1-06 — /change-plan can be hammered ─────────────────────────────
+ *
+ * Unlike /cancel and /end-trial it never transitions into a state that refuses a
+ * repeat, and every upgrade leg PATCHes with `invoice_immediately: true`. The
+ * three sibling money routes (/checkout, /confirm, /portal) all carry a two-leg
+ * rate limit; this one carried none, so monthly<->yearly could be alternated as
+ * fast as the network allows.
+ */
+test("change-plan is rate limited like the other money routes", async (t) => {
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.acquisitionLock as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.acquisitionLock as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.acquisitionLock as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "create", async (a: any) => ({ id: "intent-1", ...a.data }));
+  stubMethod(t, prisma.checkoutIntent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma as any, "$transaction", async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn)));
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
+  configured(t);
+  const beforeRl = env.authRateLimitDisabled;
+  (env as any).authRateLimitDisabled = false;
+  t.after(() => {
+    (env as any).authRateLimitDisabled = beforeRl;
+  });
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+
+  // Observed through the throttle store the limiter actually writes to, rather
+  // than by patching the module: the route imports the binding directly, so a
+  // namespace patch never intercepts it and the test would pass on nothing.
+  const keys: string[] = [];
+  stubMethod(t, prisma.authThrottle as any, "updateMany", async (a: any) => {
+    if (a?.where?.key) keys.push(a.where.key);
+    return { count: 0 };
+  });
+  stubMethod(t, prisma.authThrottle as any, "upsert", async (a: any) => {
+    const k = a?.where?.key;
+    if (k) keys.push(k);
+    return {};
+  });
+  stubMethod(t, prisma.authThrottle as any, "findUnique", async () => null);
+
+  // The route 409s (no subscription) long before it would reach Lemon Squeezy;
+  // what is asserted is that a budget was consumed at all.
+  await request(app).post("/api/subscription/change-plan").set(auth).send({ plan: "yearly" });
+
+  assert.ok(
+    keys.some((k) => k.startsWith("change-plan:")),
+    `no rate-limit budget was consumed (saw: ${JSON.stringify(keys)})`,
+  );
 });

@@ -5,11 +5,12 @@ import { env, variantGate } from "../lib/env";
 import { asyncHandler } from "../middleware/async-handler";
 import { requireAdmin } from "../middleware/admin-auth";
 import { resolveAndCache } from "./entitlement";
-import { hideTestRowsFor } from "../lib/subscription";
+import { hideTestRowsFor, isCurrentTrial, isLiveUnpaidTrial } from "../lib/subscription";
 import {
   MAX_ATTEMPTS,
   drainCancels,
   enqueueAndAttemptCancel,
+  queueCancelAndRevokeTrial,
   replayTask,
 } from "../lib/billing-tasks";
 
@@ -48,6 +49,14 @@ import {
  * plans need an end date cannot drift from the rule about which plans grant.
  */
 const GRANTING_PLANS = GRANTING_PLAN_NAMES;
+
+/**
+ * Plan names that mean "take the complimentary grant away".
+ *
+ * Explicit, so that anything belonging to NEITHER set is an error rather than a
+ * silent revocation — see the check in POST /users/:id/plan.
+ */
+const WITHDRAWING_PLANS = new Set(["free", "none", "expired", "revoked"]);
 
 export const adminRouter = Router();
 
@@ -307,7 +316,20 @@ adminRouter.post(
     // grant `computeEntitlement` reads — and the response carries the RESOLVED
     // entitlement rather than the row we just wrote, so the console cannot show
     // a state the resolver disagrees with.
-    const grants = GRANTING_PLANS.has(plan.toLowerCase());
+    // AN UNKNOWN PLAN NAME IS REFUSED, not quietly treated as "withdraw".
+    //
+    // The console's dropdown offers "trial" while the backend spells the granting
+    // status "trialing" — so picking it validated cleanly, skipped the end-date
+    // requirement, and wrote compActive:false. The operator read that as "give
+    // them a trial"; it REVOKED their grant, and looked like success.
+    const wanted = plan.toLowerCase();
+    const grants = GRANTING_PLANS.has(wanted);
+    if (!grants && !WITHDRAWING_PLANS.has(wanted)) {
+      throw badRequest(
+        `Unknown plan "${plan}". Grant one of: ${[...GRANTING_PLANS].join(", ")}. ` +
+          `To withdraw a grant use: ${[...WITHDRAWING_PLANS].join(", ")}.`,
+      );
+    }
     await prisma.user.update({
       where: { id: req.params.id },
       data: grants
@@ -437,13 +459,13 @@ adminRouter.get(
 
     const [pending, deadLetter] = await Promise.all([
       prisma.billingTask.findMany({
-        where: { doneAt: null, attempts: { lt: MAX_ATTEMPTS } },
+        where: { attempts: { lt: MAX_ATTEMPTS }, OR: [{ doneAt: null }, { doneAt: { isSet: false } }] },
         orderBy: { nextAttemptAt: "asc" },
         take: 100,
         select: columns,
       }),
       prisma.billingTask.findMany({
-        where: { doneAt: null, attempts: { gte: MAX_ATTEMPTS } },
+        where: { attempts: { gte: MAX_ATTEMPTS }, OR: [{ doneAt: null }, { doneAt: { isSet: false } }] },
         orderBy: { createdAt: "asc" },
         take: 100,
         select: columns,
@@ -821,12 +843,66 @@ adminRouter.post(
     // id in the body can never reach a subscription that is not this user's.
     const sub = await prisma.subscription.findFirst({
       where: { userId: user.id, provider: "lemonsqueezy", externalId },
-      select: { externalId: true, status: true },
+      select: { id: true, externalId: true, status: true, trialEndsAt: true, trialCancelledAt: true },
     });
     if (!sub) throw notFound("No such subscription on this account");
     if (sub.status === "cancelled" || sub.status === "expired") {
       throw conflict(`Subscription is already ${sub.status}`);
     }
+
+    // CANCELLING A TRIAL ENDS ACCESS AT ONCE, and that rule is armed by the
+    // `trialCancelledAt` tombstone `subscriptionGrants` reads. The webhook writes
+    // it, and so does the customer's own /cancel — this route wrote neither, so
+    // an operator cancelling a trial left the customer with access until a
+    // delivery happened to arrive. On the queued path there is no delivery
+    // coming at all, and the trial would have run its full window for free.
+    //
+    // Set-once, and never on a paid subscription: the window must still be open,
+    // which is the same test the predicate itself applies.
+    // TWO questions, deliberately separate.
+    //
+    // `cancellingALiveTrial` — is there still a tombstone to write? False on a
+    // retry, because the first call already wrote one.
+    //
+    // `isTrialRow` — is this row a trial at all? Still TRUE on that retry, which
+    // is what lets the response keep saying `entitlementRevoked: true` instead of
+    // reclassifying an already-revoked trial as a non-trial and reporting that
+    // nothing was cut off.
+    const cancellingALiveTrial = isLiveUnpaidTrial(sub);
+    const isTrialRow = isCurrentTrial(sub);
+
+    /**
+     * Write the tombstone, and THROW if it does not land.
+     *
+     * This used to end in `.catch(e => console.error(...))`, which turned a
+     * failed security write into an HTTP 200: Lemon Squeezy had cancelled, our
+     * own revocation had not, and the operator was told the job was done. A
+     * write that decides access cannot be best-effort — the caller must learn
+     * that the two halves disagree.
+     */
+    const markTrialCancelled = async (): Promise<void> => {
+      if (!cancellingALiveTrial) return;
+      await prisma.subscription.updateMany({
+        where: {
+          id: sub.id,
+          OR: [{ trialCancelledAt: null }, { trialCancelledAt: { isSet: false } }],
+        },
+        data: { trialCancelledAt: new Date() },
+      });
+    };
+
+    /** Honest when only half of it worked. */
+    const revocationFailed = (providerCancelled: boolean, queued: boolean, e: unknown): never => {
+      console.error("[admin] cancellation recorded at the provider but NOT revoked locally:", e);
+      throw new HttpError(
+        503,
+        "The subscription was actioned at the payment provider, but access could not be revoked here. Retry.",
+        {
+          code: "REVOCATION_NOT_PERSISTED",
+          details: { providerCancelled, queued, entitlementRevoked: false },
+        },
+      );
+    };
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), LS_TIMEOUT_MS);
@@ -844,7 +920,32 @@ adminRouter.post(
     } catch (err) {
       // Never echo the failure verbatim: the request carried the API key.
       console.error("[admin] Lemon Squeezy unreachable:", err instanceof Error ? err.message : err);
-      throw badRequest("Could not reach the payment provider. Please try again.");
+      // NOT simply a 400. Deleting a user through this console enqueues the
+      // cancellation so a provider outage postpones it instead of losing it
+      // (see DELETE /users/:id); this route used to throw and remember nothing,
+      // so an operator who pressed Cancel during an outage left the customer
+      // being charged with no record that anyone had tried.
+      // 202 ACCEPTED, not 400. The instruction was understood and durably
+      // recorded; only the provider is late. A 400 tells the caller their
+      // request was invalid — about a request we accepted — and forced the
+      // console to read an English sentence to find out whether a customer's
+      // renewal had actually stopped. The status code is the contract.
+      // ONE transaction. Owing the cancellation and revoking the trial are the
+      // two halves of the 202 promise; separately, a failure between them left
+      // either a task nobody revoked for or a revoked customer nothing would
+      // ever cancel. If it does not commit, nothing is claimed.
+      try {
+        await queueCancelAndRevokeTrial({
+          externalId: sub.externalId,
+          reason: "admin-cancel",
+          subscriptionId: cancellingALiveTrial ? sub.id : null,
+        });
+      } catch (e) {
+        revocationFailed(false, false, e);
+      }
+      await audit(req, "cancel_subscription", user.id, reason, { externalId, status: sub.status }, { cancelled: false, queued: true });
+      res.status(202).json({ cancelled: false, queued: true, entitlementRevoked: isTrialRow });
+      return;
     } finally {
       clearTimeout(timer);
     }
@@ -852,6 +953,27 @@ adminRouter.post(
     if (!response.ok) {
       const why = await readLemonSqueezyError(response);
       console.error(`[admin] cancel ${sub.externalId} failed: HTTP ${response.status} — ${why}`);
+      // Same reasoning as the unreachable branch above: a 5xx or a rate limit
+      // from Lemon Squeezy is a "come back later", not a decision.
+      if (response.status === 429 || response.status >= 500) {
+        // Same reasoning: "come back later" is not a client error — and the
+        // same two writes as the unreachable branch. This branch used to queue
+        // the provider call and answer `entitlementRevoked: true` while writing
+        // NO tombstone, so the response told an operator access had stopped
+        // while the trial went on granting for the rest of its window.
+        try {
+          await queueCancelAndRevokeTrial({
+            externalId: sub.externalId,
+            reason: "admin-cancel",
+            subscriptionId: cancellingALiveTrial ? sub.id : null,
+          });
+        } catch (e) {
+          revocationFailed(false, false, e);
+        }
+        await audit(req, "cancel_subscription", user.id, reason, { externalId, status: sub.status }, { cancelled: false, queued: true });
+        res.status(202).json({ cancelled: false, queued: true, entitlementRevoked: isTrialRow });
+        return;
+      }
       throw badRequest(`Could not cancel the subscription — ${why}`);
     }
 
@@ -863,12 +985,35 @@ adminRouter.post(
       /* the cancellation still happened */
     }
 
+    // THE TOMBSTONE FIRST, THE AUDIT SECOND — and the order is the point.
+    //
+    // Written the other way round, a failed revocation answered 503
+    // REVOCATION_NOT_PERSISTED while leaving behind an audit row that said the
+    // subscription was cancelled. The operator was told the write did not land;
+    // the log said it did. An audit that can contradict the response it belongs
+    // to is worse than no audit, because it is the record people trust later.
+    try {
+      await markTrialCancelled();
+    } catch (e) {
+      revocationFailed(true, false, e);
+    }
+
     await audit(req, "cancel_subscription", user.id, reason, { externalId, status: sub.status }, {
       status: "cancelled",
       endsAt,
     });
 
-    res.status(202).json({ ok: true, endsAt });
+    // 200 with a STRUCTURED result: the provider confirmed, nothing is owed.
+    // 202 is reserved for "accepted, still to do" — conflating the two is what
+    // made the console read prose to find out what had happened.
+    res.status(200).json({
+      cancelled: true,
+      queued: false,
+      // Explicit, so the console never has to infer whether access actually
+      // stopped: a paid subscription keeps its period, a trial does not.
+      entitlementRevoked: isTrialRow,
+      endsAt,
+    });
   }),
 );
 

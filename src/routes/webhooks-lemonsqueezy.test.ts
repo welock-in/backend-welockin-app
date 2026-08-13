@@ -751,8 +751,18 @@ function subBody(over: Record<string, any> = {}) {
         // while any variant granted, and misleading the moment that stopped
         // being true. Tests about unknown variants say so explicitly instead.
         variant_id: 1986433,
-        trial_ends_at: "2026-08-11T10:00:00.000Z",
-        renews_at: "2026-08-11T10:00:00.000Z",
+        // RELATIVE, not a hardcoded instant. These were "2026-08-11T10:00:00Z",
+        // which stopped being in the future at 10:00 UTC on that day — and the
+        // suite went red mid-session for no reason connected to any change.
+        //
+        // It matters because `validUntilFrom` reads `renews_at` for an active
+        // subscription: once it is in the past, `subscriptionGrants` answers
+        // false, `granting` is false, and the test-mode gate below
+        // (`testMode && !allowTestMode && granting`) never fires. The test then
+        // asserts a skip that could no longer happen. A fixture that expires
+        // does not test less over time; it tests something else.
+        trial_ends_at: new Date(Date.now() + 7 * 86_400_000).toISOString(),
+        renews_at: new Date(Date.now() + 7 * 86_400_000).toISOString(),
         ends_at: null,
         updated_at: "2026-08-04T10:00:00.000Z",
         test_mode: false,
@@ -1394,13 +1404,18 @@ test("a cancelled trial is tombstoned even when its delivery arrives late", asyn
     }),
   );
 
-  const tombstone = writes.find((w) => w.data?.trialCancelledAt && w.where?.trialCancelledAt === null);
-  assert.ok(tombstone, "the tombstone is written on its own, outside the staleness guard");
-  assert.equal(
-    tombstone.where.trialCancelledAt,
-    null,
-    "set-once: a second delivery cannot move the timestamp",
+  const tombstone = writes.find(
+    (w) => w.data?.trialCancelledAt && Array.isArray(w.where?.OR),
   );
+  assert.ok(tombstone, "the tombstone is written on its own, outside the staleness guard");
+  // Set-once, and tolerant of BOTH shapes MongoDB can hold: a row written before
+  // the column existed has no key at all (`isSet: false`), while a row written
+  // since holds an explicit null. Matching only `null` meant the tombstone was
+  // never written on any pre-existing subscription — found by the real-MongoDB
+  // suite, invisible to a double.
+  const shapes = JSON.stringify(tombstone.where.OR);
+  assert.match(shapes, /"trialCancelledAt":null/, "an explicit null must match");
+  assert.match(shapes, /"isSet":false/, "and so must a field that was never written");
 });
 
 /*

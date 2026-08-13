@@ -3,13 +3,18 @@ import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import {
   hideTestRowsFor,
+  planEligibility,
   subscriptionGrants,
   subscriptionIsLive,
   variantForPlan,
 } from "../lib/subscription";
+import { cancellationStates } from "../lib/billing-tasks";
+import { outstandingAcquisition } from "../lib/checkout-intent";
+import { isReliableDeviceId, readDeviceId } from "../lib/device";
+import { ledgerHash } from "../lib/hash";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
-import { badRequest, conflict } from "../lib/http-error";
+import { badRequest, conflict, HttpError } from "../lib/http-error";
 import { readLemonSqueezyError } from "../lib/lemonsqueezy";
 import { changePlanSchema } from "../validation/schemas";
 import { clientIp, consumeRateLimit } from "../lib/rate-limit";
@@ -176,6 +181,8 @@ subscriptionRouter.get(
         ...hideTestRowsFor(userId, env),
       },
       select: {
+        // Needed to ask the outbox how far this row's cancellation got.
+        externalId: true,
         status: true,
         interval: true,
         validUntil: true,
@@ -200,7 +207,53 @@ subscriptionRouter.get(
     // a screen with no cancel button on a card that is still being charged.
     const live = subs.find(subscriptionIsLive) ?? null;
 
+    // WHETHER THIS ACCOUNT MAY BUY, per plan, as codes the client branches on.
+    //
+    // Deliberately not derivable from the fields above, and deliberately not one
+    // verdict for the whole account. A customer on a live monthly plan may not
+    // buy yearly — Change plan is the route — yet may buy lifetime, and a single
+    // `canPurchase` has to be wrong about one of them. "Your cancellation is
+    // still being confirmed" and "you already have a subscription" are different
+    // screens with different buttons too. The desktop used to infer all of this
+    // by matching an English sentence out of a 409.
+    //
+    // Computed by the SAME function the checkout enforces, so this cannot
+    // advertise a purchase that the next request refuses for another reason.
+    const rawDeviceId = readDeviceId(req);
+    const deviceId = isReliableDeviceId(rawDeviceId) ? rawDeviceId : "";
+    const [cancellations, ownedLifetime, deviceClaim, outstanding] = await Promise.all([
+      cancellationStates(subs.map((sub) => sub.externalId)),
+      prisma.purchase.findFirst({
+        where: { userId, isRefunded: false, ...hideTestRowsFor(userId, env) },
+        select: { id: true },
+      }),
+      deviceId
+        ? prisma.trialClaim.findUnique({
+            where: { deviceIdHash: ledgerHash(deviceId) },
+            select: { id: true },
+          })
+        : Promise.resolve(null),
+      outstandingAcquisition(userId),
+    ]);
+
     res.json({
+      purchaseEligibility: planEligibility({
+        subs,
+        cancellations,
+        ownsLifetime: ownedLifetime != null,
+        deviceHadTrial: deviceClaim != null,
+        trialDays: {
+          monthly: env.lemonSqueezyTrialDaysMonthly,
+          yearly: env.lemonSqueezyTrialDaysYearly,
+        },
+        outstanding: outstanding
+          ? {
+              plan: outstanding.plan,
+              state: outstanding.state,
+              resumable: outstanding.state === "ready" && outstanding.checkoutUrl != null,
+            }
+          : null,
+      }),
       subscription: live && {
         status: live.status,
         interval: live.interval,
@@ -549,7 +602,17 @@ subscriptionRouter.post(
       (sub) => sub.status === "cancelled" && subscriptionGrants(sub, now),
     );
     if (!resumable) {
-      throw conflict("There is no cancelled subscription to reactivate on this account.");
+      // A STABLE CODE, not just prose. Every reason a resume is refused lands
+      // here — no cancelled row, a window that already closed, a variant we no
+      // longer sell, and the one that matters most: a trial an operator revoked,
+      // which `subscriptionGrants` keeps out of this filter via the tombstone. A
+      // console that has to string-match the sentence to tell those apart breaks
+      // the day someone rewords it.
+      throw new HttpError(
+        409,
+        "There is no cancelled subscription to reactivate on this account.",
+        { code: "SUBSCRIPTION_NOT_REACTIVATABLE" },
+      );
     }
 
     const controller = new AbortController();
@@ -654,6 +717,13 @@ subscriptionRouter.post(
     }
 
     const userId = req.user!.id;
+    // The only money route here with no self-limiting state: /cancel and
+    // /end-trial each 409 on a second call, but monthly<->yearly can be
+    // alternated for ever — and every upgrade leg PATCHes with
+    // `invoice_immediately: true`. Same two-leg cap as /checkout and /portal.
+    await consumeRateLimit(`change-plan:${userId}`, 10, 5 * 60_000);
+    await consumeRateLimit(`change-plan:ip:${clientIp(req)}`, 30, 5 * 60_000);
+
     const subs = await prisma.subscription.findMany({
       where: { userId, provider: PROVIDER, ...hideTestRowsFor(userId, env) },
       select: {

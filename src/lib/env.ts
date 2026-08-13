@@ -320,6 +320,22 @@ export const env = {
    * would have failed OPEN into a free-licence tap.
    */
   lemonSqueezyAllowTestMode: process.env.LEMONSQUEEZY_ALLOW_TEST_MODE === "true",
+  /**
+   * How long the trial on each recurring variant runs, in days.
+   *
+   * CONFIGURED IN LEMON SQUEEZY, mirrored here — this side does not create the
+   * trial, the variant does. It is duplicated on purpose: the paywall has to say
+   * "3 days free" before a checkout exists, and asking the provider on every
+   * status read would put a network call on a screen that must render offline.
+   *
+   * The cost of the duplication is that changing the variant in the dashboard
+   * without changing this makes the paywall lie about the length. That is a
+   * copy error, not an entitlement error — nothing here decides who gets a
+   * trial, only what number is printed next to it.
+   */
+  lemonSqueezyTrialDaysMonthly: intFromEnv("LEMONSQUEEZY_TRIAL_DAYS_MONTHLY", 3),
+  lemonSqueezyTrialDaysYearly: intFromEnv("LEMONSQUEEZY_TRIAL_DAYS_YEARLY", 7),
+
 
   // --- RevenueCat (iOS: StoreKit subscriptions + lifetime) --------------------
   /**

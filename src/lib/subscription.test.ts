@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
-import { test, type TestContext } from "node:test";
-import { subscriptionGrants, validUntilFrom } from "./subscription";
+import { describe, it, test, type TestContext } from "node:test";
+import {
+  isCurrentTrial,
+  isLiveUnpaidTrial,
+  subscriptionGrants,
+  validUntilFrom,
+} from "./subscription";
 import { env } from "./env";
 
 /** Patch env for one test, restored afterwards. */
@@ -30,7 +35,7 @@ const EARLIER = new Date("2026-07-01T00:00:00.000Z");
  * they already paid for. Reading `cancelled` as "no access" takes the product
  * away from someone who has paid through the end of the month.
  */
-test("a cancelled subscription still grants until the paid period ends", () => {
+test("a cancelled subscription still grants until the current access period ends", () => {
   assert.equal(subscriptionGrants({ status: "cancelled", validUntil: LATER }, NOW), true);
   assert.equal(subscriptionGrants({ status: "cancelled", validUntil: EARLIER }, NOW), false);
 });
@@ -546,4 +551,84 @@ test("paused in 'void' mode suspends access; 'free' mode keeps it", () => {
     true,
     "a stale pause mode on a subscription that is no longer paused decides nothing",
   );
+});
+
+/**
+ * What the status can and cannot tell us.
+ *
+ * These seven rows are the ones that got confused. The trap is `active`: it does
+ * NOT prove money was collected — a 100% discount coupon, a free plan and a
+ * manual provider adjustment all produce exactly the same string. Nothing here
+ * claims a customer paid, because nothing here can: that answer lives in the
+ * payment records, not in a subscription status. The only claim these predicates
+ * make is whether Lemon Squeezy says a trial is running right now.
+ */
+describe("trial classification", () => {
+  const now = new Date("2026-08-11T12:00:00.000Z");
+  const future = new Date("2026-08-14T12:00:00.000Z");
+  const past = new Date("2026-08-08T12:00:00.000Z");
+
+  const cases: Array<{
+    name: string;
+    sub: { status: string; trialEndsAt: Date | null; trialCancelledAt: Date | null };
+    isTrial: boolean;
+    isLive: boolean;
+  }> = [
+    {
+      name: "on_trial, future end, no tombstone — the live trial",
+      sub: { status: "on_trial", trialEndsAt: future, trialCancelledAt: null },
+      isTrial: true,
+      isLive: true,
+    },
+    {
+      name: "on_trial, future end, ALREADY tombstoned — still a trial, nothing left to revoke",
+      sub: { status: "on_trial", trialEndsAt: future, trialCancelledAt: past },
+      isTrial: true, // a retry must not reclassify it
+      isLive: false, // but must not write a second timestamp
+    },
+    {
+      name: "active with a future trial_ends_at — converted early, the date is stale",
+      sub: { status: "active", trialEndsAt: future, trialCancelledAt: null },
+      isTrial: false,
+      isLive: false,
+    },
+    {
+      name: "active on a 100% discount — active, and NOT evidence of a payment",
+      sub: { status: "active", trialEndsAt: null, trialCancelledAt: null },
+      isTrial: false,
+      isLive: false,
+    },
+    {
+      name: "on_trial whose window has already closed",
+      sub: { status: "on_trial", trialEndsAt: past, trialCancelledAt: null },
+      isTrial: false,
+      isLive: false,
+    },
+    {
+      name: "cancelled, tombstoned — the trial that was stopped",
+      sub: { status: "cancelled", trialEndsAt: future, trialCancelledAt: past },
+      isTrial: false,
+      isLive: false,
+    },
+    {
+      name: "cancelled subscription that never was a trial",
+      sub: { status: "cancelled", trialEndsAt: null, trialCancelledAt: null },
+      isTrial: false,
+      isLive: false,
+    },
+  ];
+
+  for (const c of cases) {
+    it(c.name, () => {
+      assert.equal(isCurrentTrial(c.sub, now), c.isTrial, "isCurrentTrial");
+      assert.equal(isLiveUnpaidTrial(c.sub, now), c.isLive, "isLiveUnpaidTrial");
+    });
+  }
+
+  it("a tombstone changes what is left to do, never what the row IS", () => {
+    const running = { status: "on_trial", trialEndsAt: future, trialCancelledAt: null };
+    const revoked = { ...running, trialCancelledAt: past };
+    assert.equal(isCurrentTrial(running, now), isCurrentTrial(revoked, now));
+    assert.notEqual(isLiveUnpaidTrial(running, now), isLiveUnpaidTrial(revoked, now));
+  });
 });

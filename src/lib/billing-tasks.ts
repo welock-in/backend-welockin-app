@@ -1,5 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
+import type { CancellationState } from "./subscription";
 import { env } from "./env";
 
 /**
@@ -54,6 +55,24 @@ export function backoffMs(attempts: number): number {
   return Math.min(5 * 60_000 * 2 ** attempts, 24 * 60 * 60_000);
 }
 
+
+/**
+ * "This field is empty" — on MongoDB that is TWO different documents.
+ *
+ * Prisma does not store an optional field that has no value, so a freshly
+ * created task has no `doneAt` key at all, and `where: { doneAt: null }` matches
+ * NOTHING. Every query in this file filtered that way, which meant the drain
+ * found no work, the claim claimed nothing, and replay matched nothing — an
+ * outbox that recorded cancellations perfectly and never sent one. The unit
+ * tests missed it because an in-memory double treats absent and null alike;
+ * only a real MongoDB tells you the difference.
+ *
+ * Both shapes are accepted: rows created before the explicit-null write below,
+ * and rows created after it.
+ */
+const empty = (field: "doneAt" | "lockedAt") =>
+  [{ [field]: null }, { [field]: { isSet: false } }] as Prisma.BillingTaskWhereInput[];
+
 const key = (externalId: string) => ({
   provider_externalId_kind: { provider: PROVIDER, externalId, kind: "cancel" },
 });
@@ -88,7 +107,9 @@ export async function enqueueCancel(externalId: string, reason: string): Promise
     if (!existing) {
       try {
         await prisma.billingTask.create({
-          data: { provider: PROVIDER, externalId, kind: "cancel", reason },
+          // Explicit nulls: without them MongoDB simply omits the keys and
+          // every "still owed" query below would skip this row for ever.
+          data: { provider: PROVIDER, externalId, kind: "cancel", reason, doneAt: null, lockedAt: null, lastError: null },
         });
       } catch (e) {
         // ONLY the race is swallowed. A bare catch here hid every transient
@@ -173,8 +194,10 @@ async function claim(taskId: string): Promise<boolean> {
   const claimed = await prisma.billingTask.updateMany({
     where: {
       id: taskId,
-      doneAt: null,
-      OR: [{ lockedAt: null }, { lockedAt: { lt: stale } }],
+      AND: [
+        { OR: empty("doneAt") },
+        { OR: [...empty("lockedAt"), { lockedAt: { lt: stale } }] },
+      ],
     },
     data: { lockedAt: new Date() },
   });
@@ -246,6 +269,176 @@ export async function runCancel(task: {
  * subscription nobody can find again), while the lifetime grant must proceed
  * regardless, because the money is already taken.
  */
+/**
+ * Owe a cancellation AND revoke the trial, atomically.
+ *
+ * Two writes that must not exist apart. The queued path answers 202 — "accepted,
+ * we will carry it out" — and that promise has two halves: the provider call is
+ * durably owed, and the customer's trial access has stopped. Written separately,
+ * a failure between them left either a task nobody revoked for, or a revoked
+ * customer whose cancellation nothing would ever send.
+ *
+ * MongoDB gives us this only because the deployment is a replica set (see the QA
+ * harness, which starts one for exactly this reason). The PROVIDER call stays
+ * outside — an HTTP request cannot be rolled back, and pretending otherwise
+ * would be worse than not having a transaction at all.
+ *
+ * Returns nothing and throws on failure: the caller must not answer 202 unless
+ * this resolved.
+ */
+/**
+ * Is this the database telling us two requests collided, or is it telling us
+ * something is wrong?
+ *
+ * The distinction is the whole safety of the retry. Replaying a genuine
+ * collision is correct — the work IS recorded, by the other request. Replaying a
+ * validation failure, a bad connection string or a schema mismatch just does the
+ * same broken thing again and turns one clear error into a slower one.
+ *
+ * So this allowlists, never denylists: an error nobody here recognised is not a
+ * race, and it propagates.
+ *
+ * The three shapes, all observed rather than assumed — `billing.mongo.test.ts`
+ * races two real transactions against a real replica set and asserts THIS
+ * function returns true for whatever the driver actually raised:
+ *
+ *   · P2002 — our unique index on (provider, externalId, kind) rejected the
+ *     loser's insert. The ordinary outcome of two operators clicking together.
+ *   · P2034 — Prisma's own "transaction conflicted, retry it" code.
+ *   · TransientTransactionError / UnknownTransactionCommitResult — MongoDB's own
+ *     retryable labels, which the driver attaches to the error rather than
+ *     encoding in a code. Mongo documents both as safe to replay whole.
+ */
+export function isRetryableRaceError(e: unknown): boolean {
+  if (e instanceof Prisma.PrismaClientKnownRequestError) {
+    // P2002: unique constraint. P2034: transaction write conflict / deadlock.
+    return e.code === "P2002" || e.code === "P2034";
+  }
+  const labels = (e as { errorLabels?: unknown })?.errorLabels;
+  if (Array.isArray(labels)) {
+    return labels.some(
+      (l) => l === "TransientTransactionError" || l === "UnknownTransactionCommitResult",
+    );
+  }
+  // Prisma wraps driver errors in an untyped message on some paths; the labels
+  // survive as text. Narrow and last-resort on purpose.
+  const msg = e instanceof Error ? e.message : "";
+  return /TransientTransactionError|WriteConflict|UnknownTransactionCommitResult/.test(msg);
+}
+
+/**
+ * How many times a collision may be replayed before we stop believing it is one.
+ *
+ * Bounded, and small. Two operators colliding resolves on the first replay,
+ * because the replay reads the winner's row and takes the no-insert path. A
+ * third identical failure is evidence of something that is not a race, and
+ * looping on it would turn a broken deploy into a busy loop against the
+ * database — the failure mode that takes the whole service down instead of one
+ * request.
+ */
+const MAX_RACE_REPLAYS = 2;
+
+/**
+ * How far each of these subscriptions' cancellations has got.
+ *
+ * One query for the whole set, because the caller is deciding a checkout and a
+ * per-row round trip is a per-row round trip on the paywall. An id with no row
+ * is deliberately ABSENT from the result rather than mapped to something: the
+ * caller reads a missing entry as "none", which is the honest meaning — nothing
+ * was ever owed, because the provider answered on the spot.
+ */
+export async function cancellationStates(
+  externalIds: string[],
+): Promise<Map<string, CancellationState>> {
+  const out = new Map<string, CancellationState>();
+  if (externalIds.length === 0) return out;
+
+  const rows = await prisma.billingTask.findMany({
+    where: { provider: PROVIDER, kind: "cancel", externalId: { in: externalIds } },
+    select: { externalId: true, doneAt: true, attempts: true },
+  });
+
+  for (const row of rows) {
+    // `doneAt` is the same absent-vs-null shape as everywhere else in this file:
+    // a field Prisma never wrote does not exist on the document, so `== null`
+    // (loose, catching undefined too) is the only test that sees both.
+    const settled = row.doneAt != null;
+    out.set(
+      row.externalId,
+      settled
+        ? "settled"
+        : row.attempts >= MAX_ATTEMPTS
+          ? "dead_lettered"
+          : "pending",
+    );
+  }
+  return out;
+}
+
+export async function queueCancelAndRevokeTrial(input: {
+  externalId: string;
+  reason: string;
+  subscriptionId: string | null;
+}): Promise<void> {
+  // Two operators pressed Cancel at the same instant: both read "no task yet",
+  // both inserted, and the unique index rejected the loser. That collision means
+  // someone else already recorded the work — success, not a 500. The replay
+  // re-reads, finds the winner's row, and takes the no-insert path.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await queueCancelAndRevokeTrialOnce(input);
+      return;
+    } catch (e) {
+      // Retried WHOLE rather than caught inside the transaction: MongoDB aborts
+      // a transaction on a failed write, so anything after an internal catch
+      // would run in a dead session and silently commit nothing.
+      if (attempt >= MAX_RACE_REPLAYS || !isRetryableRaceError(e)) throw e;
+    }
+  }
+}
+
+async function queueCancelAndRevokeTrialOnce(input: {
+  externalId: string;
+  reason: string;
+  subscriptionId: string | null;
+}): Promise<void> {
+  await prisma.$transaction(async (tx) => {
+    const existing = await tx.billingTask.findUnique({
+      where: key(input.externalId),
+      select: { id: true, doneAt: true },
+    });
+    if (!existing) {
+      await tx.billingTask.create({
+        data: {
+          provider: PROVIDER,
+          externalId: input.externalId,
+          kind: "cancel",
+          reason: input.reason,
+          doneAt: null,
+          lockedAt: null,
+          lastError: null,
+        },
+      });
+    } else if (existing.doneAt) {
+      // Settled once, owed again — the same reasoning as `enqueueCancel`.
+      await tx.billingTask.update({
+        where: { id: existing.id },
+        data: { doneAt: null, attempts: 0, lastError: null, lockedAt: null, nextAttemptAt: new Date() },
+      });
+    }
+    // Set-once: a retry must not move the first revocation's timestamp.
+    if (input.subscriptionId) {
+      await tx.subscription.updateMany({
+        where: {
+          id: input.subscriptionId,
+          OR: [{ trialCancelledAt: null }, { trialCancelledAt: { isSet: false } }],
+        },
+        data: { trialCancelledAt: new Date() },
+      });
+    }
+  });
+}
+
 export async function enqueueAndAttemptCancel(externalId: string, reason: string): Promise<boolean> {
   const recorded = await enqueueCancel(externalId, reason);
   try {
@@ -295,10 +488,12 @@ export async function drainCancels(limit = 25): Promise<DrainReport> {
   const due = await prisma.billingTask.findMany({
     where: {
       kind: "cancel",
-      doneAt: null,
       nextAttemptAt: { lte: now },
       attempts: { lt: MAX_ATTEMPTS },
-      OR: [{ lockedAt: null }, { lockedAt: { lt: stale } }],
+      AND: [
+        { OR: empty("doneAt") },
+        { OR: [...empty("lockedAt"), { lockedAt: { lt: stale } }] },
+      ],
     },
     orderBy: { nextAttemptAt: "asc" },
     take: limit,
@@ -318,9 +513,9 @@ export async function drainCancels(limit = 25): Promise<DrainReport> {
   }
 
   const [stillOwed, deadLettered] = await Promise.all([
-    prisma.billingTask.count({ where: { kind: "cancel", doneAt: null } }),
+    prisma.billingTask.count({ where: { kind: "cancel", OR: empty("doneAt") } }),
     prisma.billingTask.count({
-      where: { kind: "cancel", doneAt: null, attempts: { gte: MAX_ATTEMPTS } },
+      where: { kind: "cancel", attempts: { gte: MAX_ATTEMPTS }, OR: empty("doneAt") },
     }),
   ]);
 
@@ -344,7 +539,7 @@ export async function drainCancels(limit = 25): Promise<DrainReport> {
  */
 export async function replayTask(id: string): Promise<boolean> {
   const updated = await prisma.billingTask.updateMany({
-    where: { id, doneAt: null },
+    where: { id, OR: empty("doneAt") },
     data: { attempts: 0, lastError: null, lockedAt: null, nextAttemptAt: new Date() },
   });
   return updated.count === 1;

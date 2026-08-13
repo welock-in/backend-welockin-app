@@ -1,6 +1,7 @@
 import { Router, type Request } from "express";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
+import { completeIntent, intentByToken } from "../lib/checkout-intent";
 import { env } from "../lib/env";
 import { LIFETIME_PRODUCT_ID } from "../lib/entitlement";
 import { asyncHandler } from "../middleware/async-handler";
@@ -211,6 +212,8 @@ async function handle(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
     console.warn(`[lemonsqueezy] unmatched order ${order.orderId}`);
     return { status: "failed", reason: `no account matches order ${order.orderId}` };
   }
+
+  await closeCheckoutIntent(body, userId);
 
   const wrote = await recordPaidOrder(order, userId, body as Prisma.InputJsonValue);
   if (wrote === "already-consumed") {
@@ -553,6 +556,62 @@ async function markEvent(eventKey: string, status: string, error?: string): Prom
   return markWebhookEvent(PROVIDER, eventKey, status, error);
 }
 
+
+/**
+ * A payment landed — close the checkout intent that minted it.
+ *
+ * PLACED BEFORE the state mirror on purpose. A redelivery, or an event the
+ * staleness guard drops, still means this customer paid: the acquisition it
+ * belongs to is over either way, and leaving the lock held would strand them
+ * until it expired.
+ *
+ * SAFE AGAINST A LATE DELIVERY because it is keyed on the INTENT, never on the
+ * account. A webhook for a checkout the customer abandoned cannot release the
+ * lock of a newer one they are midway through paying — the guarded update simply
+ * matches nothing.
+ *
+ * SAFE AGAINST A FORGED TOKEN because the intent must belong to the account we
+ * resolved independently. `custom_data` is whatever the checkout put there, and
+ * a Lemon Squeezy hosted URL accepts `checkout[custom][...]` as a query
+ * parameter — so it is only ours on checkouts we minted, and is never proof of
+ * anything on its own.
+ */
+async function closeCheckoutIntent(
+  body: LemonSqueezyWebhook,
+  userId: string,
+): Promise<void> {
+  const raw = body.meta?.custom_data?.checkout_intent_id;
+  const token = typeof raw === "string" ? raw.trim() : "";
+  if (!token) {
+    // A LEGACY LINK, and worth saying out loud rather than passing over.
+    //
+    // Every checkout minted since the acquisition lock exists carries this id.
+    // A payment arriving without one was minted before it — and those links were
+    // created with no `expires_at`, which Lemon Squeezy documents as meaning they
+    // can be used indefinitely. It publishes no way to invalidate a checkout
+    // after creation and no way to look one up by custom data, so they cannot be
+    // revoked or even enumerated; the only handle anyone has is this line.
+    //
+    // The payment itself is honoured normally — `ConsumedOrder` still makes each
+    // order land exactly once. What this catches is the case support needs to
+    // see: a second charge on an account, arriving from a link nobody can kill.
+    console.warn(
+      `[lemonsqueezy] payment with no checkout_intent_id for user ${userId} — ` +
+        "legacy checkout link, minted before acquisition locking",
+    );
+    return;
+  }
+  try {
+    const intent = await intentByToken(token);
+    if (!intent || intent.userId !== userId) return;
+    await completeIntent(intent.id);
+  } catch (e) {
+    // Best-effort: failing to close an intent must never fail a payment
+    // webhook. The lock expires on its own, and the row stays visible.
+    console.error("[lemonsqueezy] could not close the checkout intent:", e);
+  }
+}
+
 /**
  * Record what a subscription now IS.
  *
@@ -626,6 +685,8 @@ async function handleSubscription(
     if (isReliableDeviceId(deviceId)) await recordDeviceTrialConsumed(deviceId, userId, sub.trialEndsAt);
   }
 
+  await closeCheckoutIntent(body, userId);
+
   const wrote = await mirrorSubscriptionState(sub, userId, body as Prisma.InputJsonValue);
   if (wrote === "stale") {
     // The row exists and is NEWER than this event: a stale retry, understood
@@ -666,6 +727,13 @@ export async function mirrorSubscriptionState(
   // nothing can clear it. A resume arriving later restores `status` and leaves
   // the tombstone exactly where it was, and the row stays non-granting for the
   // rest of the window it was cancelled in.
+  //
+  // DELIBERATELY NOT `isLiveUnpaidTrial`, and this is the one place that
+  // divergence is correct. That predicate keys on `on_trial` because the admin
+  // path acts BEFORE Lemon Squeezy has changed anything — the row it reads is
+  // still a running trial. By the time this handler runs, the provider has
+  // already flipped the status, so `on_trial` is precisely the value it will
+  // never see. Sharing one helper across both would silently stop one of them.
   const cancelledDuringTrial =
     sub.status === "cancelled" &&
     sub.trialEndsAt != null &&
@@ -687,14 +755,32 @@ export async function mirrorSubscriptionState(
   if (cancelledDuringTrial) {
     await prisma.subscription
       .updateMany({
-        where: { provider: PROVIDER, externalId: sub.subscriptionId, trialCancelledAt: null },
+        // Same MongoDB trap as the outbox: an optional field that was never
+        // written is ABSENT, not null, so `trialCancelledAt: null` matched no
+        // existing subscription and the tombstone was never written on any row
+        // that predates the column. Both shapes accepted.
+        where: {
+          provider: PROVIDER,
+          externalId: sub.subscriptionId,
+          OR: [{ trialCancelledAt: null }, { trialCancelledAt: { isSet: false } }],
+        },
         data: { trialCancelledAt: new Date() },
       })
       .catch((e) => console.error("[lemonsqueezy] could not write the trial tombstone:", e));
   }
 
   const data = {
-    ...(cancelledDuringTrial ? { trialCancelledAt: new Date() } : {}),
+    // NO `trialCancelledAt` HERE — deliberately, and this is the second half of
+    // the set-once guarantee above.
+    //
+    // The guarded write a few lines up is monotonic: its WHERE refuses any row
+    // that already carries a tombstone, so a redelivery cannot move the date.
+    // This spread then quietly undid that. It is part of the unconditional
+    // mirror `data`, so every redelivery of a cancellation stamped a NEW
+    // revocation time over the old one — and a real one did, 34ms later, in the
+    // test below. Access was never restored, so nothing broke visibly; what was
+    // destroyed was the answer to "when did this customer actually lose access?",
+    // which is the one question an operator asks a tombstone.
     status: sub.status,
     variantId: sub.variantId ?? "",
     interval: intervalForVariant(

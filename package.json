@@ -25,7 +25,9 @@
     "protection:seed": "tsx scripts/seed-protection.ts",
     "notifications:seed": "tsx scripts/seed-notifications.ts",
     "postinstall": "prisma generate",
-    "dev:scenario": "tsx scripts/dev-scenario.ts"
+    "dev:scenario": "tsx scripts/dev-scenario.ts",
+    "test:billing:mongo": "tsx --test tests/mongo/*.mongo.test.ts",
+    "test:billing:ls-smoke": "tsx tests/ls-smoke/run.mjs"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",
@@ -46,6 +48,7 @@
     "@types/morgan": "^1.9.9",
     "@types/node": "^22.10.5",
     "@types/supertest": "^6.0.2",
+    "mongodb-memory-server": "^11.2.0",
     "prisma": "^5.22.0",
     "supertest": "^7.0.0",
     "tsx": "^4.19.2",

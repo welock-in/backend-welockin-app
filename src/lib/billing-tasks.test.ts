@@ -67,6 +67,10 @@ function matches(row: Row, where: Record<string, any>): boolean {
       if (!(v as any[]).some((sub) => matches(row, sub))) return false;
       continue;
     }
+    if (k === "AND") {
+      if (!(v as any[]).every((sub) => matches(row, sub))) return false;
+      continue;
+    }
     if (k === "provider_externalId_kind") {
       if (row.provider !== v.provider || row.externalId !== v.externalId || row.kind !== v.kind) {
         return false;
@@ -78,6 +82,12 @@ function matches(row: Row, where: Record<string, any>): boolean {
       if (actual != null) return false;
     } else if (v instanceof Date) {
       if (!(actual instanceof Date) || actual.getTime() !== v.getTime()) return false;
+    } else if (typeof v === "object" && "isSet" in (v as object)) {
+      // MongoDB stores no key at all for an optional field with no value, and
+      // Prisma exposes that as `isSet`. The double has to model it, or the
+      // absent-vs-null trap that this project actually hit stays invisible here.
+      const present = actual !== undefined;
+      if (present !== (v as { isSet: boolean }).isSet) return false;
     } else if (typeof v === "object") {
       const at = actual instanceof Date ? actual.getTime() : actual;
       for (const [op, bound] of Object.entries(v as Record<string, any>)) {

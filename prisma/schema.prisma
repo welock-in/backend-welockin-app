@@ -122,6 +122,8 @@ model User {
   subscriptions      Subscription[]
   emailVerifications EmailVerification[]
   passwordResets     PasswordReset[]
+  checkoutIntents    CheckoutIntent[]
+  acquisitionLock    AcquisitionLock?
 }
 
 // A focus session that is HAPPENING RIGHT NOW, reported by a client via
@@ -1181,4 +1183,107 @@ model Release {
   @@unique([channel, target, arch, version])
   @@index([channel, target, arch, status, versionKey])
   @@map("releases")
+}
+
+/// A payment link we asked Lemon Squeezy for, and what became of it.
+///
+/// WHY THIS EXISTS. `POST /api/checkout` mints a hosted payment URL. It creates
+/// no subscription and used to reserve nothing, so two tabs — or two devices, or
+/// two Vercel instances — could each mint a URL, and a customer who paid both
+/// ended up with two subscriptions. An in-process guard cannot close that: the
+/// two requests need not share a process. The invariant has to live here.
+///
+/// This table is the HISTORY. The mutual exclusion is `AcquisitionLock`, which
+/// is a separate document for a specific reason — see its own comment.
+model CheckoutIntent {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  /// The public handle, unguessable, used to resume a checkout without exposing
+  /// a row id. Never the Mongo id: those are sequential enough to enumerate.
+  token String @unique
+
+  userId String @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// "monthly" | "yearly" | "lifetime".
+  plan String
+
+  /// The mutual-exclusion scope. One value today, "acquisition", covering all
+  /// three plans together: holding a payable monthly link AND a payable lifetime
+  /// link at the same time is exactly the double payment this prevents. Stored
+  /// rather than assumed so a future scope that legitimately runs in parallel
+  /// (a seat top-up, say) needs no migration.
+  scope String
+
+  /// The key that makes a retry the same intent rather than a new one.
+  ///
+  /// NEVER NULL, and that is a MongoDB constraint rather than a preference: in a
+  /// compound unique index null is a VALUE, so two intents for one account with
+  /// no client key would collide and the second checkout would fail with a
+  /// duplicate-key error. It did, before this comment existed.
+  ///
+  /// So when the client supplies no `Idempotency-Key` — and none does today; the
+  /// Tauri desktop is the only caller and sends three headers, this not among
+  /// them — the intent's own unguessable token is used, which is unique by
+  /// construction and can never be guessed by a client trying to collide.
+  idempotencyKey String
+
+  /// reserved | ready | uncertain | completed | failed | expired
+  ///
+  /// `uncertain` is the important one. A timeout or a dropped connection does
+  /// NOT prove Lemon Squeezy failed to create the checkout — the request may
+  /// have arrived and the response been lost. Such an intent keeps its lock
+  /// until the link it may have created can no longer be paid.
+  state String
+
+  provider           String
+  providerCheckoutId String?
+  /// The hosted payment URL. Handed out only by the authenticated checkout
+  /// endpoint, never by the status read.
+  checkoutUrl String?
+
+  /// When the link stops being payable. Compared against the server clock to
+  /// make decisions — never inferred from a TTL sweep, which is cleanup.
+  expiresAt DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// A client that retries with the same key must get the same intent back.
+  @@unique([userId, idempotencyKey])
+  @@index([userId, state])
+  @@index([state, expiresAt])
+}
+
+/// The mutual exclusion itself: at most one payable acquisition per account.
+///
+/// A SEPARATE DOCUMENT, not a partial unique index on CheckoutIntent, and that
+/// is a constraint rather than a preference: Prisma's MongoDB connector has no
+/// partial indexes, so "unique among rows whose state is reserved|ready|
+/// uncertain" cannot be expressed. Encoding the state into a nullable key column
+/// instead — the usual trick — leans on the absent-vs-null behaviour that has
+/// already broken the outbox in this codebase once.
+///
+/// A plain `@@unique([userId, scope])` on a row that exists only while a
+/// checkout is outstanding says the same thing, and says it to the database
+/// rather than to a convention.
+model AcquisitionLock {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  userId String @unique @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  scope String
+
+  /// Which intent holds it, so releasing can be checked against the holder and
+  /// a late webhook cannot release a newer checkout than the one it belongs to.
+  intentId String @db.ObjectId
+
+  /// Never before the provider link stops being payable.
+  expiresAt DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, scope])
 }

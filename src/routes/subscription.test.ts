@@ -68,8 +68,13 @@ test("ending a trial requires a bearer token", async () => {
 });
 
 test("it ends the trial NOW and asks for the invoice immediately", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [liveTrial]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
 
   let url = "";
   let init: any = null;
@@ -99,8 +104,13 @@ test("it ends the trial NOW and asks for the invoice immediately", async (t) => 
  * body would let anyone end — and charge — a stranger's trial.
  */
 test("the subscription comes from the caller's token, never from the request", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   const finds = stubMethod(t, prisma.subscription as any, "findMany", async () => [liveTrial]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => ({ ok: true, status: 200, json: async () => ({}) }));
 
   await request(app)
@@ -112,11 +122,16 @@ test("the subscription comes from the caller's token, never from the request", a
 });
 
 test("a second click is refused rather than charging twice", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   // The first click converted it: the status is no longer on_trial.
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { ...liveTrial, status: "active" },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => {
     throw new Error("must not reach Lemon Squeezy");
   });
@@ -127,10 +142,15 @@ test("a second click is refused rather than charging twice", async (t) => {
 });
 
 test("an expired trial is not a trial to end", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { ...liveTrial, validUntil: new Date(Date.now() - 86_400_000) },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => {
     throw new Error("must not reach Lemon Squeezy");
   });
@@ -141,8 +161,13 @@ test("an expired trial is not a trial to end", async (t) => {
 });
 
 test("an account with no subscription at all is refused cleanly", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => {
     throw new Error("must not reach Lemon Squeezy");
   });
@@ -153,8 +178,13 @@ test("an account with no subscription at all is refused cleanly", async (t) => {
 });
 
 test("a provider outage does not leak the API key", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [liveTrial]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => {
     throw new Error("connect ECONNREFUSED — Bearer test-key");
   });
@@ -166,6 +196,11 @@ test("a provider outage does not leak the API key", async (t) => {
 });
 
 test("an unconfigured storefront fails loudly instead of pretending to charge", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   configured(t, { lemonSqueezyApiKey: "" });
   stubFetch(t, async () => {
     throw new Error("must not reach Lemon Squeezy");
@@ -185,10 +220,15 @@ test("an unconfigured storefront fails loudly instead of pretending to charge", 
  */
 
 test("cancelling calls Lemon Squeezy's delete and reports when access stops", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { externalId: "77001", status: "active", validUntil: new Date(Date.now() + 20 * 86_400_000) },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
 
   let url = "";
   let method = "";
@@ -211,10 +251,15 @@ test("cancelling calls Lemon Squeezy's delete and reports when access stops", as
 });
 
 test("the subscription to cancel comes from the token, never the request", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   const finds = stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { externalId: "77001", status: "active", validUntil: new Date(Date.now() + 86_400_000) },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => ({ ok: true, status: 200, json: async () => ({}) }));
 
   await request(app).post("/api/subscription/cancel").set(auth).send({ subscriptionId: "99999" });
@@ -223,10 +268,15 @@ test("the subscription to cancel comes from the token, never the request", async
 });
 
 test("cancelling twice is refused rather than repeated", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { externalId: "77001", status: "cancelled", validUntil: new Date(Date.now() + 86_400_000) },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => {
     throw new Error("must not reach Lemon Squeezy");
   });
@@ -237,10 +287,15 @@ test("cancelling twice is refused rather than repeated", async (t) => {
 });
 
 test("cancelling DURING a trial is allowed — it means 'don't charge me'", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { externalId: "77001", status: "on_trial", validUntil: new Date(Date.now() + 3 * 86_400_000) },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   let method = "";
   stubFetch(t, async (_u: string, i: any) => {
     method = i.method;
@@ -254,6 +309,10 @@ test("cancelling DURING a trial is allowed — it means 'don't charge me'", asyn
 });
 
 test("GET /subscription still marks an on-trial row as cancellable", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     {
@@ -265,6 +324,7 @@ test("GET /subscription still marks an on-trial row as cancellable", async (t) =
       endsAt: null,
     },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
 
   const res = await request(app).get("/api/subscription").set(auth);
 
@@ -272,6 +332,10 @@ test("GET /subscription still marks an on-trial row as cancellable", async (t) =
 });
 
 test("a cancelled subscription still reads as live, with its end date", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   const endsAt = new Date(Date.now() + 12 * 86_400_000);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
@@ -284,6 +348,7 @@ test("a cancelled subscription still reads as live, with its end date", async (t
       endsAt,
     },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
 
   const res = await request(app).get("/api/subscription").set(auth);
 
@@ -294,6 +359,10 @@ test("a cancelled subscription still reads as live, with its end date", async (t
 });
 
 test("an account with only expired rows reports no subscription", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     {
@@ -305,6 +374,7 @@ test("an account with only expired rows reports no subscription", async (t) => {
       endsAt: new Date(Date.now() - 86_400_000),
     },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
 
   const res = await request(app).get("/api/subscription").set(auth);
 
@@ -318,10 +388,15 @@ test("an account with only expired rows reports no subscription", async (t) => {
  * the token like every other money action.
  */
 test("reactivating a cancelled-but-live subscription patches cancelled:false", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { externalId: "77001", status: "cancelled", validUntil: new Date(Date.now() + 10 * 86_400_000), endsAt: new Date(Date.now() + 10 * 86_400_000) },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
 
   let url = "";
   let method = "";
@@ -343,10 +418,15 @@ test("reactivating a cancelled-but-live subscription patches cancelled:false", a
 });
 
 test("the subscription to reactivate comes from the token, never the request", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   const finds = stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { externalId: "77001", status: "cancelled", validUntil: new Date(Date.now() + 86_400_000), endsAt: new Date(Date.now() + 86_400_000) },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => ({ ok: true, status: 200, json: async () => ({}) }));
 
   await request(app).post("/api/subscription/reactivate").set(auth).send({ subscriptionId: "99999" });
@@ -355,10 +435,15 @@ test("the subscription to reactivate comes from the token, never the request", a
 });
 
 test("there is nothing to reactivate on an account with no cancelled subscription", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { externalId: "77001", status: "active", validUntil: new Date(Date.now() + 86_400_000), endsAt: null },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   let called = false;
   stubFetch(t, async () => {
     called = true;
@@ -372,10 +457,15 @@ test("there is nothing to reactivate on an account with no cancelled subscriptio
 });
 
 test("an already-expired subscription cannot be reactivated (start a new plan instead)", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { externalId: "77001", status: "cancelled", validUntil: new Date(Date.now() - 86_400_000), endsAt: new Date(Date.now() - 86_400_000) },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => ({ ok: true, status: 200, json: async () => ({}) }));
 
   const res = await request(app).post("/api/subscription/reactivate").set(auth);
@@ -386,6 +476,10 @@ test("an already-expired subscription cannot be reactivated (start a new plan in
 });
 
 test("GET /subscription flags a cancelled-but-live row as reactivatable", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     {
@@ -397,6 +491,7 @@ test("GET /subscription flags a cancelled-but-live row as reactivatable", async 
       endsAt: new Date(Date.now() + 5 * 86_400_000),
     },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
 
   const res = await request(app).get("/api/subscription").set(auth);
 
@@ -429,8 +524,13 @@ function configuredVariants(t: Ctx) {
 }
 
 test("upgrading monthly→yearly PATCHes the new variant and charges now", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configuredVariants(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [liveMonthly]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   let init: any = null;
   let url = "";
   stubFetch(t, async (u: string, i: any) => {
@@ -452,8 +552,13 @@ test("upgrading monthly→yearly PATCHes the new variant and charges now", async
 });
 
 test("downgrading yearly→monthly switches at renewal without charging now", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configuredVariants(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [liveYearly]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   let init: any = null;
   stubFetch(t, async (_u: string, i: any) => {
     init = i;
@@ -471,10 +576,15 @@ test("downgrading yearly→monthly switches at renewal without charging now", as
 });
 
 test("changing plan is refused while on trial (pay now first)", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configuredVariants(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
     { externalId: "77001", status: "on_trial", validUntil: new Date(Date.now() + 3 * 86_400_000), variantId: "1986433" },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   let called = false;
   stubFetch(t, async () => {
     called = true;
@@ -488,8 +598,13 @@ test("changing plan is refused while on trial (pay now first)", async (t) => {
 });
 
 test("changing to the plan you already have is refused", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configuredVariants(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [liveMonthly]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => ({ ok: true, status: 200, json: async () => ({}) }));
 
   const res = await request(app).post("/api/subscription/change-plan").set(auth).send({ plan: "monthly" });
@@ -498,8 +613,13 @@ test("changing to the plan you already have is refused", async (t) => {
 });
 
 test("changing plan comes from the token, never the request body", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configuredVariants(t);
   const finds = stubMethod(t, prisma.subscription as any, "findMany", async () => [liveMonthly]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => ({ ok: true, status: 200, json: async () => ({}) }));
 
   await request(app).post("/api/subscription/change-plan").set(auth).send({ plan: "yearly", subscriptionId: "99999" });
@@ -508,8 +628,13 @@ test("changing plan comes from the token, never the request body", async (t) => 
 });
 
 test("change-plan rejects a plan that is not monthly or yearly (no lifetime here)", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configuredVariants(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [liveMonthly]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => ({ ok: true, status: 200, json: async () => ({}) }));
 
   const res = await request(app).post("/api/subscription/change-plan").set(auth).send({ plan: "lifetime" });
@@ -542,8 +667,13 @@ const liveSub = {
 };
 
 test("the portal link is fetched fresh from Lemon Squeezy, not served from the row", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [liveSub]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   const writes = stubMethod(t, prisma.subscription as any, "update", async () => ({}));
   stubFetch(t, async () => ({
     ok: true,
@@ -562,8 +692,13 @@ test("the portal link is fetched fresh from Lemon Squeezy, not served from the r
 });
 
 test("an unreachable provider falls back to the stored link rather than nothing", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [liveSub]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubMethod(t, prisma.subscription as any, "update", async () => ({}));
   stubFetch(t, async () => {
     throw new Error("ECONNREFUSED");
@@ -582,8 +717,13 @@ test("an unreachable provider falls back to the stored link rather than nothing"
  * gets a refusal, not somebody else's billing page.
  */
 test("an account with no subscription cannot reach a portal link", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => {
     throw new Error("must not reach Lemon Squeezy");
   });
@@ -605,6 +745,10 @@ test("the portal link needs a bearer token", async () => {
  * customer would get the rest of their trial back for free, repeatedly.
  */
 test("reactivate refuses a trial that was cancelled", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   const inThreeDays = new Date(Date.now() + 3 * 86_400_000);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
@@ -621,6 +765,7 @@ test("reactivate refuses a trial that was cancelled", async (t) => {
       createdAt: new Date(),
     },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => {
     throw new Error("must not reach Lemon Squeezy");
   });
@@ -631,6 +776,10 @@ test("reactivate refuses a trial that was cancelled", async (t) => {
 });
 
 test("reactivate still works for a cancelled PAID subscription", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
   configured(t);
   const inTenDays = new Date(Date.now() + 10 * 86_400_000);
   stubMethod(t, prisma.subscription as any, "findMany", async () => [
@@ -648,6 +797,7 @@ test("reactivate still works for a cancelled PAID subscription", async (t) => {
       createdAt: new Date(),
     },
   ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
   stubFetch(t, async () => ({
     ok: true,
     status: 200,

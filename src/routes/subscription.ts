@@ -251,6 +251,7 @@ subscriptionRouter.get(
               plan: outstanding.plan,
               state: outstanding.state,
               resumable: outstanding.state === "ready" && outstanding.checkoutUrl != null,
+              expiresAt: outstanding.expiresAt.toISOString(),
             }
           : null,
       }),

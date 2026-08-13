@@ -1204,3 +1204,121 @@ test("an uncertain acquisition stops blocking once its hold window has passed", 
     "an expired hold must not still report an unknown checkout",
   );
 });
+
+/**
+ * The dead end, from the API's side.
+ *
+ * A customer with a monthly checkout open clicked "Get lifetime" and was told
+ * "A checkout is already in progress. Finish or cancel it first." Nothing in the
+ * product can finish or cancel it — Lemon Squeezy publishes no way to invalidate
+ * a checkout after creation — so the only true statement is WHEN the block ends.
+ *
+ * That instant was the one thing the client could not derive: it could read
+ * WHICH plan is resumable from the code, but not until when.
+ */
+test("a held acquisition says which plan is resumable and until when", async (t) => {
+  silenceErrors(t);
+  const f = await makeAccount("resume-contract");
+  const calls = stubProvider(t);
+
+  const minted = await checkout(f.auth, "monthly");
+  assert.equal(minted.status, 201, minted.text);
+
+  const status = await request(app).get("/api/subscription").set(f.auth);
+  const e = status.body.purchaseEligibility;
+
+  // The resumable one names itself, and carries no secret.
+  assert.equal(e.monthly.reasonCode, "CHECKOUT_RESUMABLE");
+  assert.equal(e.monthly.canPurchase, true);
+
+  // The others say when they come back, rather than asking for the impossible.
+  for (const plan of ["yearly", "lifetime"] as const) {
+    assert.equal(e[plan].reasonCode, "CHECKOUT_IN_PROGRESS", plan);
+    assert.ok(e[plan].blockedUntil, `${plan} must say until when`);
+    assert.ok(
+      new Date(e[plan].blockedUntil).getTime() > Date.now(),
+      `${plan}: the instant must be in the future`,
+    );
+  }
+
+  // And no part of the status read leaks the way to pay.
+  const blob = JSON.stringify(status.body);
+  assert.ok(!blob.includes("ls.test/checkout"), "no checkout URL in the status read");
+  assert.ok(!blob.includes(minted.body.intentToken), "no intent token either");
+
+  // Resuming the same plan returns the SAME link and calls the provider once.
+  const resumed = await checkout(f.auth, "monthly");
+  assert.equal(resumed.status, 201, resumed.text);
+  assert.equal(resumed.body.reused, true);
+  assert.equal(resumed.body.url, minted.body.url);
+  assert.equal(calls.length, 1, "resuming must not mint a second checkout");
+});
+
+/**
+ * An unreadable provider answer offers no link, and says so.
+ *
+ * `ready` and `uncertain` look alike from outside — both refuse a new checkout —
+ * but they must not read alike. `ready` means "here is the page you already
+ * have"; `uncertain` means "we never learned whether a payable page exists", and
+ * offering a resume there would send the customer to a link we cannot produce,
+ * or invite the retry that charges twice. The only safe answer is the instant
+ * after which an invisible link can no longer be paid.
+ */
+test("an uncertain acquisition offers nothing to resume, only when to return", async (t) => {
+  silenceErrors(t);
+  const f = await makeAccount("uncertain-contract");
+  stubProvider(t, {
+    respond: () => {
+      throw new Error("socket hang up");
+    },
+  });
+  assert.equal((await checkout(f.auth, "monthly")).status, 503);
+
+  const e = (await request(app).get("/api/subscription").set(f.auth)).body.purchaseEligibility;
+
+  for (const plan of ["monthly", "yearly", "lifetime"] as const) {
+    assert.equal(e[plan].reasonCode, "CHECKOUT_STATE_UNCERTAIN", plan);
+    assert.equal(e[plan].canPurchase, false, plan);
+    assert.ok(e[plan].blockedUntil, `${plan} must name the instant it returns`);
+  }
+  assert.equal(
+    Object.values(e).filter((p: any) => p.reasonCode === "CHECKOUT_RESUMABLE").length,
+    0,
+    "nothing may be offered for resumption when no link is known to exist",
+  );
+});
+
+/**
+ * When the hold lapses the account is free again — with ONE lock, not two.
+ *
+ * The screen refetches at the instant it was given. What it must find is a fully
+ * open paywall: every plan buyable, no leftover `blockedUntil` for the copy to
+ * quote, and a fresh acquisition replacing the stale one rather than joining it.
+ * `@@unique([userId, scope])` is what makes the replacement atomic; if it were
+ * ever missing in production, this is the test that describes what breaks.
+ */
+test("an expired hold reopens every plan and leaves a single lock behind", async (t) => {
+  silenceErrors(t);
+  const f = await makeAccount("expired-recovery");
+  const calls = stubProvider(t);
+
+  assert.equal((await checkout(f.auth, "monthly")).status, 201);
+  const past = new Date(Date.now() - 1000);
+  await prisma.checkoutIntent.updateMany({ where: { userId: f.user.id }, data: { expiresAt: past } });
+  await prisma.acquisitionLock.updateMany({ where: { userId: f.user.id }, data: { expiresAt: past } });
+
+  const e = (await request(app).get("/api/subscription").set(f.auth)).body.purchaseEligibility;
+  for (const plan of ["monthly", "yearly", "lifetime"] as const) {
+    assert.equal(e[plan].canPurchase, true, `${plan} must be buyable again`);
+    assert.equal(e[plan].blockedUntil, undefined, `${plan} must not still quote a lifted hold`);
+  }
+
+  // A different plan now, which is the whole point of waiting.
+  assert.equal((await checkout(f.auth, "lifetime")).status, 201);
+  assert.equal(calls.length, 2, "the second checkout is a real one, not a reuse");
+
+  const locks = await prisma.acquisitionLock.findMany({ where: { userId: f.user.id } });
+  assert.equal(locks.length, 1, "the stale lock is replaced, never duplicated");
+  assert.equal(locks[0].scope, "acquisition");
+  assert.ok(locks[0].expiresAt.getTime() > Date.now(), "the replacement holds a live window");
+});

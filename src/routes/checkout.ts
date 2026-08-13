@@ -292,7 +292,10 @@ checkoutRouter.post(
     if (reservation.outcome === "busy") {
       throw new HttpError(
         409,
-        "A checkout is already in progress on this account. Finish or cancel it first.",
+        // The client branches on `code`; this prose is the fallback. It must not
+        // name an action the product cannot perform - see subscription.ts.
+        "Another plan already has a payment page open. Continue that one, or " +
+        "choose a different plan once it expires.",
         {
           code: "CHECKOUT_IN_PROGRESS",
           details: { plan: reservation.intent.plan },

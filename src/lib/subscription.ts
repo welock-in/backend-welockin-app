@@ -257,6 +257,20 @@ export type PlanEligibility = {
   trialMode: TrialMode;
   /** Days of trial this plan would grant — 0 unless `trialMode` is "eligible". */
   trialDays: number;
+  /**
+   * When the outstanding acquisition stops holding this plan back, ISO 8601.
+   *
+   * Present only on the plans an in-flight checkout affects — the resumable one
+   * and the ones it blocks. It is the ONE thing the client could not work out
+   * for itself: it can see WHICH plan is resumable from the code, but not until
+   * when, and without that the only honest thing it could say was "try again
+   * later", which is how the dead end started.
+   *
+   * A date, and nothing else. No URL, no intent token, no provider id — those
+   * come from `POST /api/checkout`, which at least requires the caller to have
+   * asked.
+   */
+  blockedUntil?: string;
 };
 
 /** Prose for humans; the client branches on the code, never on this. */
@@ -275,8 +289,14 @@ export const ELIGIBILITY_MESSAGES: Record<EligibilityReason, string> = {
     "Contact support before buying again so you are not billed twice.",
   LIFETIME_ALREADY_OWNED: "You already own the lifetime licence.",
   CHECKOUT_RESUMABLE: "You have a payment page open for this plan — finish it here.",
+  // NEVER "finish or cancel it first": there is no cancelling. Lemon Squeezy
+  // publishes no way to invalidate a checkout once created, so the product
+  // cannot offer the action that sentence demanded, and the customer was left
+  // with a screen asking them to do something impossible. What IS true is that
+  // the other plan is still payable and the hold lifts on its own.
   CHECKOUT_IN_PROGRESS:
-    "A checkout is already in progress on this account. Finish or cancel it first.",
+    "Another plan already has a payment page open. Continue that one, or choose " +
+    "a different plan once it expires.",
   CHECKOUT_STATE_UNCERTAIN:
     "A previous checkout could not be confirmed with the payment provider. " +
     "Please wait a few minutes or contact support.",
@@ -377,7 +397,7 @@ export function planEligibility(input: {
    * The account's outstanding acquisition, if it has one. Null when nothing is
    * in flight — an expired one counts as nothing, see `outstandingAcquisition`.
    */
-  outstanding?: { plan: string; state: string; resumable: boolean } | null;
+  outstanding?: { plan: string; state: string; resumable: boolean; expiresAt?: string } | null;
 }): Record<PurchasePlan, PlanEligibility> {
   const blocked = (): CheckoutBlockReason | null => {
     const hits = new Set<CheckoutBlockReason>();
@@ -414,10 +434,15 @@ export function planEligibility(input: {
   if (held) {
     if (held.state === "uncertain") {
       // We do not know whether a payable link exists, so we may not create one.
-      const unknown = refuse("CHECKOUT_STATE_UNCERTAIN");
+      const until = held.expiresAt;
+      const unknown = {
+        ...refuse("CHECKOUT_STATE_UNCERTAIN"),
+        ...(until ? { blockedUntil: until } : {}),
+      };
       return { monthly: unknown, yearly: unknown, lifetime: unknown };
     }
-    const busy = refuse("CHECKOUT_IN_PROGRESS");
+    const until = held.expiresAt;
+    const busy = { ...refuse("CHECKOUT_IN_PROGRESS"), ...(until ? { blockedUntil: until } : {}) };
     const resume: PlanEligibility = {
       // TRUE, and deliberately: pressing Buy again returns the SAME link rather
       // than minting a second. The screen offers "finish paying", not "buy".

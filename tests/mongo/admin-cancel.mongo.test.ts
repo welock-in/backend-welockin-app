@@ -1803,3 +1803,67 @@ test("once a second subscription exists, further checkouts are refused", async (
   assert.equal(status.body.purchaseEligibility.monthly.reasonCode, "ACTIVE_SUBSCRIPTION");
   assert.equal(status.body.purchaseEligibility.yearly.reasonCode, "ACTIVE_SUBSCRIPTION");
 });
+
+/**
+ * The two cancellations expire differently, proved at the endpoint the app asks.
+ *
+ * `grantsAccess` above reads the predicate. This reads /api/entitlement — what
+ * the desktop actually receives — because the distinction only matters if it
+ * survives the route: a paid subscriber who cancels has bought a period and
+ * keeps it to the instant the SERVER names; a trial buys no period, so cancelling
+ * one ends access now.
+ *
+ * Getting this backwards is expensive in both directions. Cutting a paid
+ * customer off early takes access they paid for. Letting a cancelled trial run
+ * on gives the product away and, worse, leaves the paywall hidden from someone
+ * we have already decided must see it.
+ */
+test("a cancelled paid subscription keeps access to the server's instant; a cancelled trial keeps none", async (t) => {
+  silenceErrors(t);
+
+  // ── the paid one ──────────────────────────────────────────────────────────
+  const paid = await makeTrial("expiry-paid");
+  const until = at(20);
+  await prisma.subscription.update({
+    where: { id: paid.sub.id },
+    data: { status: "active", trialEndsAt: at(3), validUntil: until, endsAt: until },
+  });
+  stubFetch(t, async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ data: { attributes: { ends_at: until.toISOString() } } }),
+  }));
+  assert.equal((await cancelAsAdmin(paid.user.id, paid.externalId, "stop renewing")).status, 200);
+
+  const paidEnt = await request(app).get("/api/entitlement").set(paid.auth);
+  assert.equal(paidEnt.status, 200, paidEnt.text);
+  assert.equal(paidEnt.body.isPro, true, "a cancelled paid period is still a paid period");
+  assert.equal(
+    new Date(paidEnt.body.validUntil).getTime(),
+    until.getTime(),
+    "the end must be the server's instant, not a client's idea of one",
+  );
+
+  // ── the trial one ─────────────────────────────────────────────────────────
+  const trial = await makeTrial("expiry-trial");
+  stubFetch(t, async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ data: { attributes: { ends_at: null } } }),
+  }));
+  const res = await cancelAsAdmin(trial.user.id, trial.externalId, "trial revoked");
+  assert.equal(res.status, 200, res.text);
+  assert.equal(res.body.entitlementRevoked, true);
+
+  const trialEnt = await request(app).get("/api/entitlement").set(trial.auth);
+  assert.equal(trialEnt.status, 200, trialEnt.text);
+  assert.equal(trialEnt.body.isPro, false, "a cancelled trial keeps no remaining period");
+
+  // And the paywall it lands on offers no second trial: the row still exists,
+  // so the trial is spent — on yearly as much as on the plan it was used for.
+  const status = await request(app).get("/api/subscription").set(trial.auth);
+  for (const plan of ["monthly", "yearly"]) {
+    assert.equal(status.body.purchaseEligibility[plan].trialMode, "skip", plan);
+    assert.equal(status.body.purchaseEligibility[plan].canPurchase, true, plan);
+  }
+});

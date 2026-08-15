@@ -194,6 +194,173 @@ test("an account with no subscription queues nothing", async (t) => {
  * moment later; continuing would orphan a live charge with nothing anywhere
  * pointing at it. Deletion is DEFERRED here, never refused.
  */
+/* ════════════════════════════════════════════════════════════════════════════
+ * GET /api/me/deletion-preview — the promise the confirmation screen makes.
+ *
+ * The preview and DELETE / share ONE subscription read and ONE
+ * "will-auto-cancel" predicate, so what these tests pin is the promise itself:
+ * the Lemon Squeezy rows the preview lists under `willAutoCancel` are exactly
+ * the rows the deletion then enqueues outbox cancellations for.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/** A live Lemon Squeezy monthly, as the preview's shared read selects it. */
+const lsSub = (externalId: string, over: Record<string, unknown> = {}) => ({
+  provider: "lemonsqueezy",
+  externalId,
+  status: "active",
+  interval: "monthly",
+  validUntil: new Date("2026-09-01T00:00:00.000Z"),
+  customerPortalUrl: "https://portal.lemonsqueezy.test/p",
+  updatePaymentUrl: null,
+  ...over,
+});
+
+/** A live Apple (RevenueCat-mirrored) yearly, with the persisted management URL. */
+const rcSub = (externalId: string, over: Record<string, unknown> = {}) => ({
+  provider: "revenuecat",
+  externalId,
+  status: "active",
+  interval: "yearly",
+  validUntil: new Date("2026-10-01T00:00:00.000Z"),
+  customerPortalUrl: "https://apps.apple.com/account/subscriptions",
+  updatePaymentUrl: null,
+  ...over,
+});
+
+/** The preview's world: the account guard's read, the shared subscription
+ *  read, and the lifetime-purchase read. */
+function stubPreview(t: TestContext, subs: any[], lifetime: { provider: string } | null = null) {
+  stub(t, prisma.user as any, "findUnique", async () => ({
+    id: USER,
+    email: "user@example.com",
+    emailVerified: true,
+    passwordChangedAt: null,
+  }));
+  const subReads = stub(t, prisma.subscription as any, "findMany", async () => subs);
+  const lifetimeReads = stub(t, prisma.purchase as any, "findFirst", async () => lifetime);
+  return { subReads, lifetimeReads };
+}
+
+test("the preview splits auto-cancel (Lemon Squeezy) from manual-cancel (Apple), and drops the dead rows", async (t) => {
+  stubPreview(t, [
+    lsSub("ls-live"),
+    rcSub("rc-live"),
+    lsSub("ls-expired", { status: "expired" }),
+    lsSub("ls-cancelled", { status: "cancelled" }),
+  ]);
+
+  const res = await request(app).get("/api/me/deletion-preview").set(auth());
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.subscriptions.length, 2, "expired/cancelled rows have nothing to warn about");
+  assert.deepEqual(res.body.willAutoCancel, [
+    {
+      provider: "LEMON_SQUEEZY",
+      interval: "monthly",
+      status: "active",
+      validUntil: "2026-09-01T00:00:00.000Z",
+      managementUrl: "https://portal.lemonsqueezy.test/p",
+    },
+  ]);
+  // The Apple row: WE cannot cancel it — the customer does, and the button
+  // that sends them there is the RevenueCat management URL the sync persisted.
+  assert.deepEqual(res.body.requiresManualCancel, [
+    {
+      provider: "APPLE",
+      interval: "yearly",
+      status: "active",
+      validUntil: "2026-10-01T00:00:00.000Z",
+      managementUrl: "https://apps.apple.com/account/subscriptions",
+    },
+  ]);
+  assert.equal(res.body.hasLifetime, false);
+  assert.equal(res.body.lifetimeProvider, null);
+  assert.ok(res.body.serverTime, "the client anchors any countdown to the server clock");
+});
+
+/*
+ * THE SHARED-READ PIN. Run the preview and the deletion over the SAME rows and
+ * compare: every status the preview promises to auto-cancel is one the
+ * deletion enqueues, and vice versa. The fixture rows carry distinct statuses
+ * precisely so the wire entries (which carry no external id) stay matchable to
+ * the enqueued tasks (which carry no status).
+ */
+test("the rows the preview lists under willAutoCancel are exactly the rows DELETE enqueues", async (t) => {
+  const rows = [
+    lsSub("s-active", { status: "active" }),
+    lsSub("s-trial", { status: "on_trial" }),
+    lsSub("s-paused", { status: "paused" }),
+    lsSub("s-pastdue", { status: "past_due" }),
+    lsSub("s-cancelled", { status: "cancelled" }),
+    lsSub("s-expired", { status: "expired" }),
+    rcSub("rc-live"),
+  ];
+
+  stubPreview(t, rows);
+  const preview = await request(app).get("/api/me/deletion-preview").set(auth());
+  assert.equal(preview.status, 200);
+  const promised = preview.body.willAutoCancel
+    .map((s: { status: string }) => s.status)
+    .sort();
+
+  withKey(t);
+  const db = stubDelete(t, rows);
+  stubFetch(t, async () => ({ ok: true, status: 200 }));
+  const del = await request(app).delete("/api/me").set(auth());
+  assert.equal(del.status, 204);
+  const enqueued = db.enqueued
+    .map((task) => rows.find((r) => r.externalId === task.externalId)!.status)
+    .sort();
+
+  assert.deepEqual(promised, enqueued, "the preview promised a different deletion than the one performed");
+  assert.ok(!enqueued.includes("cancelled") && !enqueued.includes("expired"));
+  assert.equal(db.enqueued.length, 4, "and the Apple row is in neither list — it cannot be server-cancelled");
+});
+
+test("a lifetime licence is reported with WHOSE store sold it", async (t) => {
+  let lifetime: { provider: string } | null = { provider: "app_store" };
+  stub(t, prisma.user as any, "findUnique", async () => ({
+    id: USER,
+    email: "user@example.com",
+    emailVerified: true,
+    passwordChangedAt: null,
+  }));
+  stub(t, prisma.subscription as any, "findMany", async () => []);
+  const lifetimeReads = stub(t, prisma.purchase as any, "findFirst", async () => lifetime);
+
+  const apple = await request(app).get("/api/me/deletion-preview").set(auth());
+  assert.equal(apple.status, 200);
+  assert.equal(apple.body.hasLifetime, true);
+  assert.equal(apple.body.lifetimeProvider, "APPLE");
+
+  lifetime = { provider: "lemonsqueezy" };
+  const lemon = await request(app).get("/api/me/deletion-preview").set(auth());
+  assert.equal(lemon.body.lifetimeProvider, "LEMON_SQUEEZY");
+
+  // A refunded purchase is not ownership — the read itself must say so.
+  const where = lifetimeReads[lifetimeReads.length - 1][0].where;
+  assert.equal(where.isRefunded, false);
+});
+
+test("an account with nothing at all previews as exactly that", async (t) => {
+  stubPreview(t, []);
+
+  const res = await request(app).get("/api/me/deletion-preview").set(auth());
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.hasLifetime, false);
+  assert.equal(res.body.lifetimeProvider, null);
+  assert.deepEqual(res.body.subscriptions, []);
+  assert.deepEqual(res.body.willAutoCancel, []);
+  assert.deepEqual(res.body.requiresManualCancel, []);
+  assert.ok(res.body.serverTime);
+});
+
+test("the preview requires a bearer token", async () => {
+  const res = await request(app).get("/api/me/deletion-preview");
+  assert.equal(res.status, 401);
+});
+
 test("if the cancellation cannot be recorded, the account is not destroyed", async (t) => {
   withKey(t);
   const db = stubDelete(t, [{ provider: "lemonsqueezy", externalId: "sub-1", status: "active" }]);

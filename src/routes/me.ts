@@ -6,10 +6,75 @@ import { notFound } from "../lib/http-error";
 import { enqueueAndAttemptCancel } from "../lib/billing-tasks";
 import { env } from "../lib/env";
 import { hideTestRowsFor } from "../lib/subscription";
+import { billingProviderFor } from "../lib/entitlement";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 
 export const meRouter = Router();
+
+/* ── what deleting this account would do to its billing ─────────────────────
+ *
+ * ONE set of reads and ONE predicate, shared by GET /deletion-preview and
+ * DELETE /. That sharing is the contract, not a convenience: the preview is a
+ * PROMISE about what the deletion will do, and two copies of the query (or of
+ * the "which rows get cancelled" rule) would drift exactly the way the
+ * eligibility reads once did — the screen would announce an auto-cancel the
+ * deletion never enqueues, or stay silent about one it does.
+ */
+
+/** Every column either consumer reads off a subscription row. DELETE / uses
+ *  `provider`/`externalId`/`status`; the preview additionally renders the
+ *  interval, the paid-up window and the stored management link. */
+const DELETION_SUBSCRIPTION_SELECT = {
+  provider: true,
+  externalId: true,
+  status: true,
+  interval: true,
+  validUntil: true,
+  customerPortalUrl: true,
+  updatePaymentUrl: true,
+} as const;
+
+type DeletionSubscription = {
+  provider: string;
+  externalId: string;
+  status: string;
+  interval: string | null;
+  validUntil: Date | null;
+  customerPortalUrl: string | null;
+  updatePaymentUrl: string | null;
+};
+
+/**
+ * The subscription rows a deletion acts on — ALL statuses, because DELETE /
+ * tombstones every one of them (a cancelled subscription's id must still never
+ * mint a second grant), under the same test-row gate as every other
+ * subscription query. See DELETE / for why the admin test lab's synthetic rows
+ * must never reach the cancellation outbox.
+ */
+async function subscriptionsForDeletion(userId: string): Promise<DeletionSubscription[]> {
+  return prisma.subscription.findMany({
+    where: { userId, ...hideTestRowsFor(userId, env) },
+    select: DELETION_SUBSCRIPTION_SELECT,
+  });
+}
+
+/** Can this row still take money? `cancelled` and `expired` cannot — Lemon
+ *  Squeezy takes no further payment on either — so a deletion has nothing to
+ *  say about them and the preview does not list them. */
+function canStillBill(sub: { status: string }): boolean {
+  return sub.status !== "expired" && sub.status !== "cancelled";
+}
+
+/**
+ * Exactly the rows DELETE / enqueues outbox cancellations for. The outbox
+ * speaks Lemon Squeezy only — an Apple subscription cannot be cancelled from
+ * the server; the customer does that in their App Store settings, and
+ * enqueueing it would only mint a dead-lettered task.
+ */
+function deleteWouldAutoCancel(sub: { provider: string; status: string }): boolean {
+  return canStillBill(sub) && sub.provider === "lemonsqueezy";
+}
 
 meRouter.get(
   "/",
@@ -22,6 +87,70 @@ meRouter.get(
       throw notFound("User not found");
     }
     res.json({ user: toPublicUser(user) });
+  }),
+);
+
+/**
+ * GET /api/me/deletion-preview — what deleting this account will do to its
+ * billing, BEFORE the client shows the irreversible confirmation step.
+ *
+ * The delete flow's step-zero copy branches on this: a Lemon Squeezy
+ * subscription "will be cancelled automatically" (the outbox guarantees it —
+ * see DELETE /), an Apple one CANNOT be cancelled by us and the customer must
+ * do it themselves in their App Store settings (`managementUrl` is the
+ * RevenueCat management link the sync persists), and a lifetime licence is
+ * lost for good. Read-only: nothing here reserves, enqueues or deletes.
+ *
+ * Built from the SAME reads and the SAME predicate the deletion itself uses
+ * (above), so the preview can never announce a cancellation DELETE / would not
+ * perform, nor hide one it would.
+ */
+meRouter.get(
+  "/deletion-preview",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const userId = req.user!.id;
+
+    const [subs, lifetime] = await Promise.all([
+      subscriptionsForDeletion(userId),
+      // The non-refunded lifetime, any provider — the same "is this ownership"
+      // read the eligibility inputs use (a refunded purchase is not ownership,
+      // and a test-mode one stops existing when its provider's gate is shut).
+      prisma.purchase.findFirst({
+        where: { userId, isRefunded: false, ...hideTestRowsFor(userId, env) },
+        select: { provider: true },
+      }),
+    ]);
+
+    // Only the rows that can still bill: a deletion has nothing to warn about
+    // on a subscription no further money can leave through.
+    const live = subs.filter(canStillBill);
+    const entry = (sub: DeletionSubscription) => ({
+      // The client's two-world vocabulary, via the ONE shared mapping.
+      // Unrecognised providers read as LEMON_SQUEEZY, the same default the
+      // entitlement view's manageableSubscription documents.
+      provider: billingProviderFor(sub.provider) ?? ("LEMON_SQUEEZY" as const),
+      interval: sub.interval,
+      status: sub.status,
+      validUntil: sub.validUntil ? sub.validUntil.toISOString() : null,
+      // Last-known, not live — for an Apple row this is the RevenueCat
+      // management_url the sync persists (unsigned, does not expire).
+      managementUrl: sub.customerPortalUrl ?? sub.updatePaymentUrl ?? null,
+    });
+
+    res.json({
+      hasLifetime: lifetime != null,
+      lifetimeProvider: lifetime ? billingProviderFor(lifetime.provider) : null,
+      subscriptions: live.map(entry),
+      // The split the confirmation copy branches on. `willAutoCancel` is
+      // computed by the deletion's own predicate — these are exactly the rows
+      // DELETE / will enqueue outbox cancellations for, no more and no fewer.
+      willAutoCancel: live.filter(deleteWouldAutoCancel).map(entry),
+      requiresManualCancel: live
+        .filter((sub) => billingProviderFor(sub.provider) === "APPLE")
+        .map(entry),
+      serverTime: new Date().toISOString(),
+    });
   }),
 );
 
@@ -77,15 +206,15 @@ meRouter.delete(
     // this at purchase time; this covers the rows that predate the ledger.
     const [oldPurchases, oldSubs] = await Promise.all([
       prisma.purchase.findMany({ where: { userId }, select: { provider: true, externalId: true } }),
-      prisma.subscription.findMany({
-        // Test rows filtered like every other subscription query. The admin test
-        // lab mints synthetic rows with ids Lemon Squeezy has never heard of, and
-        // asking it to cancel one would fail every attempt until the task
-        // dead-lettered — a permanent red mark for a subscription that never
-        // existed, sitting next to the real ones that do need attention.
-        where: { userId, ...hideTestRowsFor(userId, env) },
-        select: { provider: true, externalId: true, status: true },
-      }),
+      // The SHARED read (see the top of this file): the deletion preview reads
+      // the same rows through the same query, which is what makes the preview a
+      // promise rather than a guess. Test rows filtered like every other
+      // subscription query — the admin test lab mints synthetic rows with ids
+      // Lemon Squeezy has never heard of, and asking it to cancel one would
+      // fail every attempt until the task dead-lettered: a permanent red mark
+      // for a subscription that never existed, sitting next to the real ones
+      // that do need attention.
+      subscriptionsForDeletion(userId),
     ]);
 
     // STOP CHARGING THE CARD. Deleting the account here removed our record of the
@@ -98,11 +227,11 @@ meRouter.delete(
     // outlive them. The outbox is keyed on the provider's id for the same reason
     // — by the time it is retried, the account it belonged to will not exist.
     for (const s of oldSubs) {
-      if (s.status === "expired" || s.status === "cancelled") continue; // nothing left to stop
-      // The outbox speaks Lemon Squeezy only. An Apple subscription cannot be
-      // cancelled from the server — the customer does that in their App Store
-      // settings — so enqueueing it would only mint a dead-lettered task.
-      if (s.provider !== "lemonsqueezy") continue;
+      // The SHARED predicate (see the top of this file): live Lemon Squeezy
+      // rows only. `cancelled`/`expired` have nothing left to stop, and Apple
+      // rows cannot be cancelled from the server — the preview says the same
+      // thing for the same reason, because it calls the same function.
+      if (!deleteWouldAutoCancel(s)) continue;
       const recorded = await enqueueAndAttemptCancel(s.externalId, "account-deleted");
       // We are one line away from deleting the only record of this subscription.
       // If the instruction did not land, stopping here is the lesser harm: the

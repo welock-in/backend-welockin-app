@@ -627,6 +627,97 @@ test("changing plan comes from the token, never the request body", async (t) => 
   assert.equal(finds[0][0].where.userId, userId);
 });
 
+/*
+ * PayPal-backed subscriptions cannot be PATCHed — Lemon Squeezy answers 422,
+ * because the change must go through PayPal's own consent flow — and the
+ * subscription object then carries `urls.customer_portal_update_subscription`,
+ * the one page that CAN do it. The client must receive that page as a stable
+ * code, not a dead-end prose error.
+ */
+test("a PayPal-backed change-plan hands back the portal that CAN do it", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
+  configuredVariants(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [liveMonthly]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubFetch(t, async (_u: string, i: any) => {
+    if ((i?.method ?? "GET") === "PATCH") {
+      return {
+        ok: false,
+        status: 422,
+        json: async () => ({ errors: [{ title: "Unprocessable Entity", detail: "PayPal subscriptions cannot be updated" }] }),
+      };
+    }
+    // The re-fetch: the subscription object carries the PayPal portal page.
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: { attributes: { urls: { customer_portal_update_subscription: "https://x/paypal-portal" } } },
+      }),
+    };
+  });
+
+  const res = await request(app).post("/api/subscription/change-plan").set(auth).send({ plan: "yearly" });
+
+  assert.equal(res.status, 409);
+  assert.equal(res.body.code, "SUBSCRIPTION_PORTAL_REQUIRED");
+  assert.equal(res.body.url, "https://x/paypal-portal");
+});
+
+test("a 422 with no portal page to offer stays the generic refusal", async (t) => {
+  // Not every 422 is PayPal. When the re-fetch has no portal URL, the honest
+  // answer is still the provider's own refusal — never a 409 pointing nowhere.
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
+  configuredVariants(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [liveMonthly]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubFetch(t, async (_u: string, i: any) => {
+    if ((i?.method ?? "GET") === "PATCH") {
+      return { ok: false, status: 422, json: async () => ({ errors: [{ title: "Unprocessable Entity" }] }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ data: { attributes: { urls: {} } } }) };
+  });
+
+  const res = await request(app).post("/api/subscription/change-plan").set(auth).send({ plan: "yearly" });
+
+  assert.equal(res.status, 400);
+  assert.equal(res.body.code, undefined);
+});
+
+test("a PayPal-backed end-trial hands back the same portal", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
+  configured(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [liveTrial]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  stubFetch(t, async (_u: string, i: any) => {
+    if ((i?.method ?? "GET") === "PATCH") {
+      return { ok: false, status: 422, json: async () => ({ errors: [{ title: "Unprocessable Entity" }] }) };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: { attributes: { urls: { customer_portal_update_subscription: "https://x/paypal-portal" } } },
+      }),
+    };
+  });
+
+  const res = await request(app).post("/api/subscription/end-trial").set(auth);
+
+  assert.equal(res.status, 409);
+  assert.equal(res.body.code, "SUBSCRIPTION_PORTAL_REQUIRED");
+  assert.equal(res.body.url, "https://x/paypal-portal");
+});
+
 test("change-plan rejects a plan that is not monthly or yearly (no lifetime here)", async (t) => {
   stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
   stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);

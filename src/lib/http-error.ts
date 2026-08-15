@@ -54,6 +54,22 @@ export const transactionForeign = (msg = "This transaction belongs to another ap
 export const transactionUnknownProduct = (msg = "Unknown product") =>
   new HttpError(400, msg, { code: "TRANSACTION_UNKNOWN_PRODUCT" });
 
+// --- Subscriptions ----------------------------------------------------------
+/**
+ * The change is possible, just not from HERE. Lemon Squeezy cannot PATCH a
+ * PayPal-backed subscription — the API answers 422 — because the change has to
+ * go through PayPal's own consent flow, which lives behind the signed
+ * `customer_portal_update_subscription` URL on the subscription object.
+ *
+ * Carries that URL so the client can open the page that CAN do it instead of
+ * dead-ending on an error, and MUST carry the code: without it this 409 is
+ * indistinguishable from "there is nothing to change".
+ */
+export const subscriptionPortalRequired = (
+  url: string,
+  msg = "This subscription can only be changed from its billing portal",
+) => new HttpError(409, msg, { code: "SUBSCRIPTION_PORTAL_REQUIRED", details: { url } });
+
 // --- Onboarding funnel ------------------------------------------------------
 // The mobile funnel branches on these `code` values.
 export const ageBelowMinimum = (minimumAge: number) =>

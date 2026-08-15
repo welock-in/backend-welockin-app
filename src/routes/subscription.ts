@@ -14,7 +14,7 @@ import { isReliableDeviceId, readDeviceId } from "../lib/device";
 import { ledgerHash } from "../lib/hash";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
-import { badRequest, conflict, HttpError } from "../lib/http-error";
+import { badRequest, conflict, HttpError, subscriptionPortalRequired } from "../lib/http-error";
 import { readLemonSqueezyError } from "../lib/lemonsqueezy";
 import { changePlanSchema } from "../validation/schemas";
 import { clientIp, consumeRateLimit } from "../lib/rate-limit";
@@ -25,6 +25,59 @@ export const subscriptionRouter = Router();
 const LS_TIMEOUT_MS = 10_000;
 
 const PROVIDER = "lemonsqueezy";
+
+/**
+ * The portal page that CAN change a PayPal-backed subscription.
+ *
+ * Lemon Squeezy refuses to PATCH a subscription whose payment method is a
+ * PayPal billing agreement — every update answers 422, because the change has
+ * to go through PayPal's own consent flow — and instead exposes a signed
+ * `customer_portal_update_subscription` URL on the subscription object.
+ * Fetched at the moment it is needed, like `GET /portal`, because the
+ * signature expires after 24 hours.
+ *
+ * Best-effort by design: null on any failure, and the caller falls back to the
+ * generic refusal — a broken re-fetch must not bury the original error.
+ */
+async function portalUpdateSubscriptionUrl(externalId: string): Promise<string | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LS_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${env.lemonSqueezyApiBase}/v1/subscriptions/${externalId}`, {
+      method: "GET",
+      headers: {
+        Accept: "application/vnd.api+json",
+        Authorization: `Bearer ${env.lemonSqueezyApiKey}`,
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) return null;
+    const body = (await response.json()) as {
+      data?: { attributes?: { urls?: { customer_portal_update_subscription?: string } } };
+    };
+    return body.data?.attributes?.urls?.customer_portal_update_subscription ?? null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Turn a refused PATCH into the answer the client can act on, when there is one.
+ *
+ * A 422 is Lemon Squeezy refusing the OPERATION, not the request shape — and
+ * for a PayPal-backed subscription it refuses every PATCH. When that is the
+ * story, the subscription carries the portal page that can make the change,
+ * and the client gets a 409 SUBSCRIPTION_PORTAL_REQUIRED with that URL instead
+ * of a dead-end 400. Any other failure — or a 422 with no portal URL to offer
+ * — falls through to the caller's generic error.
+ */
+async function throwPortalRequiredIfPayPal(status: number, externalId: string): Promise<void> {
+  if (status !== 422) return;
+  const url = await portalUpdateSubscriptionUrl(externalId);
+  if (url) throw subscriptionPortalRequired(url);
+}
 
 /**
  * "Pay now" — end the free trial immediately and take the payment.
@@ -152,6 +205,7 @@ subscriptionRouter.post(
         `[subscription] Lemon Squeezy refused to end trial ${trial.externalId}: ` +
           `HTTP ${response.status} — ${why}`,
       );
+      await throwPortalRequiredIfPayPal(response.status, trial.externalId);
       throw badRequest(`Could not take the payment — ${why}`);
     }
 
@@ -798,6 +852,7 @@ subscriptionRouter.post(
         `[subscription] Lemon Squeezy refused to change ${live.externalId} to ${plan}: ` +
           `HTTP ${response.status} — ${why}`,
       );
+      await throwPortalRequiredIfPayPal(response.status, live.externalId);
       throw badRequest(`Could not change the plan — ${why}`);
     }
 

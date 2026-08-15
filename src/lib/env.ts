@@ -509,6 +509,22 @@ export const env = {
    */
   deviceBindingEnforced: (process.env.DEVICE_BINDING_ENFORCED ?? "false") === "true",
   /**
+   * May a SIGNUP be REFUSED because this device already belongs to a PAYING
+   * account (spec S1/N4)?
+   *
+   * The server-side half of the precheck (`POST /api/auth/precheck` +
+   * lib/precheck.ts): the client shows the interstitial, this makes it
+   * unbypassable. OFF by default and flipped only once the iOS build that can
+   * RENDER the 409 (code DEVICE_LINKED_TO_PAYING_ACCOUNT) has shipped — before
+   * that, every blocked user would see an error with no way to act on it,
+   * which is the same staging rule as `emailVerificationEnforced`.
+   *
+   * Same shape as `deviceBindingEnforced` above, for the same reason: the
+   * false positives are real people (a resold iPhone, a family's shared iPad),
+   * so the refusal needs an off switch that works without a deploy.
+   */
+  signupPayingDeviceBlock: (process.env.SIGNUP_PAYING_DEVICE_BLOCK ?? "false") === "true",
+  /**
    * Turn off auth rate limiting. TESTS ONLY.
    *
    * Requires the literal string "true" for the same reason

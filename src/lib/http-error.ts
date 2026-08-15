@@ -167,3 +167,24 @@ export const resetTokenInvalid = (msg = "This link has expired or has already be
 export const deviceAlreadyClaimed = (
   msg = "This computer is already linked to a WeLockIn account. Sign in with it, or contact hello@welock.in.",
 ) => new HttpError(409, msg, { code: "DEVICE_ALREADY_CLAIMED" });
+
+/**
+ * This device already belongs to an account with REAL MONEY on it, and
+ * `SIGNUP_PAYING_DEVICE_BLOCK` says to refuse a second account rather than let
+ * someone accidentally pay twice (spec S1/N4).
+ *
+ * Sibling of `deviceAlreadyClaimed`, but it MUST carry more than a code: the
+ * client's interstitial says "this phone already has a paying account —
+ * {maskedEmail}" and offers the right sign-in buttons, and neither is knowable
+ * client-side. `maskedEmail` is the `maskEmail` form, never the raw address —
+ * this 409 answers people who have NOT authenticated as that account.
+ */
+export const deviceLinkedToPayingAccount = (
+  maskedEmail: string,
+  loginMethods: ("password" | "apple")[],
+  msg = "This device already belongs to a WeLockIn account with an active purchase. Sign in with that account instead.",
+) =>
+  new HttpError(409, msg, {
+    code: "DEVICE_LINKED_TO_PAYING_ACCOUNT",
+    details: { maskedEmail, loginMethods },
+  });

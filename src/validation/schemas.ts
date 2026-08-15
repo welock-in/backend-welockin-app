@@ -130,6 +130,22 @@ export const attestRegisterSchema = z.object({
   challenge: z.string().trim().min(1),
 });
 
+/**
+ * `POST /api/auth/precheck` (spec S1/N4 + L1/N6). The identity that matters is
+ * the `X-WeLockIn-Device-Id` header, like `startTrialSchema`; the body carries
+ * only the iOS `identifierForVendor` fallback leg.
+ *
+ * DELIBERATELY NO `email` FIELD. This endpoint is unauthenticated, and an email
+ * parameter would turn it into an account-existence oracle: feed it addresses
+ * and read back who is a paying customer. The lookup is keyed on things only
+ * the physical device knows — a caller can learn about the device in their
+ * hand, never about an address in their list.
+ */
+export const precheckSchema = z.object({
+  /** iOS `identifierForVendor` — same bounds discipline as `deviceSchema`. */
+  idfv: z.string().trim().min(1).max(128).optional(),
+});
+
 export const appleAuthSchema = z.object({
   identityToken: z.string().min(1, "identityToken is required"),
   // Extra client-supplied fields are deliberately stripped. In particular, an

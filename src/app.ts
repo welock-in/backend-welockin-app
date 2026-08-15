@@ -9,6 +9,7 @@ import { healthLemonSqueezyRouter } from "./routes/health-lemonsqueezy";
 import { updatesRouter } from "./routes/updates";
 import { authRouter } from "./routes/auth";
 import { authEmailRouter } from "./routes/auth-email";
+import { authPrecheckRouter } from "./routes/auth-precheck";
 import { contactRouter } from "./routes/contact";
 import { meRouter } from "./routes/me";
 import { devicesRouter } from "./routes/devices";
@@ -89,6 +90,11 @@ export function createApp(): Express {
   // are the routes an UNVERIFIED account must still be able to reach, so they
   // can never sit behind the gate they exist to open.
   app.use("/api/auth", authEmailRouter);
+  // The device → paying-account precheck. PUBLIC like its siblings above — it
+  // runs BEFORE signup by definition, so a bearer token is the one thing its
+  // callers cannot be required to have (a valid one is still read, for
+  // `isCurrentUser`). Abuse is handled by rate limits inside the route.
+  app.use("/api/auth/precheck", authPrecheckRouter);
   // The site's contact form. PUBLIC like the reset routes above it: the people
   // most likely to write in are locked out or have no account, so a bearer
   // token is the one thing they cannot supply. Abuse is handled by rate limits

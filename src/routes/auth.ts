@@ -2,8 +2,14 @@ import { Router } from "express";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { signToken } from "../lib/jwt";
-import { toPublicUser } from "../lib/user";
-import { badRequest, conflict, deviceAlreadyClaimed, unauthorized } from "../lib/http-error";
+import { maskEmail, toPublicUser } from "../lib/user";
+import {
+  badRequest,
+  conflict,
+  deviceAlreadyClaimed,
+  deviceLinkedToPayingAccount,
+  unauthorized,
+} from "../lib/http-error";
 import { asyncHandler } from "../middleware/async-handler";
 import { appleAuthSchema, loginSchema, registerSchema } from "../validation/schemas";
 import { env } from "../lib/env";
@@ -19,6 +25,7 @@ import {
 import { deterministicObjectId } from "../lib/deterministic-id";
 import { readDeviceId } from "../lib/device";
 import { claimTrialOnSignup } from "../lib/trial-claim";
+import { findPayingAccountForDevice } from "../lib/precheck";
 
 const isDuplicateKey = (err: unknown) =>
   err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
@@ -51,6 +58,24 @@ authRouter.post(
     if (env.deviceBindingEnforced && fingerprint.signals.length > 0) {
       const owner = await findBlockingClaimOwner(fingerprint.signals);
       if (owner) throw deviceAlreadyClaimed();
+    }
+
+    // The paying-device gate (S1/N4) — defence in depth behind the client's
+    // precheck interstitial: a patched client skips the interstitial, not this.
+    // Only an account with REAL MONEY blocks (a comp or a spent trial does
+    // not), and only a DIFFERENT address: the paying owner re-registering
+    // their own email is stopped by the duplicate-email 409 above, which says
+    // "sign in" — the right advice — rather than this refusal.
+    if (env.signupPayingDeviceBlock) {
+      const precheck = await findPayingAccountForDevice({
+        deviceId: readDeviceId(req),
+        signals: fingerprint.signals,
+        env,
+      });
+      const paying = precheck.payingAccount;
+      if (paying && paying.email !== email) {
+        throw deviceLinkedToPayingAccount(maskEmail(paying.email), paying.loginMethods);
+      }
     }
 
     const passwordHash = await hashPassword(password);
@@ -147,6 +172,26 @@ authRouter.post(
 
       const providerId = deterministicObjectId("auth-provider", "apple", identity.sub);
       const existing = await prisma.user.findUnique({ where: { email } });
+
+      // The paying-device gate (S1/N4), on the CREATED branch only. Linking
+      // Apple to an existing account, or any later re-login, must never be
+      // blocked — the paying account signing into ITSELF is the precheck's
+      // happy ending, not its target. `existing` here means the Apple email
+      // already has an account, i.e. the link/converge path below, so the gate
+      // applies exactly when a brand-new account is about to be minted. The
+      // email comparison is belt-and-braces: a paying account with this very
+      // address would have been found by the `existing` lookup above.
+      if (!existing && env.signupPayingDeviceBlock) {
+        const precheck = await findPayingAccountForDevice({
+          deviceId: readDeviceId(req),
+          signals: parseFingerprint(req).signals,
+          env,
+        });
+        const paying = precheck.payingAccount;
+        if (paying && paying.email !== email) {
+          throw deviceLinkedToPayingAccount(maskEmail(paying.email), paying.loginMethods);
+        }
+      }
 
       try {
         if (existing) {

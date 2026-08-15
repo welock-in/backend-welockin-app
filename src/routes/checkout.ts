@@ -3,13 +3,8 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { checkoutConfirmSchema, checkoutSchema } from "../validation/schemas";
-import {
-  ELIGIBILITY_MESSAGES,
-  hideTestRowsFor,
-  planEligibility,
-  variantForPlan,
-} from "../lib/subscription";
-import { cancellationStates } from "../lib/billing-tasks";
+import { ELIGIBILITY_MESSAGES, variantForPlan } from "../lib/subscription";
+import { loadEligibilityInputs, purchaseEligibilityFrom } from "../lib/eligibility-io";
 import {
   CHECKOUT_TTL_MS,
   conflictingKeyPlan,
@@ -18,7 +13,6 @@ import {
   markFailed,
   markReady,
   markUncertain,
-  outstandingAcquisition,
   reserveAcquisition,
 } from "../lib/checkout-intent";
 import {
@@ -30,7 +24,6 @@ import {
 } from "../lib/lemonsqueezy";
 import { clientIp, consumeRateLimit } from "../lib/rate-limit";
 import { readDeviceId, isReliableDeviceId } from "../lib/device";
-import { ledgerHash } from "../lib/hash";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { HttpError, accountGone, badRequest, conflict, notFound } from "../lib/http-error";
@@ -107,20 +100,6 @@ checkoutRouter.post(
     });
     if (!user) throw accountGone();
 
-    // Do not send someone to pay for what they already own. A lifetime licence
-    // makes every plan pointless — a second purchase buys nothing, and refunding
-    // it afterwards costs us the fee and them the goodwill.
-    const owned = await prisma.purchase.findFirst({
-      where: { userId, isRefunded: false, ...hideTestRowsFor(userId, env) },
-      select: { id: true },
-    });
-
-    // A live subscription blocks a SECOND subscription, but never the upgrade to
-    // lifetime: someone paying monthly who wants to stop paying monthly is the
-    // best possible customer, and refusing them is refusing money. Changing
-    // between monthly and yearly is a Lemon Squeezy operation on the existing
-    // subscription, not a new checkout — sending them here would leave them
-    // holding two.
     // ONE FREE TRIAL, PER ACCOUNT *AND* PER MACHINE. Lemon Squeezy applies the
     // variant's trial to EVERY checkout for it — their docs are explicit that
     // repeat-trial prevention is the merchant's job — so a lapsed customer, or
@@ -141,58 +120,19 @@ checkoutRouter.post(
     // "unidentified" fallback is treated as no id (see isReliableDeviceId).
     const rawDeviceId = readDeviceId(req);
     const deviceId = isReliableDeviceId(rawDeviceId) ? rawDeviceId : "";
-    // ONE DECISION, SHARED WITH THE PAYWALL.
+    // ONE DECISION, SHARED WITH THE PAYWALL — fed from ONE set of reads.
     //
-    // `planEligibility` is exactly what `GET /api/subscription` renders from, so
-    // this endpoint cannot refuse a purchase the status call has just advertised
-    // — nor refuse it for a reason the screen never mentioned. Two copies of
-    // this rule is how an API ends up saying "you may buy yearly" and then
-    // answering 409 with something else.
-    //
-    // EVERY PLAN is evaluated, not just the requested one, because the answers
-    // are not independent: a lifetime licence already owned refuses all three,
-    // while a pending recurring cancellation refuses monthly and yearly and
-    // leaves lifetime alone (it is not a subscription, so it cannot become a
-    // second one — see the saga note on `planEligibility`).
-    const subs = await prisma.subscription.findMany({
-      where: { userId, ...hideTestRowsFor(userId, env) },
-      select: {
-        externalId: true,
-        status: true,
-        validUntil: true,
-        // Mixed-provider query: without this, the Lemon Squeezy variant
-        // allowlist inside `subscriptionGrants` would judge RevenueCat rows
-        // too (see SubscriptionLike.provider).
-        provider: true,
-        trialEndsAt: true,
-        trialCancelledAt: true,
-        pauseMode: true,
-        providerUpdatedAt: true,
-        createdAt: true,
-        variantId: true,
-        updatedAt: true,
-      },
-    });
-
-    // The device leg. A TrialClaim for this machine — written when its last
-    // trial started (see the webhook), or by the legacy cardless-trial path —
-    // means this computer has had its trial. Fails OPEN: no device id (an old
-    // client, or a machine that could not identify itself) simply falls back to
-    // the account leg, never a refusal.
-    const [cancellations, deviceClaim, outstanding] = await Promise.all([
-      cancellationStates(subs.map((sub) => sub.externalId)),
-      deviceId
-        ? prisma.trialClaim.findUnique({
-            where: { deviceIdHash: ledgerHash(deviceId) },
-            select: { id: true },
-          })
-        : Promise.resolve(null),
-      // What the paywall would advertise. The LOCK below is what enforces it —
-      // two simultaneous callers both read "nothing outstanding" here and only
-      // one can win the reservation. This read exists so the refusal a second
-      // request gets is the same one the status screen was already showing.
-      outstandingAcquisition(userId),
-    ]);
+    // `loadEligibilityInputs` is exactly what `GET /api/subscription` and the
+    // entitlement view render from, so this endpoint cannot refuse a purchase
+    // the status call has just advertised — nor refuse it for a reason the
+    // screen never mentioned. Two copies of the READS were how the API ended up
+    // saying "you may buy monthly" to an Apple subscriber and then answering
+    // 409: the rule was shared, the facts were not. See lib/eligibility-io.ts
+    // for what the inputs are (all-provider rows, the lifetime with its
+    // provider, the device trial leg, the outbox, the checkout hold — the
+    // outstanding read is advisory: the LOCK below is what enforces it, this
+    // read only makes the refusal match the screen).
+    const io = await loadEligibilityInputs(userId, rawDeviceId);
 
     // BEFORE the eligibility gate: a key that no longer matches its payload is a
     // broken request, not an ineligible account, and conflating the two hands the
@@ -207,23 +147,12 @@ checkoutRouter.post(
       }
     }
 
-    const decision = planEligibility({
-      subs,
-      cancellations,
-      ownsLifetime: owned != null,
-      deviceHadTrial: deviceClaim != null,
-      trialDays: {
-        monthly: env.lemonSqueezyTrialDaysMonthly,
-        yearly: env.lemonSqueezyTrialDaysYearly,
-      },
-      outstanding: outstanding
-        ? {
-            plan: outstanding.plan,
-            state: outstanding.state,
-            resumable: outstanding.state === "ready" && outstanding.checkoutUrl != null,
-          }
-        : null,
-    })[plan];
+    // EVERY PLAN is evaluated, not just the requested one, because the answers
+    // are not independent: a lifetime licence already owned refuses all three,
+    // while a pending recurring cancellation refuses monthly and yearly and
+    // leaves lifetime alone (it is not a subscription, so it cannot become a
+    // second one — see the saga note on `planEligibility`).
+    const decision = purchaseEligibilityFrom(io)[plan];
 
     if (!decision.canPurchase) {
       throw new HttpError(409, ELIGIBILITY_MESSAGES[decision.reasonCode], {

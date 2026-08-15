@@ -258,6 +258,18 @@ export type PlanEligibility = {
   /** Days of trial this plan would grant — 0 unless `trialMode` is "eligible". */
   trialDays: number;
   /**
+   * WHICH store's row is in the way, when the refusal is about something the
+   * account already holds (`ACTIVE_SUBSCRIPTION` / `LIFETIME_ALREADY_OWNED`).
+   *
+   * The client's next sentence depends on it: an Apple subscription is managed
+   * on the iPhone and this server can neither cancel nor change it, so "go to
+   * Change plan" — the right advice for a Lemon Squeezy row — is a dead end.
+   * Optional and best-effort: absent when the caller could not say (an old
+   * fixture, a row written before providers were recorded), and the client
+   * falls back to its provider-less copy.
+   */
+  blockingProvider?: "lemonsqueezy" | "revenuecat";
+  /**
    * When the outstanding acquisition stops holding this plan back, ISO 8601.
    *
    * Present only on the plans an in-flight checkout affects — the resumable one
@@ -318,6 +330,22 @@ const BLOCK_SEVERITY: readonly CheckoutBlockReason[] = [
   "ACTIVE_SUBSCRIPTION",
   "CANCELLED_ACCESS_REMAINING",
 ];
+
+/**
+ * A stored provider, normalised to the two words `blockingProvider` speaks.
+ *
+ * `app_store` folds into "revenuecat" because they are the same world for the
+ * client's purposes — an Apple purchase, managed by Apple, whichever pipe
+ * mirrored it. Anything unrecognised returns undefined and the field is simply
+ * omitted: a guess here would send someone to the wrong store's manage page.
+ */
+function blockingProviderOf(
+  provider: string | null | undefined,
+): "lemonsqueezy" | "revenuecat" | undefined {
+  if (provider === "lemonsqueezy") return "lemonsqueezy";
+  if (provider === "revenuecat" || provider === "app_store") return "revenuecat";
+  return undefined;
+}
 
 /**
  * Does THIS subscription row stand in the way of a new recurring purchase?
@@ -388,9 +416,17 @@ export function blocksNewRecurringCheckout(
  * by accident: it never touches `blocksNewRecurringCheckout`.
  */
 export function planEligibility(input: {
-  subs: ReadonlyArray<{ externalId: string; status: string; trialCancelledAt: Date | null }>;
+  subs: ReadonlyArray<{
+    externalId: string;
+    status: string;
+    trialCancelledAt: Date | null;
+    /** Which store's row — absent means "lemonsqueezy", like SubscriptionLike. */
+    provider?: string;
+  }>;
   cancellations: ReadonlyMap<string, CancellationState>;
   ownsLifetime: boolean;
+  /** Which store sold the lifetime, when `ownsLifetime` — for `blockingProvider`. */
+  lifetimeProvider?: string | null;
   deviceHadTrial: boolean;
   trialDays: { monthly: number; yearly: number };
   /**
@@ -399,27 +435,34 @@ export function planEligibility(input: {
    */
   outstanding?: { plan: string; state: string; resumable: boolean; expiresAt?: string } | null;
 }): Record<PurchasePlan, PlanEligibility> {
-  const blocked = (): CheckoutBlockReason | null => {
-    const hits = new Set<CheckoutBlockReason>();
+  const blocked = (): { reason: CheckoutBlockReason; row?: { provider?: string } } | null => {
+    // The FIRST row per reason wins the attribution: rows arrive most recently
+    // updated first, so a tie goes to the one the customer touched last.
+    const hits = new Map<CheckoutBlockReason, { provider?: string }>();
     for (const sub of input.subs) {
       const reason = blocksNewRecurringCheckout(
         sub,
         input.cancellations.get(sub.externalId) ?? "none",
       );
-      if (reason) hits.add(reason);
+      if (reason && !hits.has(reason)) hits.set(reason, sub);
     }
-    return BLOCK_SEVERITY.find((r) => hits.has(r)) ?? null;
+    const reason = BLOCK_SEVERITY.find((r) => hits.has(r));
+    return reason ? { reason, row: hits.get(reason) } : null;
   };
 
-  const refuse = (reasonCode: CheckoutBlockReason): PlanEligibility => ({
+  const refuse = (
+    reasonCode: CheckoutBlockReason,
+    blockingProvider?: "lemonsqueezy" | "revenuecat",
+  ): PlanEligibility => ({
     canPurchase: false,
     reasonCode,
     trialMode: "none",
     trialDays: 0,
+    ...(blockingProvider ? { blockingProvider } : {}),
   });
 
   if (input.ownsLifetime) {
-    const owned = refuse("LIFETIME_ALREADY_OWNED");
+    const owned = refuse("LIFETIME_ALREADY_OWNED", blockingProviderOf(input.lifetimeProvider));
     return { monthly: owned, yearly: owned, lifetime: owned };
   }
 
@@ -469,7 +512,17 @@ export function planEligibility(input: {
 
   const block = blocked();
   if (block) {
-    return { monthly: refuse(block), yearly: refuse(block), lifetime };
+    // The provider is named only on ACTIVE_SUBSCRIPTION — the one refusal whose
+    // remedy differs by store (an Apple plan cannot be changed from here). The
+    // checkout-hold and outbox refusals are about OUR bookkeeping, not a row
+    // the customer can act on at either store.
+    const refusal = refuse(
+      block.reason,
+      block.reason === "ACTIVE_SUBSCRIPTION"
+        ? blockingProviderOf(block.row?.provider ?? "lemonsqueezy")
+        : undefined,
+    );
+    return { monthly: refusal, yearly: refusal, lifetime };
   }
 
   // The account leg and the device leg, exactly as the checkout computes them:

@@ -321,6 +321,41 @@ test("the management URL rides along for the billing view", () => {
   assert.equal(plan.managementUrl, "https://apps.apple.com/account/subscriptions");
 });
 
+test("the management URL is PERSISTED on every subscription row it mirrors", () => {
+  // Both callers used to discard `plan.managementUrl` after the upserts, so the
+  // one page that can manage an Apple subscription was fetched on every sync
+  // and stored nowhere — and the entitlement view had nothing to hand the
+  // client. It now rides in the row's own `customerPortalUrl`, the same column
+  // the Lemon Squeezy webhook fills with its portal link.
+  const row = onlySub(subscriberWith({ expires_date: FUTURE, period_type: "normal" }));
+  assert.equal(row.data.customerPortalUrl, "https://apps.apple.com/account/subscriptions");
+});
+
+test("a subscriber with no management URL writes null, never a stale leftover", () => {
+  const subscriber = subscriberWith({ expires_date: FUTURE });
+  delete (subscriber as { management_url?: unknown }).management_url;
+  const row = onlySub(subscriber);
+  assert.equal(row.data.customerPortalUrl, null);
+});
+
+test("the upsert hands RevenueCat's manage URL to the database", async (t) => {
+  // End to end through syncUserFromRevenueCat: the URL must be IN the written
+  // data, not merely in the projection — this is the line that was missing.
+  const db = stubSync(t, ok(subscriberWith({ expires_date: FUTURE, period_type: "normal" })));
+
+  await syncUserFromRevenueCat(USER);
+
+  assert.equal(db.subUpsert.length, 1);
+  assert.equal(
+    db.subUpsert[0][0].update.customerPortalUrl,
+    "https://apps.apple.com/account/subscriptions",
+  );
+  assert.equal(
+    db.subUpsert[0][0].create.customerPortalUrl,
+    "https://apps.apple.com/account/subscriptions",
+  );
+});
+
 /* ── the authoritative sweep (the transfer-loser leak) ──────────────────── */
 
 type Ctx = { after: (fn: () => void) => void };

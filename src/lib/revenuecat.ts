@@ -255,6 +255,15 @@ export type RcSubscriptionWrite = {
     providerUpdatedAt: Date;
     appUserId: string;
     originalAppUserId: string | null;
+    /**
+     * RevenueCat's `management_url` — the page that can actually manage this
+     * subscription (App Store subscriptions for an app_store row). Persisted on
+     * the SAME column the Lemon Squeezy webhook writes its portal link to, so
+     * every reader of "where does this row get managed" has one place to look.
+     * Subscriber-level at RevenueCat, so every row of one sync carries the same
+     * value; unlike the signed Lemon Squeezy links it does not expire.
+     */
+    customerPortalUrl: string | null;
   };
 };
 
@@ -364,6 +373,14 @@ export function projectSubscriber(userId: string, subscriber: RcSubscriber, now:
   const subscriptions: RcSubscriptionWrite[] = [];
   const purchases: RcPurchaseWrite[] = [];
 
+  // Computed once, up front: it rides on every subscription row (see
+  // RcSubscriptionWrite.data.customerPortalUrl) AND in the plan's own field for
+  // the caller that wants it without a row.
+  const managementUrl =
+    typeof subscriber.management_url === "string" && subscriber.management_url
+      ? subscriber.management_url
+      : null;
+
   for (const [productId, sub] of Object.entries(subscriber.subscriptions ?? {})) {
     if (!sub || typeof sub !== "object") continue;
     if (!(RC_SUBSCRIPTION_PRODUCT_IDS as readonly string[]).includes(productId)) continue;
@@ -409,6 +426,10 @@ export function projectSubscriber(userId: string, subscriber: RcSubscriber, now:
           typeof subscriber.original_app_user_id === "string"
             ? subscriber.original_app_user_id
             : null,
+        // Written (and overwritten) on every sync, like every other field here:
+        // the row mirrors what IS, and a snapshot without the URL clears it
+        // rather than leaving a stale one to be handed out as current.
+        customerPortalUrl: managementUrl,
       },
     });
   }
@@ -501,14 +522,7 @@ export function projectSubscriber(userId: string, subscriber: RcSubscriber, now:
     }
   }
 
-  return {
-    subscriptions,
-    purchases,
-    managementUrl:
-      typeof subscriber.management_url === "string" && subscriber.management_url
-        ? subscriber.management_url
-        : null,
-  };
+  return { subscriptions, purchases, managementUrl };
 }
 
 /* ── the I/O glue both entry points share ───────────────────────────────── */

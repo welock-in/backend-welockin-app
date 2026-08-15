@@ -89,7 +89,7 @@ function stubDb(t: Ctx, overrides: Record<string, (...args: any[]) => any> = {})
     subWrite: stubMethod(t, prisma.subscription as any, "updateMany", pick("subWrite", async () => ({ count: 0 }))),
     subFind: stubMethod(t, prisma.subscription as any, "findUnique", pick("subFind", async () => null)),
     // A lifetime purchase cancels the buyer's live subscription
-    // (cancelSubscriptionsForLifetimeBuyer). Baseline: none to cancel.
+    // (cancelRecurringLsForLifetimeBuyer). Baseline: none to cancel.
     subFindMany: stubMethod(t, prisma.subscription as any, "findMany", pick("subFindMany", async () => [])),
     subCreate: stubMethod(t, prisma.subscription as any, "create", pick("subCreate", async () => ({}))),
     purchaseUpsert: stubMethod(t, prisma.purchase as any, "upsert", pick("purchaseUpsert", async () => ({}))),

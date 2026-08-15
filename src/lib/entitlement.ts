@@ -53,10 +53,15 @@ export function isSellableProductId(productId: string): boolean {
 }
 
 /**
- * `User.plan` values. This column is a DENORMALIZED MIRROR, never the authority:
- * the desktop clients and `GET /api/me` have always read it, so it keeps being
- * written, but every access decision comes from the `Purchase` rows and the
- * `TrialClaim` ledger. Do not gate on it.
+ * Legacy plan WORDS, kept only because `purchaseEffect` still names its verdict
+ * with them (and a test pins that contract). They are NOT what `User.plan`
+ * holds any more: that column carries the resolver's own status vocabulary —
+ * "trialing" | "active" | "expired" | "refunded" | "comped" | "revoked" —
+ * written by its ONE writer, `resolveAndCache` (routes/entitlement.ts), as a
+ * denormalized cache for the admin console and `GET /api/me`. Never the
+ * authority: every access decision comes from the `Purchase`/`Subscription`
+ * rows and the `TrialClaim` ledger. Do not gate on it, and do not write it
+ * anywhere else — a mirror with two writers is worse than no mirror.
  */
 export const PLAN = {
   trial: "trial",

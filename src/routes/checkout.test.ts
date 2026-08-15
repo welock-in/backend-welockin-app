@@ -992,8 +992,13 @@ function lsSubList(over: Record<string, unknown> = {}) {
           status: "on_trial",
           variant_id: 1986433,
           product_id: 1270398,
-          trial_ends_at: "2026-08-11T10:00:00Z",
-          renews_at: "2026-08-11T10:00:00Z",
+          // RELATIVE, not a hardcoded instant, for the reason the webhook
+          // suite's subBody() spells out: "2026-08-11T10:00:00Z" quietly slid
+          // into the past, and a fixture that expires does not test less over
+          // time — it tests something else (an on_trial row that no longer
+          // grants).
+          trial_ends_at: new Date(Date.now() + 7 * 86_400_000).toISOString(),
+          renews_at: new Date(Date.now() + 7 * 86_400_000).toISOString(),
           ends_at: null,
           urls: { update_payment_method: "https://x/upm", customer_portal: "https://x/portal" },
           updated_at: "2026-08-08T10:00:05Z",

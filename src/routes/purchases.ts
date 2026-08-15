@@ -29,7 +29,7 @@ import { resolveAndCache } from "./entitlement";
 
    TWO PRODUCTS, TWO EFFECTS:
      · the lifetime unlock    → a `Purchase` row (the existing model, so
-       no migration), plus the `User.plan` mirror the desktop reads;
+       no migration);
      · the Price-Tier-0 trial → a `TrialClaim`, bound to the Apple ID,
        the phone AND the account at once.
 
@@ -130,7 +130,7 @@ purchasesRouter.post(
     );
 
     if (effect.kind === "lifetime") {
-      await recordLifetime(userId, tx, effect.refunded, effect.plan);
+      await recordLifetime(userId, tx, effect.refunded);
     } else if (effect.kind === "trial") {
       await claimTrial(userId, tx.originalTransactionId, deviceId, idfv, effect);
     }
@@ -155,7 +155,6 @@ async function recordLifetime(
   userId: string,
   tx: { originalTransactionId: string; productId: string; purchaseDate: number },
   refunded: boolean,
-  plan: string,
 ): Promise<void> {
   await prisma.purchase.upsert({
     where: {
@@ -177,9 +176,11 @@ async function recordLifetime(
     },
   });
 
-  // Denormalized mirror for the desktop clients and GET /api/me, which have always
-  // read `plan`. Best-effort: the Purchase row above is the authority.
-  await prisma.user.update({ where: { id: userId }, data: { plan } }).catch(() => {});
+  // Deliberately NOT touching `User.plan`. The cache has ONE writer —
+  // `resolveAndCache`, which the route calls right after this and which writes
+  // the resolver's own vocabulary. A second writer here wrote a different word
+  // ("lifetime") for the resolver to overwrite moments later ("active"), and a
+  // mirror two writers disagree about is worse than no mirror.
 }
 
 /**
@@ -283,9 +284,10 @@ async function claimTrial(
         id: userId,
         OR: [{ trialEndsAt: null }, { trialEndsAt: { gt: governingEndsAt } }],
       },
-      // Deliberately not touching `plan`: a user who already owns the lifetime
-      // unlock can replay a trial transaction, and demoting their mirror to
-      // "trial" would misreport them to the desktop clients and /api/me.
+      // Deliberately not touching `plan` — the cache has one writer,
+      // `resolveAndCache` (see recordLifetime above). A demotion to "trial"
+      // written here on a replayed transaction would misreport a lifetime
+      // owner to the desktop clients until the next resolve corrected it.
       data: { trialEndsAt: governingEndsAt },
     })
     .catch(() => {});

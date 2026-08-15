@@ -6,7 +6,8 @@ import { env } from "./env";
  *
  * WeLockIn sells one thing here: a lifetime licence for the macOS and Windows
  * builds, which ship outside the App Store and therefore neither have to use, nor
- * can use, store IAP. iOS keeps going through Adapty because Apple requires it.
+ * can use, store IAP. iOS goes through the App Store, mirrored via RevenueCat,
+ * because Apple requires it.
  *
  * This module proves a delivery really came from Lemon Squeezy and reads the few
  * fields we care about. What a payment MEANS is the route's business.

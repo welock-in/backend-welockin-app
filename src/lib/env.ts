@@ -245,9 +245,9 @@ export const env = {
   // limits). Sends still work without it via the open Expo Push API.
   expoAccessToken: process.env.EXPO_ACCESS_TOKEN ?? "",
   // Lemon Squeezy — the DESKTOP purchase path (macOS + Windows, shipped outside
-  // the App Store, so no store IAP is imposed and none is possible). iOS keeps
-  // going through Adapty because Apple requires it there. Both land in the same
-  // Purchase table, told apart by `provider`.
+  // the App Store, so no store IAP is imposed and none is possible). iOS goes
+  // through the App Store via RevenueCat because Apple requires it there. Both
+  // land in the same Purchase table, told apart by `provider`.
   // LEMON_API_KEY is an alias, not a typo to clean up: it is the name the
   // production dashboard has carried since the first integration, and code
   // accepting both costs one line where a dashboard rename costs an outage

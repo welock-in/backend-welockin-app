@@ -29,6 +29,12 @@ model User {
   // Password registrations are unverified until an email-verification flow is
   // completed. Apple users are created with a verified token email.
   emailVerified Boolean?  @default(false)
+  /// The resolver's status vocabulary — "trialing"|"active"|"expired"|
+  /// "refunded"|"comped"|"revoked" — written by its ONE writer,
+  /// `resolveAndCache` (routes/entitlement.ts). A denormalized CACHE for the
+  /// admin console and GET /api/me, never gated on: access is decided from the
+  /// Purchase/Subscription rows and the TrialClaim ledger. The create-time
+  /// default "trial" is legacy and lasts only until the first resolve.
   plan          String    @default("trial")
   /// LEGACY, read-only. Every account created before the TrialClaim ledger
   /// carries the 14-day window that `POST /api/auth/register` used to stamp.
@@ -583,21 +589,22 @@ model OnboardingProfile {
 }
 
 // A completed payment. ONE row per storefront transaction, whatever the
-// storefront: iOS goes through Adapty because Apple requires store IAP, while the
-// macOS and Windows builds ship outside the App Store and are sold through Lemon
-// Squeezy. Both land here, told apart by `provider`, so entitlement stays one
-// rule instead of one rule per shop.
+// storefront: iOS goes through the App Store (its state mirrored via
+// RevenueCat) because Apple requires store IAP, while the macOS and Windows
+// builds ship outside the App Store and are sold through Lemon Squeezy. All
+// land here, told apart by `provider`, so entitlement stays one rule instead
+// of one rule per shop.
 model Purchase {
   id          String    @id @default(auto()) @map("_id") @db.ObjectId
   userId      String    @db.ObjectId
   user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  provider    String // "lemonsqueezy" | "adapty"
+  provider    String // "lemonsqueezy" | "app_store" | "revenuecat"
   store       String // "lemonsqueezy" | "app_store" | "play_store"
   productId   String
   /// The storefront's own id for this transaction, stable across replay and
   /// refund. Unique WITH the provider, never alone: two shops number their orders
-  /// independently, so an Adapty transaction id and a Lemon Squeezy order id can
-  /// collide — and a collision would hand one customer's licence to another.
+  /// independently, so an App Store transaction id and a Lemon Squeezy order id
+  /// can collide — and a collision would hand one customer's licence to another.
   externalId  String
   priceUsd    Float?
   purchasedAt DateTime
@@ -742,11 +749,12 @@ model Subscription {
   userId String @db.ObjectId
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  /// "lemonsqueezy". Present from the start so a second provider does not need a
-  /// migration — the same reason Purchase carries one.
+  /// "lemonsqueezy" | "revenuecat". Carried from the start precisely so the
+  /// second provider needed no migration — the same reason Purchase has one.
   provider String
-  /// Lemon Squeezy's subscription id. Unique WITH the provider, never alone: two
-  /// shops number their subscriptions independently.
+  /// The provider's subscription id — Lemon Squeezy's own, or the RevenueCat
+  /// mirror's `userId:productId` key. Unique WITH the provider, never alone:
+  /// two shops number their subscriptions independently.
   externalId String
 
   /// Which plan, so the UI can say "Yearly" rather than a bare price, and so a
@@ -962,7 +970,7 @@ model TrialClaim {
   /// Server wall clock, stamped ONCE. Immutable: nothing in the system may move
   /// a trial's end, which is the entire point of writing it down.
   endsAt      DateTime?
-  status      String?   @default("active") // "active"|"expired"|"converted"
+  status      String?   @default("active") // "active"|"expired"|"converted"|"card_trial"
 
   /// Abuse signals, recorded but never acted on automatically — they exist so a
   /// human reviewing a suspicious account has something to look at.

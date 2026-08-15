@@ -3,7 +3,6 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { completeIntent, intentByToken } from "../lib/checkout-intent";
 import { env } from "../lib/env";
-import { LIFETIME_PRODUCT_ID } from "../lib/entitlement";
 import { asyncHandler } from "../middleware/async-handler";
 import {
   HANDLED_EVENTS,
@@ -31,6 +30,16 @@ import { cancelRecurringLsForLifetimeBuyer } from "../lib/billing-tasks";
 export const lemonSqueezyWebhookRouter = Router();
 
 const PROVIDER = "lemonsqueezy";
+
+/**
+ * `Purchase.productId` for an order whose payload named no variant. It used to
+ * fall back to the APPLE lifetime Product ID, which stamped a Lemon Squeezy
+ * order as an App Store product — wrong provenance in the one column support
+ * reads to see what was bought. Nothing gates on Lemon Squeezy productId
+ * values (every reader filters on `provider`/`isRefunded` only), so the label
+ * is honest without being load-bearing.
+ */
+const FALLBACK_PRODUCT_ID = "lemonsqueezy:lifetime";
 
 /**
  * Lemon Squeezy order webhook — the first thing in this backend that writes a
@@ -268,7 +277,7 @@ export async function recordPaidOrder(
       userId,
       provider: PROVIDER,
       store: PROVIDER,
-      productId: order.variantId ?? LIFETIME_PRODUCT_ID,
+      productId: order.variantId ?? FALLBACK_PRODUCT_ID,
       externalId: order.orderId,
       priceUsd: order.priceUsd,
       purchasedAt: order.purchasedAt,
@@ -430,7 +439,7 @@ async function refund(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
       userId,
       provider: PROVIDER,
       store: PROVIDER,
-      productId: order.variantId ?? LIFETIME_PRODUCT_ID,
+      productId: order.variantId ?? FALLBACK_PRODUCT_ID,
       externalId: order.orderId,
       priceUsd: order.priceUsd,
       purchasedAt: order.purchasedAt,

@@ -187,8 +187,9 @@ project's environment settings.
 ### Payments — Lemon Squeezy (desktop lifetime licence)
 
 macOS and Windows ship outside the App Store, so no store IAP is imposed and
-none is possible; iOS keeps going through Adapty because Apple requires it.
-Both land in the same `Purchase` table, told apart by `provider`.
+none is possible; iOS goes through the App Store, mirrored via RevenueCat,
+because Apple requires it. Both land in the same `Purchase` table, told apart
+by `provider`.
 
 | Var | Default | Purpose |
 |---|---|---|
@@ -534,16 +535,16 @@ Build `npm install && npm run build`, start `npm start`. Provide `DATABASE_URL`,
 
 Honest posture (some are intentional product decisions, some are open work):
 
-- **No rate limiting** on `POST /api/auth/login`, `/register`, `POST /api/admin/login`, or the OTP `POST /api/addiction-protection/{lock,resend}` (the latter can email an attacker-chosen partner address repeatedly). Proper limiting on serverless needs a DB/Redis-backed limiter — tracked, not yet implemented.
+- **Rate limiting is DB-backed** (`AuthThrottle` via `src/lib/rate-limit.ts`, so it survives serverless fan-out) and covers login, register, admin login, email verification/reset, contact, checkout/confirm, and the subscription money routes (portal, change-plan). It **fails open** by design — a broken counter must not refuse every login — and the OTP `POST /api/addiction-protection/{lock,resend}` is still uncovered (it can email an attacker-chosen partner address repeatedly).
 - **Secrets fail *closed* in production.** With `NODE_ENV=production`, boot throws if `DATABASE_URL` or `JWT_SECRET` is unset (or `JWT_SECRET` is still the `change-me` placeholder) — no silent fallback to a guessable secret. In dev/test the fallbacks keep zero-config runs working.
 - **Partner OTP is stored in plaintext and shown to admins** — *intentional*: it's a friction code (with a 5-try cap), not a credential.
 - **Day-streak analytics use the server timezone (UTC on Vercel)**, so a streak can flip at a different local time than a non-UTC user expects.
 - **App Attest is scaffolded but fail-closed** — `/api/attest/register` always returns `501` and `ATTEST_REQUIRED` must stay `false` until the native verifier is wired. Focus/break counters are binding-protected but forgeable by the account owner until then.
 - **`deviceId` is client-supplied, so the trial ledger has a ceiling.** The macOS app derives it from `IOPlatformUUID` (`src-tauri/src/device.rs`), which survives reinstall and disk erase — but it travels in a header, and a patched build can send whatever it likes. The ledger's job is to stop "make another account" from being a bypass, not to be unforgeable. Raising the ceiling further means attestation, which does not exist for Developer-ID macOS apps today.
 - **Nothing server-side is gated on entitlement.** `computeEntitlement` is read by its own route and nothing else: no endpoint refuses service to a non-pro user. Enforcement is entirely the client's decision, which means it is only as strong as the client.
-- **No admin comp/revoke routes yet.** The columns and the resolver support both, and `npm run entitlement:migrate` writes comps, but `POST /api/admin/users/:id/suspend` and `.../plan` still change columns the resolver does not read — they do **not** take access away.
-- **No trial-claim reset endpoint.** A replaced logic board or a resold Mac currently has no self-service path; it needs a hand-edit until the admin surface lands.
-- **The refund path is all-or-nothing.** Any `order_refunded` revokes the licence, including what Lemon Squeezy classes as a partial refund.
+- **Admin comp/revoke are real routes** — `POST/DELETE /api/admin/users/:id/comp` and `.../revoke`, each requiring a reason and writing an `AdminAuditLog` row, and `POST .../plan` is routed to the comp lever so it changes what the resolver actually reads. `POST .../suspend` remains moderation-only: `User.status` is not a resolver input and does not take access away.
+- **Trial-claim reset is an admin route** — `POST /api/admin/users/:id/trial-reset` (reason + `confirmUserId` repeated, audited) deletes the account's claims and signals and clears the legacy window, for the replaced-logic-board / resold-Mac case the machine rule gets wrong.
+- **A partial refund keeps the licence.** Only a FULL `order_refunded` revokes; a partial one is recorded (`rawEvent`) and logged for support, and a partial refund for an order we never saw created is parked `failed` for a human rather than guessed at.
 
 ---
 

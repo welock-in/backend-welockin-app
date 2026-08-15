@@ -26,8 +26,7 @@
     "notifications:seed": "tsx scripts/seed-notifications.ts",
     "postinstall": "prisma generate",
     "dev:scenario": "tsx scripts/dev-scenario.ts",
-    "test:billing:mongo": "tsx --test tests/mongo/*.mongo.test.ts",
-    "test:billing:ls-smoke": "tsx tests/ls-smoke/run.mjs"
+    "test:billing:mongo": "tsx --test tests/mongo/*.mongo.test.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",

@@ -462,8 +462,10 @@ checkoutRouter.post(
   }),
 );
 
-/** GET against the Lemon Squeezy API with our key, bounded like every LS call here. */
-async function lemonFetch(path: string): Promise<Response> {
+/** GET against the Lemon Squeezy API with our key, bounded like every LS call
+ *  here. Exported for POST /api/billing/resync, which pulls the same objects
+ *  this file's confirm path pulls — one helper, one timeout, one header set. */
+export async function lemonFetch(path: string): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CHECKOUT_TIMEOUT_MS);
   try {

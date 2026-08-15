@@ -7,6 +7,7 @@ import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { getProvider } from "../lib/purchase-providers";
 import { RC_LIFETIME_PRODUCT_IDS, RC_PRODUCT_YEARLY, type RcSubscriber } from "../lib/revenuecat";
+import { REAL_ORDER_CREATED } from "./lemonsqueezy-fixtures";
 import { stubAccountGuard, stubNoBillingHolds } from "./test-helpers";
 
 /*
@@ -475,6 +476,256 @@ test("closing the gate DELETES nothing — the paid row never depended on it", a
     { provider: "revenuecat" },
   ]);
   assert.equal(rows.purchases.length, 2, "nothing was removed from the table by either read");
+});
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * POST /api/billing/resync — "I've already paid", with nothing but a session.
+ *
+ * What these tests pin: the Lemon Squeezy leg looks up the CALLER'S OWN email
+ * and writes through the webhook's shared writers (so a resync can never mint
+ * what a webhook would have refused — tombstones and test-mode gates
+ * included); the RevenueCat leg degrades to a partial answer instead of
+ * failing the call; and both rate-limit keys guard the door.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/** The storefront, configured with the captured fixture's real ids. */
+function lemonConfigured(t: Ctx) {
+  setEnv(t, {
+    lemonSqueezyApiKey: "test-key",
+    lemonSqueezyStoreId: "364783",
+    lemonSqueezyVariantId: "1960881",
+    lemonSqueezyVariantMonthly: "1986433",
+    lemonSqueezyVariantYearly: "1986420",
+    lemonSqueezyAllowTestMode: false,
+  });
+}
+
+/**
+ * The captured REAL order (lemonsqueezy-fixtures.ts) as the API would list it,
+ * re-owned by the test caller's email and flipped to live mode — each test
+ * that wants the test-mode gate flips it back explicitly.
+ */
+function apiOrder(over: Record<string, unknown> = {}) {
+  const data = JSON.parse(JSON.stringify(REAL_ORDER_CREATED.data)) as {
+    attributes: Record<string, unknown>;
+  };
+  data.attributes = {
+    ...data.attributes,
+    user_email: "user@example.com",
+    test_mode: false,
+    ...over,
+  };
+  return data;
+}
+
+/** An API subscription object for the monthly variant, owned by the caller. */
+function apiSub(over: Record<string, unknown> = {}) {
+  return {
+    id: "sub-777",
+    type: "subscriptions",
+    attributes: {
+      store_id: 364783,
+      variant_id: 1986433,
+      product_id: 1254414,
+      user_email: "user@example.com",
+      status: "active",
+      test_mode: false,
+      trial_ends_at: null,
+      renews_at: "2026-09-15T00:00:00.000Z",
+      ends_at: null,
+      updated_at: "2026-08-15T00:00:00.000Z",
+      urls: {
+        update_payment_method: "https://portal.lemonsqueezy.test/update",
+        customer_portal: "https://portal.lemonsqueezy.test/portal",
+      },
+      ...over,
+    },
+  };
+}
+
+/** Answer the two LS list calls; anything else is a test failure. */
+function stubLemonList(t: Ctx, orders: unknown[], subs: unknown[]) {
+  return stubMethod(t, globalThis as any, "fetch", async (url: unknown) => {
+    const u = String(url);
+    if (u.includes("/v1/orders")) return new Response(JSON.stringify({ data: orders }), { status: 200 });
+    if (u.includes("/v1/subscriptions")) return new Response(JSON.stringify({ data: subs }), { status: 200 });
+    throw new Error(`unexpected fetch: ${u}`);
+  });
+}
+
+test("a resync without a token is a 401 — nothing is fetched for strangers", async (t) => {
+  lemonConfigured(t);
+  const fetches = stubLemonList(t, [], []);
+
+  const res = await request(app).post("/api/billing/resync").send();
+
+  assert.equal(res.status, 401);
+  assert.equal(fetches.length, 0);
+});
+
+test("a paid order found by the caller's own email is recorded through the shared writer", async (t) => {
+  lemonConfigured(t);
+  const db = stubResolver(t, { purchases: [{ isRefunded: false, provider: "lemonsqueezy" }] });
+  const fetches = stubLemonList(t, [apiOrder()], []);
+  stubMethod(t, prisma.purchase as any, "findUnique", async () => null);
+  const consumedReads = stubMethod(t, prisma.consumedOrder as any, "findUnique", async () => null);
+  const consumedWrites = stubMethod(t, prisma.consumedOrder as any, "upsert", async () => ({}));
+
+  const res = await request(app).post("/api/billing/resync").set(auth).send();
+
+  assert.equal(res.status, 200, res.text);
+  // The lookup was by the TOKEN's email, scoped to OUR store — the caller can
+  // only ever pull orders placed under the address they have proven they hold.
+  const ordersUrl = String(fetches.find((c) => String(c[0]).includes("/v1/orders"))![0]);
+  assert.ok(ordersUrl.includes("filter[store_id]=364783"));
+  assert.ok(ordersUrl.includes("filter[user_email]=user%40example.com"));
+  assert.ok(ordersUrl.includes("page[size]=10"));
+  // …and the write went through recordPaidOrder: the same upsert key, the same
+  // ownership, the same tombstone the webhook and /checkout/confirm leave.
+  assert.equal(db.purchaseUpsert.length, 1);
+  const upsert = db.purchaseUpsert[0][0];
+  assert.equal(upsert.where.provider_externalId.externalId, "9090213");
+  assert.equal(upsert.create.userId, USER);
+  assert.equal(upsert.create.provider, "lemonsqueezy");
+  assert.equal(consumedWrites.length, 1, "the consumed-order tombstone is written exactly once");
+  assert.ok(consumedReads.length >= 1, "…and only after the tombstone was consulted");
+  assert.deepEqual(res.body.resynced, { lemonsqueezy: 1, revenuecat: false });
+  assert.equal(res.body.status, "active", "the answer is the freshly resolved view");
+});
+
+test("a consumed order is refused — the tombstone outlives the account that spent it", async (t) => {
+  lemonConfigured(t);
+  const db = stubResolver(t);
+  stubLemonList(t, [apiOrder()], []);
+  stubMethod(t, prisma.purchase as any, "findUnique", async () => null);
+  stubMethod(t, prisma.consumedOrder as any, "findUnique", async () => ({ id: "tombstone" }));
+
+  const res = await request(app).post("/api/billing/resync").set(auth).send();
+
+  assert.equal(res.status, 200, "refusal is a zero, never an error — there is nothing to retry");
+  assert.equal(db.purchaseUpsert.length, 0, "no Purchase may be re-minted from a spent order");
+  assert.deepEqual(res.body.resynced, { lemonsqueezy: 0, revenuecat: false });
+});
+
+test("a test-mode order stays gated: the resync cannot open a door the webhook keeps shut", async (t) => {
+  lemonConfigured(t);
+  const db = stubResolver(t);
+  stubLemonList(t, [apiOrder({ test_mode: true })], []);
+  const consumedReads = stubMethod(t, prisma.consumedOrder as any, "findUnique", async () => null);
+
+  const res = await request(app).post("/api/billing/resync").set(auth).send();
+
+  assert.equal(res.status, 200);
+  assert.equal(db.purchaseUpsert.length, 0);
+  assert.equal(consumedReads.length, 0, "the writer was never even entered");
+  assert.deepEqual(res.body.resynced, { lemonsqueezy: 0, revenuecat: false });
+});
+
+test("a subscription found by email is mirrored through the one subscription writer", async (t) => {
+  lemonConfigured(t);
+  const db = stubResolver(t);
+  stubLemonList(t, [], [apiSub()]);
+  // mirrorSubscriptionState's path: the guarded update matches nothing (no row
+  // yet — db.subSweep answers count 0), no existing row, no tombstone → create.
+  stubMethod(t, prisma.subscription as any, "findUnique", async () => null);
+  stubMethod(t, prisma.consumedOrder as any, "findUnique", async () => null);
+  stubMethod(t, prisma.consumedOrder as any, "upsert", async () => ({}));
+  const subCreates = stubMethod(t, prisma.subscription as any, "create", async (a: any) => a.data);
+
+  const res = await request(app).post("/api/billing/resync").set(auth).send();
+
+  assert.equal(res.status, 200, res.text);
+  assert.equal(subCreates.length, 1);
+  const created = subCreates[0][0].data;
+  assert.equal(created.userId, USER);
+  assert.equal(created.provider, "lemonsqueezy");
+  assert.equal(created.externalId, "sub-777");
+  assert.equal(created.status, "active");
+  assert.equal(created.interval, "monthly", "the variant map named the plan");
+  assert.equal(created.customerPortalUrl, "https://portal.lemonsqueezy.test/portal");
+  assert.deepEqual(res.body.resynced, { lemonsqueezy: 1, revenuecat: false });
+});
+
+test("a RevenueCat outage makes the resync PARTIAL — 200 with revenuecat:false, never a failure", async (t) => {
+  // LS deliberately unconfigured: the RC leg alone is on trial here.
+  providerOpen(t);
+  stubFetch(t, () => ({ boom: true }));
+  stubResolver(t);
+
+  const res = await request(app).post("/api/billing/resync").set(auth).send();
+
+  assert.equal(res.status, 200, "the other leg's work must never be reported lost");
+  assert.deepEqual(res.body.resynced, { lemonsqueezy: 0, revenuecat: false });
+});
+
+test("a reachable RevenueCat syncs and reports so — and the view reflects what it wrote", async (t) => {
+  providerOpen(t);
+  stubFetch(t, yearlySubscriber);
+  const db = stubResolver(t, { subscriptions: [rcYearlyRow()] });
+
+  const res = await request(app).post("/api/billing/resync").set(auth).send();
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.resynced, { lemonsqueezy: 0, revenuecat: true });
+  assert.equal(res.body.status, "active");
+  assert.equal(res.body.plan, "yearly");
+  assert.equal(db.subUpsert.length, 1, "the sync wrote before the view resolved");
+});
+
+test("with Lemon Squeezy unconfigured the leg is skipped entirely and reports zero", async (t) => {
+  const fetches = stubMethod(t, globalThis as any, "fetch", async () => {
+    throw new Error("nothing may be fetched on an unconfigured storefront");
+  });
+  stubResolver(t);
+
+  const res = await request(app).post("/api/billing/resync").set(auth).send();
+
+  assert.equal(res.status, 200);
+  assert.equal(fetches.length, 0);
+  assert.deepEqual(res.body.resynced, { lemonsqueezy: 0, revenuecat: false });
+});
+
+/* ── the resync rate limit ──────────────────────────────────────────────── */
+
+function fakeThrottle(t: Ctx, countAfterBump: number) {
+  const keys: string[] = [];
+  stubMethod(t, prisma.authThrottle as any, "updateMany", async (args: any) => {
+    keys.push(args.where.key);
+    return { count: 1 };
+  });
+  stubMethod(t, prisma.authThrottle as any, "findUnique", async (args: any) => ({
+    key: args.where.key,
+    count: countAfterBump,
+    windowStartedAt: new Date(),
+  }));
+  return keys;
+}
+
+test("both limiter keys are consumed — the account's, then the address's", async (t) => {
+  setEnv(t, { authRateLimitDisabled: false });
+  const keys = fakeThrottle(t, 1);
+  stubResolver(t);
+
+  const res = await request(app).post("/api/billing/resync").set(auth).send();
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(keys.length, 2);
+  assert.equal(keys[0], `resync:user:${USER}`);
+  assert.ok(keys[1].startsWith("resync:ip:"));
+});
+
+test("over the window → the standard 429 shape, before anything is fetched or written", async (t) => {
+  setEnv(t, { authRateLimitDisabled: false });
+  fakeThrottle(t, 6);
+  const fetches = stubMethod(t, globalThis as any, "fetch", async () => {
+    throw new Error("a throttled request must not reach any provider");
+  });
+
+  const res = await request(app).post("/api/billing/resync").set(auth).send();
+
+  assert.equal(res.status, 429);
+  assert.deepEqual(res.body, { error: "Too many requests" });
+  assert.equal(fetches.length, 0);
 });
 
 test("a body cannot ask for the sandbox: the gate is the account's, not the request's", async (t) => {

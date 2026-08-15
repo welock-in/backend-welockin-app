@@ -3,15 +3,12 @@ import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import {
   hideTestRowsFor,
-  planEligibility,
   subscriptionGrants,
   subscriptionIsLive,
   variantForPlan,
 } from "../lib/subscription";
-import { cancellationStates } from "../lib/billing-tasks";
-import { outstandingAcquisition } from "../lib/checkout-intent";
-import { isReliableDeviceId, readDeviceId } from "../lib/device";
-import { ledgerHash } from "../lib/hash";
+import { loadEligibilityInputs, purchaseEligibilityFrom } from "../lib/eligibility-io";
+import { readDeviceId } from "../lib/device";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { badRequest, conflict, HttpError, subscriptionPortalRequired } from "../lib/http-error";
@@ -228,87 +225,38 @@ subscriptionRouter.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const userId = req.user!.id;
-    const subs = await prisma.subscription.findMany({
-      where: {
-        userId,
-        provider: PROVIDER,
-        ...hideTestRowsFor(userId, env),
-      },
-      select: {
-        // Needed to ask the outbox how far this row's cancellation got.
-        externalId: true,
-        status: true,
-        interval: true,
-        validUntil: true,
-        trialEndsAt: true,
-        trialCancelledAt: true,
-        pauseMode: true,
-        providerUpdatedAt: true,
-        createdAt: true,
-        variantId: true,
-        renewsAt: true,
-        endsAt: true,
-        updatedAt: true,
-      },
-      orderBy: { updatedAt: "desc" },
-    });
+    // ONE set of reads, shared with POST /api/checkout and the entitlement view
+    // (lib/eligibility-io.ts) — and ALL providers' rows, which is the fix for a
+    // real dead end: this screen used to read Lemon Squeezy only, so an Apple
+    // subscriber was told monthly was purchasable and then 409'd at checkout,
+    // which had been reading both providers all along.
+    const io = await loadEligibilityInputs(userId, readDeviceId(req));
 
     const now = new Date();
-    // The one that still grants, if any — an account can carry old expired rows
-    // and the settings screen must describe the live one, not the first one.
-    // What the customer is PAYING, which is not the same as what grants them
-    // access: a screen that hides a subscription because it stopped granting is
-    // a screen with no cancel button on a card that is still being charged.
-    const live = subs.find(subscriptionIsLive) ?? null;
-
-    // WHETHER THIS ACCOUNT MAY BUY, per plan, as codes the client branches on.
-    //
-    // Deliberately not derivable from the fields above, and deliberately not one
-    // verdict for the whole account. A customer on a live monthly plan may not
-    // buy yearly — Change plan is the route — yet may buy lifetime, and a single
-    // `canPurchase` has to be wrong about one of them. "Your cancellation is
-    // still being confirmed" and "you already have a subscription" are different
-    // screens with different buttons too. The desktop used to infer all of this
-    // by matching an English sentence out of a 409.
-    //
-    // Computed by the SAME function the checkout enforces, so this cannot
-    // advertise a purchase that the next request refuses for another reason.
-    const rawDeviceId = readDeviceId(req);
-    const deviceId = isReliableDeviceId(rawDeviceId) ? rawDeviceId : "";
-    const [cancellations, ownedLifetime, deviceClaim, outstanding] = await Promise.all([
-      cancellationStates(subs.map((sub) => sub.externalId)),
-      prisma.purchase.findFirst({
-        where: { userId, isRefunded: false, ...hideTestRowsFor(userId, env) },
-        select: { id: true },
-      }),
-      deviceId
-        ? prisma.trialClaim.findUnique({
-            where: { deviceIdHash: ledgerHash(deviceId) },
-            select: { id: true },
-          })
-        : Promise.resolve(null),
-      outstandingAcquisition(userId),
-    ]);
+    // The row the settings screen should describe: the GRANTING one first (the
+    // plan the customer is living on), else any still-live one — what the
+    // customer is PAYING is not the same as what grants them access, and a
+    // screen that hides a subscription because it stopped granting is a screen
+    // with no cancel button on a card that is still being charged.
+    const live =
+      io.subs.find((sub) => subscriptionGrants(sub, now)) ??
+      io.subs.find(subscriptionIsLive) ??
+      null;
+    // Which store the row lives at, for the client's copy — and for the two
+    // flags below, because the server can only ACT on Lemon Squeezy rows.
+    const provider: "lemonsqueezy" | "revenuecat" =
+      live?.provider === "revenuecat" ? "revenuecat" : "lemonsqueezy";
 
     res.json({
-      purchaseEligibility: planEligibility({
-        subs,
-        cancellations,
-        ownsLifetime: ownedLifetime != null,
-        deviceHadTrial: deviceClaim != null,
-        trialDays: {
-          monthly: env.lemonSqueezyTrialDaysMonthly,
-          yearly: env.lemonSqueezyTrialDaysYearly,
-        },
-        outstanding: outstanding
-          ? {
-              plan: outstanding.plan,
-              state: outstanding.state,
-              resumable: outstanding.state === "ready" && outstanding.checkoutUrl != null,
-              expiresAt: outstanding.expiresAt.toISOString(),
-            }
-          : null,
-      }),
+      // WHETHER THIS ACCOUNT MAY BUY, per plan, as codes the client branches on.
+      //
+      // Deliberately not derivable from the fields below, and deliberately not
+      // one verdict for the whole account. A customer on a live monthly plan may
+      // not buy yearly — Change plan is the route — yet may buy lifetime, and a
+      // single `canPurchase` has to be wrong about one of them. Computed by the
+      // SAME function, from the SAME reads, the checkout enforces, so this
+      // cannot advertise a purchase that the next request refuses.
+      purchaseEligibility: purchaseEligibilityFrom(io),
       subscription: live && {
         status: live.status,
         interval: live.interval,
@@ -317,15 +265,20 @@ subscriptionRouter.get(
         renewsAt: live.renewsAt?.toISOString() ?? null,
         trialEndsAt: live.trialEndsAt?.toISOString() ?? null,
         validUntil: live.validUntil?.toISOString() ?? null,
+        // ADDITIVE: the shipped desktop ignores fields it does not know.
+        provider,
         // Whether "Cancel" should be offered. A row already cancelled is running
-        // out its grace period and has nothing left to cancel. On trial it IS
-        // cancellable — that is how the customer says "don't charge me".
-        cancellable: live.status !== "cancelled",
-        // Whether "Reactivate" should be offered: a cancelled subscription still
-        // inside its paid-through window can be un-cancelled (POST /reactivate).
-        // `live` is already the granting row, so being cancelled here means
-        // cancelled-but-not-yet-expired — exactly the resumable window.
-        reactivatable: live.status === "cancelled",
+        // out its grace period and has nothing left to cancel; on trial it IS
+        // cancellable — that is how the customer says "don't charge me". And an
+        // Apple subscription is NEVER cancellable from here: only the customer
+        // can cancel it, on the device, at Apple — offering the button would
+        // promise an action the server cannot perform.
+        cancellable: provider === "revenuecat" ? false : live.status !== "cancelled",
+        // Whether "Reactivate" should be offered: a cancelled Lemon Squeezy
+        // subscription still inside its paid-through window can be un-cancelled
+        // (POST /reactivate). Same Apple rule as above — and an RC row is never
+        // status "cancelled" anyway (see lib/revenuecat.ts).
+        reactivatable: provider === "revenuecat" ? false : live.status === "cancelled",
       },
     });
   }),

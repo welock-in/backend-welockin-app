@@ -7,7 +7,7 @@ import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { getProvider } from "../lib/purchase-providers";
 import { RC_LIFETIME_PRODUCT_IDS, RC_PRODUCT_YEARLY, type RcSubscriber } from "../lib/revenuecat";
-import { stubAccountGuard } from "./test-helpers";
+import { stubAccountGuard, stubNoBillingHolds } from "./test-helpers";
 
 /*
  * /api/billing is what the paywall talks to in the seconds after a purchase.
@@ -18,6 +18,7 @@ import { stubAccountGuard } from "./test-helpers";
  */
 
 stubAccountGuard();
+stubNoBillingHolds();
 
 const app = createApp();
 const USER = "507f1f77bcf86cd799439011";

@@ -8,9 +8,10 @@ import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { ledgerHash } from "../lib/hash";
 
-import { stubNoSubscriptions } from "./test-helpers";
+import { stubNoBillingHolds, stubNoSubscriptions } from "./test-helpers";
 
 stubNoSubscriptions();
+stubNoBillingHolds();
 
 const app = createApp();
 const userId = "507f1f77bcf86cd799439011";
@@ -670,6 +671,191 @@ test("a revocation outranks everything, including a paid licence", async (t) => 
 
   assert.equal(res.body.status, "revoked");
   assert.equal(res.body.isPro, false);
+});
+
+/* ── the provider-aware fields (all additive) ─────────────────────────── */
+
+/**
+ * One subscription row as `loadEligibilityInputs` selects it. Everything the
+ * grants predicate and the new view fields read is present, so a fixture
+ * cannot pass by a rule silently skipping an absent column.
+ */
+function subRow(over: Record<string, unknown> = {}) {
+  return {
+    externalId: "ls-77001",
+    provider: "lemonsqueezy",
+    status: "active",
+    interval: "monthly",
+    validUntil: days(20),
+    trialEndsAt: null,
+    trialCancelledAt: null,
+    renewsAt: days(20),
+    endsAt: null,
+    pauseMode: null,
+    variantId: "",
+    providerUpdatedAt: new Date(),
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    willRenew: null,
+    customerPortalUrl: "https://ls.example/portal",
+    updatePaymentUrl: null,
+    ...over,
+  };
+}
+
+const APPLE_MANAGE = "https://apps.apple.com/account/subscriptions";
+
+/** The RevenueCat mirror of a live Apple subscription, manage URL persisted. */
+function rcSubRow(over: Record<string, unknown> = {}) {
+  return subRow({
+    externalId: `${userId}:in.welock.app.monthly`,
+    provider: "revenuecat",
+    willRenew: true,
+    customerPortalUrl: APPLE_MANAGE,
+    ...over,
+  });
+}
+
+test("an Apple lifetime reports billingProvider APPLE — and blocks every plan with its store named", async (t) => {
+  account(t);
+  stubMethod(t, prisma.purchase as any, "findMany", async () => [
+    { isRefunded: false, provider: "app_store" },
+  ]);
+  // The eligibility leg's own lifetime read, WITH the provider.
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => ({
+    id: "p1",
+    provider: "app_store",
+  }));
+  fakeLedger(t, []);
+
+  const res = await request(app).get("/api/entitlement").set(auth).set(dev(MAC));
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.billingProvider, "APPLE");
+  assert.equal(res.body.manageableSubscription, null, "a lifetime is not a recurring row");
+  assert.equal(res.body.willRenew, null, "nothing recurring grants, so nothing renews");
+  // The EXACT wire shape the iOS client mirrors — field for field, nothing extra.
+  assert.deepEqual(res.body.purchaseEligibility.monthly, {
+    canPurchase: false,
+    reasonCode: "LIFETIME_ALREADY_OWNED",
+    trialMode: "none",
+    trialDays: 0,
+    blockingProvider: "revenuecat",
+  });
+  assert.equal(res.body.purchaseEligibility.lifetime.canPurchase, false);
+});
+
+test("a Lemon Squeezy subscription reports LEMON_SQUEEZY, its portal link, and willRenew", async (t) => {
+  account(t);
+  noPurchases(t);
+  fakeLedger(t, []);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [subRow()]);
+
+  const res = await request(app).get("/api/entitlement").set(auth).set(dev(MAC));
+
+  assert.equal(res.body.status, "active");
+  assert.equal(res.body.billingProvider, "LEMON_SQUEEZY");
+  assert.deepEqual(res.body.manageableSubscription, {
+    provider: "LEMON_SQUEEZY",
+    managementUrl: "https://ls.example/portal",
+  });
+  assert.equal(res.body.willRenew, true, "active and uncancelled — the next charge is coming");
+  // The same verdicts GET /api/subscription serves, from the same reads.
+  assert.deepEqual(res.body.purchaseEligibility.monthly, {
+    canPurchase: false,
+    reasonCode: "ACTIVE_SUBSCRIPTION",
+    trialMode: "none",
+    trialDays: 0,
+    blockingProvider: "lemonsqueezy",
+  });
+  assert.equal(res.body.purchaseEligibility.lifetime.canPurchase, true);
+});
+
+test("a comp reports billingProvider NONE — nobody is billing them", async (t) => {
+  account(t, { compActive: true, compedUntil: days(30) });
+  noPurchases(t);
+  fakeLedger(t, []);
+
+  const res = await request(app).get("/api/entitlement").set(auth).set(dev(MAC));
+
+  assert.equal(res.body.status, "comped");
+  assert.equal(res.body.billingProvider, "NONE");
+  assert.equal(res.body.manageableSubscription, null);
+  assert.equal(res.body.willRenew, null);
+});
+
+test("a machine trial reports billingProvider NONE too", async (t) => {
+  account(t);
+  noPurchases(t);
+  fakeLedger(t, [{ deviceIdHash: ledgerHash(MAC), firstUserId: userId, endsAt: days(9) }]);
+
+  const res = await request(app).get("/api/entitlement").set(auth).set(dev(MAC));
+
+  assert.equal(res.body.status, "trialing");
+  assert.equal(res.body.billingProvider, "NONE");
+});
+
+test("a lifetime owner still sees the renewable sub, with the persisted Apple manage URL (N2)", async (t) => {
+  // The case `manageableSubscription` exists for: the lifetime grants, so no
+  // granting-subscription field would ever mention the monthly still renewing
+  // beside it — yet that monthly is the one thing still taking money.
+  account(t);
+  stubMethod(t, prisma.purchase as any, "findMany", async () => [
+    { isRefunded: false, provider: "app_store" },
+  ]);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => ({
+    id: "p1",
+    provider: "app_store",
+  }));
+  fakeLedger(t, []);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [rcSubRow()]);
+
+  const res = await request(app).get("/api/entitlement").set(auth).set(dev(MAC));
+
+  assert.equal(res.body.status, "active");
+  assert.equal(res.body.plan, "lifetime", "the lifetime is what grants");
+  assert.equal(res.body.billingProvider, "APPLE");
+  assert.deepEqual(
+    res.body.manageableSubscription,
+    { provider: "APPLE", managementUrl: APPLE_MANAGE },
+    "the RC management_url the sync persisted surfaces here",
+  );
+});
+
+test("an RC row's willRenew column is the Apple answer — auto-renew off reads false", async (t) => {
+  // Apple never writes status 'cancelled' (see lib/revenuecat.ts), so the
+  // status can never carry this fact for an RC row: the column must.
+  account(t);
+  noPurchases(t);
+  fakeLedger(t, []);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    rcSubRow({ willRenew: false }),
+  ]);
+
+  const res = await request(app).get("/api/entitlement").set(auth).set(dev(MAC));
+
+  assert.equal(res.body.status, "active", "access runs to the paid end regardless");
+  assert.equal(res.body.willRenew, false);
+  assert.equal(res.body.billingProvider, "APPLE");
+});
+
+test("willRenew is false on a cancelled-but-still-active row — the N13 state", async (t) => {
+  account(t);
+  noPurchases(t);
+  fakeLedger(t, []);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    subRow({ status: "cancelled", renewsAt: null, endsAt: days(12), validUntil: days(12) }),
+  ]);
+
+  const res = await request(app).get("/api/entitlement").set(auth).set(dev(MAC));
+
+  assert.equal(res.body.status, "active", "cancelled keeps granting until the period ends");
+  assert.equal(res.body.willRenew, false, "…but the client must say it will not renew");
+  assert.equal(
+    res.body.purchaseEligibility.monthly.reasonCode,
+    "CANCELLED_ACCESS_REMAINING",
+    "and the paywall knows why a second subscription is refused",
+  );
 });
 
 /* ── the rollout switch ───────────────────────────────────────────────── */

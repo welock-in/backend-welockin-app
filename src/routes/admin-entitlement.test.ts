@@ -7,6 +7,11 @@ import { prisma } from "../lib/prisma";
 import { freezeClock, fromFrozen } from "../lib/test-clock";
 import { env } from "../lib/env";
 import { signAdminToken } from "../lib/admin-jwt";
+import { stubNoBillingHolds } from "./test-helpers";
+
+// The set-plan route answers with the RESOLVED entitlement, whose eligibility
+// leg (lib/eligibility-io.ts) reads holds and claims no test here installs.
+stubNoBillingHolds();
 
 /**
  * The recourse routes: comp, revoke, and giving a machine its trial back.

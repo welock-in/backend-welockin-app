@@ -96,3 +96,21 @@ export function stubNoSubscriptions(): void {
   const target = prisma.subscription as unknown as Record<string, any>;
   target.findMany = async () => [];
 }
+
+/**
+ * Answer "no lifetime, no device claim, no checkout hold, nothing owed" for the
+ * whole file — the reads `loadEligibilityInputs` (lib/eligibility-io.ts) now
+ * performs on every entitlement resolution, since the view carries the same
+ * purchase-eligibility verdicts the paywall and the checkout share.
+ *
+ * Installed at module scope like `stubNoSubscriptions`, and NOT restored, for
+ * the same reason: a test that wants a hold, a claim or an owed cancellation
+ * stubs the method itself, which replaces this default and wins.
+ */
+export function stubNoBillingHolds(): void {
+  (prisma.purchase as unknown as Record<string, any>).findFirst = async () => null;
+  (prisma.trialClaim as unknown as Record<string, any>).findUnique = async () => null;
+  (prisma.acquisitionLock as unknown as Record<string, any>).findUnique = async () => null;
+  (prisma.checkoutIntent as unknown as Record<string, any>).findUnique = async () => null;
+  (prisma.billingTask as unknown as Record<string, any>).findMany = async () => [];
+}

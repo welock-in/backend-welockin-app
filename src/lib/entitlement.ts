@@ -13,6 +13,8 @@
  * stays unit-testable.
  */
 
+import type { PlanEligibility, PurchasePlan } from "./subscription";
+
 /*
  * Trial length used to live here as `TRIAL_DAYS`, read by `POST /api/auth/*` to
  * stamp `User.trialEndsAt` at account creation. It moved to `env.trialDays`
@@ -81,6 +83,32 @@ export type EntitlementStatus =
   | "refunded"
   | "comped"
   | "revoked";
+
+/**
+ * The two billing worlds a customer can live in, plus "neither". The client's
+ * vocabulary, not the database's: rows spell providers "lemonsqueezy" /
+ * "revenuecat" / "app_store", and the view collapses them to the question the
+ * UI actually asks — is your money with Apple, or with our web storefront?
+ */
+export type BillingProvider = "APPLE" | "LEMON_SQUEEZY" | "NONE";
+
+/**
+ * A stored provider string → the world it belongs to, or null when we cannot
+ * say. ONE mapping, shared by every field that speaks the client's vocabulary
+ * (`billingProvider`, `manageableSubscription.provider`), because two copies of
+ * "app_store means Apple" is one copy too many.
+ *
+ * `app_store` and `revenuecat` both map to APPLE: they are two pipes for the
+ * same store — the legacy StoreKit-JWS route and the RevenueCat mirror — and
+ * the client can act identically on either (send the customer to Apple).
+ */
+export function billingProviderFor(
+  provider: string | null | undefined,
+): "APPLE" | "LEMON_SQUEEZY" | null {
+  if (provider === "app_store" || provider === "revenuecat") return "APPLE";
+  if (provider === "lemonsqueezy") return "LEMON_SQUEEZY";
+  return null;
+}
 
 /** The exact wire shape of `GET /api/entitlement`. */
 export interface EntitlementView {
@@ -153,6 +181,55 @@ export interface EntitlementView {
    * why this defaults to false when we cannot tell.
    */
   everHadAccess?: boolean;
+  /**
+   * WHOSE money grants the access, in the client's two-world vocabulary: the
+   * granting lifetime Purchase's provider first (a lifetime outranks any
+   * subscription, mirroring the resolver's own precedence), else the granting
+   * subscription's, else "NONE" — which is also what a comp or a machine trial
+   * reports, because no store is billing them.
+   *
+   * ALL of the fields from here down are optional and additive: absence means
+   * "a deploy from before this existed", and a client MUST behave exactly as it
+   * did pre-feature when they are missing.
+   */
+  billingProvider?: BillingProvider;
+  /**
+   * The live RECURRING subscription and where it gets managed — REGARDLESS of
+   * whether it is the thing granting access. The case that makes "regardless"
+   * load-bearing: a lifetime owner whose old monthly plan is still renewing
+   * (spec N2). The lifetime grants, so no granting-subscription field would
+   * ever mention the monthly — yet it is the one thing on the account that
+   * still takes money every month, and hiding it is how someone pays for a
+   * product they already own for ever.
+   *
+   * `managementUrl` is the row's stored portal link: Lemon Squeezy's last-known
+   * signed URL (possibly expired — GET /api/subscription/portal fetches a fresh
+   * one), or the RevenueCat management_url the sync persists (Apple's page,
+   * unsigned, does not expire). Null when we have no link; the row itself is
+   * still reported so the client can at least SAY a subscription exists.
+   */
+  manageableSubscription?: {
+    provider: "APPLE" | "LEMON_SQUEEZY";
+    managementUrl: string | null;
+  } | null;
+  /**
+   * Will the entitlement-driving subscription charge again? False is the N13
+   * state — cancelled-but-still-active, "stays on until {date}, then stops" —
+   * which is exactly the sentence the client needs this field to render. Null
+   * when no recurring subscription is granting (lifetime, comp, trial, or
+   * nothing): there is no renewal to have an opinion about.
+   *
+   * RevenueCat rows carry the answer as a column (auto-renew state); Lemon
+   * Squeezy expresses the same fact as status "cancelled"/"expired" — its
+   * webhook mirrors `cancelled` INTO the status, so the status is the truth.
+   */
+  willRenew?: boolean | null;
+  /**
+   * The same per-plan verdicts GET /api/subscription serves, from the same
+   * inputs (lib/eligibility-io.ts) — so the paywall a client draws from its
+   * cached entitlement can never advertise a purchase the checkout refuses.
+   */
+  purchaseEligibility?: Record<PurchasePlan, PlanEligibility>;
 }
 
 export interface EntitlementInputs {

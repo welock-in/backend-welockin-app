@@ -6,7 +6,9 @@ import {
   hideTestRowsFor,
   subscriptionGrants,
   subscriptionGrantsUntil,
+  subscriptionIsLive,
 } from "../lib/subscription";
+import { loadEligibilityInputs, purchaseEligibilityFrom } from "../lib/eligibility-io";
 import { issueReceipt } from "../lib/entitlement-receipt";
 import { readDeviceId } from "../lib/device";
 import { parseFingerprint } from "../lib/fingerprint";
@@ -17,7 +19,9 @@ import { accountGone, badRequest } from "../lib/http-error";
 import { startTrialSchema } from "../validation/schemas";
 import {
   LIFETIME_PRODUCT_ID,
+  billingProviderFor,
   computeEntitlement,
+  type BillingProvider,
   type EntitlementView,
 } from "../lib/entitlement";
 
@@ -56,7 +60,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   const now = new Date();
   const deviceIdHash = deviceId ? ledgerHash(deviceId) : null;
 
-  const [user, purchases, claim, subs] = await Promise.all([
+  const [user, purchases, claim, eligibility] = await Promise.all([
     prisma.user.findUnique({
       where: { id: userId },
       select: {
@@ -67,10 +71,12 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
       },
     }),
     prisma.purchase.findMany({
-      // Same filter as the subscriptions below and as the checkout guards: a
-      // test purchase must stop granting the moment test mode is shut.
+      // Same filter as the subscriptions and as the checkout guards: a test
+      // purchase must stop granting the moment test mode is shut.
       where: { userId, ...hideTestRowsFor(userId, env) },
-      select: { isRefunded: true },
+      // `provider` for the view's billingProvider — WHOSE store the granting
+      // lifetime came from ("lemonsqueezy" | "app_store" | "revenuecat").
+      select: { isRefunded: true, provider: true },
     }),
     // This machine's claim OR this account's, oldest first so a later row can
     // never rewind the window. Both legs matter, in opposite directions: the
@@ -78,42 +84,14 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     // is what lets someone's SECOND Mac see the trial they are already inside
     // rather than being handed a fresh one.
     findClaim(deviceIdHash, userId),
-    // Every subscription this account has ever had, not just the live one: a
-    // customer who cancelled and resubscribed has two rows, and which of them
-    // grants is `subscriptionGrants`'s question, not this query's.
-    prisma.subscription.findMany({
-      // Test rows stop granting the moment test mode is shut — see hideTestRows.
-      where: { userId, ...hideTestRowsFor(userId, env) },
-      select: {
-        status: true,
-        validUntil: true,
-        // Load-bearing for `subscriptionGrants`: this query reads BOTH providers'
-        // rows, and without the provider the Lemon Squeezy variant allowlist
-        // would silently judge RevenueCat rows too (see SubscriptionLike).
-        provider: true,
-        // Load-bearing for `subscriptionGrants`: a subscription cancelled while
-        // its trial is still running grants nothing (a trial buys no grace).
-        // Without this column selected, that rule silently never fires.
-        trialEndsAt: true,
-        // "monthly" | "yearly" — written by the Lemon Squeezy webhook and the
-        // RevenueCat sync alike, read back as the view's `plan`.
-        interval: true,
-        trialCancelledAt: true,
-        pauseMode: true,
-        variantId: true,
-        // Also load-bearing: together they bound the grace a row with no end
-        // date gets. The PROVIDER's clock, deliberately — Prisma's `updatedAt`
-        // is our own write time, and any endpoint that touches the row could
-        // then renew someone's access by accident.
-        providerUpdatedAt: true,
-        createdAt: true,
-        // For `billingUrl` below. Both are refreshed on every webhook because
-        // Lemon Squeezy signs them with an expiry.
-        customerPortalUrl: true,
-        updatePaymentUrl: true,
-      },
-    }),
+    // Every subscription this account has ever had, ALL providers, through the
+    // SAME reads the checkout and GET /api/subscription use (see
+    // lib/eligibility-io.ts) — plus the outbox, checkout-hold and lifetime legs
+    // the view's purchaseEligibility needs. Which of the rows grants is
+    // `subscriptionGrants`'s question, not the query's.
+    loadEligibilityInputs(userId, deviceId),
   ]);
+  const subs = eligibility.subs;
 
   // A valid JWT for a deleted account reaches here (stateless verification).
   if (!user) throw accountGone();
@@ -240,12 +218,59 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   const everHadAccess =
     purchases.length > 0 || subs.length > 0 || claim != null || user.trialEndsAt != null;
 
+  // ── the provider-aware half — every field additive, see EntitlementView ──
+
+  // WHOSE money grants: the lifetime's store first (a lifetime outranks any
+  // subscription, mirroring the resolver's own precedence), else the granting
+  // subscription's, else NONE — which is what a comp or machine trial reports.
+  const grantingLifetime = purchases.find((p) => !p.isRefunded) ?? null;
+  const billingProvider: BillingProvider =
+    (grantingLifetime ? billingProviderFor(grantingLifetime.provider) : null) ??
+    (liveSub ? (billingProviderFor(liveSub.provider) ?? "LEMON_SQUEEZY") : null) ??
+    "NONE";
+
+  // The live RECURRING row, whether or not it grants — a lifetime owner's
+  // still-renewing monthly must stay visible (N2), or the one thing on the
+  // account still taking money is the one thing the screen never mentions.
+  // Granting first (the row the customer is living on), then merely live.
+  const manageable = liveSub ?? subs.find((sub) => subscriptionIsLive(sub)) ?? null;
+  const manageableSubscription = manageable
+    ? {
+        // Unrecognised providers read as LEMON_SQUEEZY, the same default
+        // SubscriptionLike documents for rows that predate the column.
+        provider: billingProviderFor(manageable.provider) ?? ("LEMON_SQUEEZY" as const),
+        // Last-known, not live — see billingUrl above for why that is fine.
+        // For an Apple row this is the RevenueCat management_url the sync
+        // persists, which is unsigned and does not expire.
+        managementUrl: manageable.customerPortalUrl ?? manageable.updatePaymentUrl ?? null,
+      }
+    : null;
+
+  // Will the granting subscription charge again? RevenueCat states it as a
+  // column (auto-renew); Lemon Squeezy states it as the status — its webhook
+  // mirrors `cancelled` INTO the status, so "cancelled"/"expired" is the whole
+  // of "will not renew". Null when nothing recurring is granting: there is no
+  // renewal to have an opinion about.
+  const willRenew =
+    liveSub == null
+      ? null
+      : billingProviderFor(liveSub.provider) === "APPLE"
+        ? (liveSub.willRenew ?? null)
+        : !["cancelled", "expired"].includes(liveSub.status);
+
   return {
     ...view,
     plan,
     validUntil: grantingSub?.validUntil?.toISOString() ?? null,
     billingUrl,
     everHadAccess,
+    billingProvider,
+    manageableSubscription,
+    willRenew,
+    // The same verdicts GET /api/subscription serves, from the same reads —
+    // the paywall a client draws from its cached entitlement cannot advertise
+    // a purchase the checkout then refuses.
+    purchaseEligibility: purchaseEligibilityFrom(eligibility),
     receipt: issueReceipt({
       userId,
       deviceId,

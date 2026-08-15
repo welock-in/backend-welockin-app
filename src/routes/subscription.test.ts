@@ -899,3 +899,113 @@ test("reactivate still works for a cancelled PAID subscription", async (t) => {
 
   assert.equal(res.status, 202);
 });
+
+/* ── provider unification: GET / sees BOTH stores ────────────────────────
+ *
+ * The drift this section pins shut: this route used to read Lemon Squeezy rows
+ * only while the checkout read all providers — so an Apple subscriber was told
+ * monthly was purchasable here and then 409'd there. Both now consume the same
+ * reads (lib/eligibility-io.ts), and the refusal names WHICH store is in the
+ * way, because "go to Change plan" is a dead end for an Apple plan.
+ */
+
+const rcActive = {
+  externalId: "507f1f77bcf86cd799439011:in.welock.app.monthly",
+  provider: "revenuecat",
+  status: "active",
+  interval: "monthly",
+  validUntil: new Date(Date.now() + 20 * 86_400_000),
+  trialEndsAt: null,
+  trialCancelledAt: null,
+  renewsAt: new Date(Date.now() + 20 * 86_400_000),
+  endsAt: null,
+  pauseMode: null,
+  variantId: "in.welock.app.monthly",
+  providerUpdatedAt: new Date(),
+  createdAt: new Date(),
+  updatedAt: new Date(),
+  willRenew: true,
+  customerPortalUrl: "https://apps.apple.com/account/subscriptions",
+  updatePaymentUrl: null,
+};
+
+test("an active Apple subscription now blocks monthly/yearly HERE too — lifetime stays purchasable", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
+  configured(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [rcActive]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+
+  const res = await request(app).get("/api/subscription").set(auth);
+
+  assert.equal(res.status, 200);
+  // The EXACT wire shape the clients mirror — field for field, nothing extra.
+  assert.deepEqual(res.body.purchaseEligibility.monthly, {
+    canPurchase: false,
+    reasonCode: "ACTIVE_SUBSCRIPTION",
+    trialMode: "none",
+    trialDays: 0,
+    blockingProvider: "revenuecat",
+  });
+  assert.equal(res.body.purchaseEligibility.yearly.canPurchase, false);
+  assert.equal(res.body.purchaseEligibility.yearly.blockingProvider, "revenuecat");
+  // A lifetime is not a second subscription, and the LS order webhook (KI-2's
+  // twin) cancels nothing at Apple — it stays purchasable, exactly as at the
+  // checkout, which is the whole point of sharing the reads.
+  assert.equal(res.body.purchaseEligibility.lifetime.canPurchase, true);
+});
+
+test("the Apple row is the display row — and the server admits it cannot cancel it", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
+  configured(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [rcActive]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+
+  const res = await request(app).get("/api/subscription").set(auth);
+
+  assert.equal(res.body.subscription.provider, "revenuecat");
+  assert.equal(res.body.subscription.status, "active");
+  assert.equal(res.body.subscription.interval, "monthly");
+  // Only the customer can cancel an Apple subscription, on the device, at
+  // Apple. Offering the buttons would promise actions this server cannot do.
+  assert.equal(res.body.subscription.cancellable, false);
+  assert.equal(res.body.subscription.reactivatable, false);
+});
+
+test("a Lemon Squeezy display row names its provider and keeps its buttons", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
+  configured(t);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    {
+      externalId: "77001",
+      provider: "lemonsqueezy",
+      status: "active",
+      interval: "monthly",
+      validUntil: new Date(Date.now() + 20 * 86_400_000),
+      trialEndsAt: null,
+      trialCancelledAt: null,
+      renewsAt: new Date(Date.now() + 20 * 86_400_000),
+      endsAt: null,
+      pauseMode: null,
+      variantId: "",
+      providerUpdatedAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    },
+  ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+
+  const res = await request(app).get("/api/subscription").set(auth);
+
+  assert.equal(res.body.subscription.provider, "lemonsqueezy");
+  assert.equal(res.body.subscription.cancellable, true, "an LS row the server CAN act on");
+  assert.equal(res.body.purchaseEligibility.monthly.blockingProvider, "lemonsqueezy");
+});

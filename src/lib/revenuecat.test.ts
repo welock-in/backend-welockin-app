@@ -401,6 +401,9 @@ function stubSync(
     respond(String(url), init),
   );
   const noop = async () => ({ count: 1 });
+  // The Lemon Squeezy leg the sync now reads (KI-2, below). Baseline: no
+  // recurring plan, so nothing is ever owed unless a test installs rows.
+  stubMethod(t, prisma.subscription as any, "findMany", async () => []);
   return {
     subUpsert: stubMethod(
       t,
@@ -955,4 +958,165 @@ test("nothing in the projection can turn a sandbox transaction into a production
     assert.equal(plan.purchases[0].data.testMode, true);
     assert.equal(plan.purchases[0].externalId, `${USER}:${LIFETIME}:sandbox`);
   }
+});
+
+/* ── KI-2: an iPhone lifetime stops the desktop billing ─────────────────── */
+
+/*
+ * The double-billing hole this section pins shut: the Lemon Squeezy order
+ * webhook has always cancelled the buyer's recurring plan when a DESKTOP
+ * lifetime lands, but a lifetime bought on the iPhone arrived through this
+ * sync and cancelled nothing — a monthly desktop subscriber who upgraded on
+ * iOS kept the licence AND the live monthly charge. The sync now feeds the
+ * SAME outbox-backed cancellation the webhook uses, so these tests drive
+ * `syncUserFromRevenueCat` and watch the outbox.
+ */
+
+/** Pin the sandbox gate, whatever the ambient environment says. */
+function sandboxGate(t: Ctx, gate: { allow: boolean; listed: string[] }) {
+  const before = {
+    allow: env.revenuecatAllowSandbox,
+    listed: env.revenuecatSandboxAllowedUserIds,
+  };
+  (env as any).revenuecatAllowSandbox = gate.allow;
+  (env as any).revenuecatSandboxAllowedUserIds = gate.listed;
+  t.after(() => {
+    (env as any).revenuecatAllowSandbox = before.allow;
+    (env as any).revenuecatSandboxAllowedUserIds = before.listed;
+  });
+}
+
+/** The recurring Lemon Squeezy plan the lifetime buyer still holds. */
+const lsRecurring = (status = "active"): Row => ({
+  userId: USER,
+  provider: "lemonsqueezy",
+  externalId: "ls-sub-77",
+  status,
+  validUntil: new Date(NOW.getTime() + 20 * 86_400_000),
+  trialEndsAt: null,
+  trialCancelledAt: null,
+  pauseMode: null,
+  providerUpdatedAt: NOW,
+  createdAt: NOW,
+  variantId: "1986433",
+  updatedAt: NOW,
+});
+
+/**
+ * The outbox, watched. The claim answers "a drain is already on it" so the
+ * inline attempt never reaches the provider — the ENQUEUE is the fact under
+ * test, exactly as the outbox design intends: never lose the instruction.
+ */
+function stubOutbox(t: Ctx, task: () => any = () => null) {
+  const reads = stubMethod(t, prisma.billingTask as any, "findUnique", async () => task());
+  const created = stubMethod(t, prisma.billingTask as any, "create", async (a: any) => a.data);
+  stubMethod(t, prisma.billingTask as any, "updateMany", async () => ({ count: 0 }));
+  const reopened = stubMethod(t, prisma.billingTask as any, "update", async (a: any) => a.data);
+  return { reads, created, reopened };
+}
+
+test("a production iPhone lifetime enqueues the cancellation of the recurring LS plan", async (t) => {
+  sandboxGate(t, { allow: false, listed: [] });
+  stubSync(t, ok(lifetimeSubscriber()));
+  const lsReads = stubMethod(t, prisma.subscription as any, "findMany", async () => [lsRecurring()]);
+  const outbox = stubOutbox(t);
+
+  await syncUserFromRevenueCat(USER);
+
+  // Scoped exactly like the webhook's own call: this user's LS rows only.
+  assert.equal(lsReads.length, 1);
+  assert.equal(lsReads[0][0].where.userId, USER);
+  assert.equal(lsReads[0][0].where.provider, "lemonsqueezy");
+  // The instruction is durably written, through the same outbox as the webhook.
+  assert.equal(outbox.created.length, 1);
+  assert.equal(outbox.created[0][0].data.externalId, "ls-sub-77");
+  assert.equal(outbox.created[0][0].data.kind, "cancel");
+  assert.equal(outbox.created[0][0].data.reason, "lifetime-upgrade");
+});
+
+test("a SANDBOX lifetime on an unlisted account cancels nothing", async (t) => {
+  // A StoreKit sandbox purchase costs nothing and is signed like a real one.
+  // The read gate refuses it access; the same gate must refuse it the power to
+  // cancel a subscription someone is genuinely paying for.
+  sandboxGate(t, { allow: false, listed: [] });
+  stubSync(
+    t,
+    ok({
+      non_subscriptions: {
+        [LIFETIME]: [{ id: "txn-sandbox", purchase_date: PAST, is_sandbox: true }],
+      },
+      entitlements: { pro: { product_identifier: LIFETIME } },
+    }),
+  );
+  const lsReads = stubMethod(t, prisma.subscription as any, "findMany", async () => [lsRecurring()]);
+  const outbox = stubOutbox(t);
+
+  await syncUserFromRevenueCat(USER);
+
+  assert.equal(lsReads.length, 0, "the LS rows are never even read");
+  assert.equal(outbox.created.length, 0);
+});
+
+test("a REFUNDED lifetime cancels nothing — money returned is not an upgrade", async (t) => {
+  sandboxGate(t, { allow: false, listed: [] });
+  stubSync(
+    t,
+    ok({
+      non_subscriptions: {
+        [LIFETIME]: [{ id: "txn-life", purchase_date: PAST, is_sandbox: false, is_refunded: true }],
+      },
+      entitlements: { pro: { product_identifier: LIFETIME } },
+    }),
+  );
+  const lsReads = stubMethod(t, prisma.subscription as any, "findMany", async () => [lsRecurring()]);
+  const outbox = stubOutbox(t);
+
+  await syncUserFromRevenueCat(USER);
+
+  assert.equal(lsReads.length, 0);
+  assert.equal(outbox.created.length, 0);
+});
+
+test("a second sync does not re-open the task once the plan is cancelled and settled", async (t) => {
+  // Idempotency is the outbox's, inherited for free: the first sync writes the
+  // instruction down; once the provider has confirmed and the webhook has
+  // mirrored the ending, every later sync must find nothing to do — not
+  // re-open a settled task and cancel into the void for ever.
+  sandboxGate(t, { allow: false, listed: [] });
+  stubSync(t, ok(lifetimeSubscriber()));
+  let lsSub = lsRecurring();
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [lsSub]);
+  let task: any = null;
+  const outbox = stubOutbox(t, () => task);
+  const created = stubMethod(t, prisma.billingTask as any, "create", async (a: any) => {
+    task = { id: "task-1", ...a.data };
+    return task;
+  });
+
+  await syncUserFromRevenueCat(USER);
+  assert.equal(created.length, 1, "the first sync writes the instruction down");
+
+  // The provider confirmed the cancel, the webhook mirrored the new status.
+  task.doneAt = new Date();
+  lsSub = lsRecurring("cancelled");
+
+  await syncUserFromRevenueCat(USER);
+
+  assert.equal(created.length, 1, "no second task");
+  assert.equal(outbox.reopened.length, 0, "and the settled one stays settled");
+});
+
+test("a broken Lemon Squeezy read cannot fail the RevenueCat sync", async (t) => {
+  // The grant has already landed; the cancellation is a follow-up. A database
+  // hiccup on the LS leg must cost a retry of the CANCELLATION (next sync, or
+  // the drain), never the sync that records what the customer owns.
+  sandboxGate(t, { allow: false, listed: [] });
+  stubSync(t, ok(lifetimeSubscriber()));
+  stubMethod(t, prisma.subscription as any, "findMany", async () => {
+    throw new Error("replica set unavailable");
+  });
+  stubOutbox(t);
+
+  const result = await syncUserFromRevenueCat(USER);
+  assert.equal(result.managementUrl, null, "the sync still answers");
 });

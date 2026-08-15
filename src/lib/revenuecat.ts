@@ -1,6 +1,8 @@
 import { prisma } from "./prisma";
 import { env } from "./env";
 import { LIFETIME_PRODUCT_ID } from "./entitlement";
+import { cancelRecurringLsForLifetimeBuyer } from "./billing-tasks";
+import { revenuecatSandboxAllows } from "./subscription";
 
 /**
  * RevenueCat — the iOS purchase path (StoreKit, via RevenueCat's plumbing).
@@ -598,6 +600,24 @@ export async function syncUserFromRevenueCat(userId: string): Promise<{ manageme
     // records that it was pulled rather than never granted.
     data: { isRefunded: true, revokedAt: now },
   });
+
+  // AN iPHONE LIFETIME STOPS THE DESKTOP BILLING — the same rule the Lemon
+  // Squeezy order webhook enforces for a desktop lifetime, or a monthly desktop
+  // subscriber who buys the lifetime on iOS keeps paying every month for a
+  // product they now own for ever. Every purchase in the plan IS a lifetime
+  // (the projection admits nothing else); it counts only when the resolver
+  // would honour it — not refunded, and production unless THIS account's
+  // sandbox rows are allowed to grant, so a TestFlight purchase on an unlisted
+  // account can never cancel real billing. The helper never throws (a Lemon
+  // Squeezy blip must not fail the sync) and is idempotent through the outbox:
+  // a pending task is left alone, and a settled one is only re-opened by a
+  // subscription that is live again.
+  const lifetimeGrants = plan.purchases.some(
+    (p) =>
+      !p.data.isRefunded &&
+      (p.data.environment === "production" || revenuecatSandboxAllows(userId, env)),
+  );
+  if (lifetimeGrants) await cancelRecurringLsForLifetimeBuyer(userId);
 
   return { managementUrl: plan.managementUrl };
 }

@@ -22,13 +22,11 @@ import {
   intervalForVariant,
   subscriptionGrants,
   validUntilFrom,
-  type SubscriptionLike,
-  subscriptionIsLive,
 } from "../lib/subscription";
 import { claimWebhookEvent, markWebhookEvent } from "../lib/webhook-events";
 import { ledgerHash } from "../lib/hash";
 import { isReliableDeviceId } from "../lib/device";
-import { enqueueAndAttemptCancel } from "../lib/billing-tasks";
+import { cancelRecurringLsForLifetimeBuyer } from "../lib/billing-tasks";
 
 export const lemonSqueezyWebhookRouter = Router();
 
@@ -262,7 +260,7 @@ export async function recordPaidOrder(
   // Safe to run first: everything above has already established that this is a
   // paid, sellable lifetime order, so the recurring plan it replaces should stop
   // whether or not our own row write succeeds a millisecond later.
-  if (!existing) await cancelSubscriptionsForLifetimeBuyer(userId);
+  if (!existing) await cancelRecurringLsForLifetimeBuyer(userId);
 
   await prisma.purchase.upsert({
     where: { provider_externalId: { provider: PROVIDER, externalId: order.orderId } },
@@ -294,59 +292,6 @@ export async function recordPaidOrder(
     await markOrderConsumed(order.orderId, "order");
   }
   return "written";
-}
-
-/**
- * Cancel every still-granting subscription this account holds, because it just
- * bought the lifetime licence.
- *
- * Cancel, not delete-our-row: Lemon Squeezy keeps a cancelled subscription valid
- * to the end of the period already paid for, and `subscriptionGrants` already
- * treats `cancelled` as granting — so the customer loses nothing they paid for
- * and simply stops renewing. The webhook that the cancel triggers writes the row.
- */
-async function cancelSubscriptionsForLifetimeBuyer(userId: string): Promise<void> {
-  let subs: (SubscriptionLike & { externalId: string })[];
-  try {
-    subs = await prisma.subscription.findMany({
-      where: { userId, provider: PROVIDER },
-      select: {
-        externalId: true,
-        status: true,
-        validUntil: true,
-        trialEndsAt: true,
-        trialCancelledAt: true,
-        pauseMode: true,
-        providerUpdatedAt: true,
-        createdAt: true,
-        variantId: true,
-        updatedAt: true,
-      },
-    });
-  } catch (e) {
-    console.error("[lemonsqueezy] lifetime buyer: could not read subscriptions:", e);
-    return;
-  }
-  const now = new Date();
-  for (const sub of subs) {
-    // Only ones that are actually live and not already cancelled — no point
-    // poking an expired row, and cancelling a cancelled one is a wasted call.
-    if (sub.status === "cancelled" || sub.status === "expired") continue;
-    // Deliberately NOT the access predicate. Being billed is a status question:
-    // a subscription that stopped granting (unknown variant, void pause) is
-    // still taking the customer's money, and skipping it here would leave them
-    // holding a lifetime licence AND a live recurring charge — the exact
-    // outcome the outbox in this same change set exists to prevent.
-    if (!subscriptionIsLive(sub)) continue;
-    // Through the outbox rather than straight at Lemon Squeezy. It used to be a
-    // single fetch with a `console.error` if it failed — and the failure mode of
-    // that shrug is a customer holding a lifetime licence AND a live monthly
-    // charge, invisible until they notice it on their statement. Writing the
-    // intent down first means an outage postpones the cancellation instead of
-    // losing it. Still never throws: the grant has already landed and must not
-    // be undone by the provider being slow.
-    await enqueueAndAttemptCancel(sub.externalId, "lifetime-upgrade");
-  }
 }
 
 /**

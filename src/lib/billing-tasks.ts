@@ -1,6 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
-import type { CancellationState } from "./subscription";
+import { subscriptionIsLive, type CancellationState, type SubscriptionLike } from "./subscription";
 import { env } from "./env";
 
 /**
@@ -454,6 +454,67 @@ export async function enqueueAndAttemptCancel(externalId: string, reason: string
     console.error(`[billing-tasks] inline cancel attempt failed for ${externalId}:`, e);
   }
   return recorded;
+}
+
+/**
+ * Cancel every still-billing Lemon Squeezy subscription this account holds,
+ * because it now owns the lifetime licence — from WHICHEVER storefront sold it.
+ * The Lemon Squeezy order webhook calls this when a desktop lifetime lands, and
+ * `syncUserFromRevenueCat` calls it when an iPhone one appears: without the
+ * second caller, a desktop subscriber who bought lifetime on iOS kept the
+ * licence AND the live monthly charge, invisible until their card statement.
+ *
+ * Cancel, not delete-our-row: Lemon Squeezy keeps a cancelled subscription valid
+ * to the end of the period already paid for, and `subscriptionGrants` already
+ * treats `cancelled` as granting — so the customer loses nothing they paid for
+ * and simply stops renewing. The webhook that the cancel triggers writes the row.
+ *
+ * Never throws, and repeat calls are free: `enqueueCancel` leaves a pending task
+ * alone, and a subscription already cancelled or expired is skipped before the
+ * outbox is even consulted — so a settled task is only ever re-opened by a row
+ * that is genuinely live again.
+ */
+export async function cancelRecurringLsForLifetimeBuyer(userId: string): Promise<void> {
+  let subs: (SubscriptionLike & { externalId: string })[];
+  try {
+    subs = await prisma.subscription.findMany({
+      where: { userId, provider: PROVIDER },
+      select: {
+        externalId: true,
+        status: true,
+        validUntil: true,
+        trialEndsAt: true,
+        trialCancelledAt: true,
+        pauseMode: true,
+        providerUpdatedAt: true,
+        createdAt: true,
+        variantId: true,
+        updatedAt: true,
+      },
+    });
+  } catch (e) {
+    console.error("[billing-tasks] lifetime buyer: could not read subscriptions:", e);
+    return;
+  }
+  for (const sub of subs) {
+    // Only ones that are actually live and not already cancelled — no point
+    // poking an expired row, and cancelling a cancelled one is a wasted call.
+    if (sub.status === "cancelled" || sub.status === "expired") continue;
+    // Deliberately NOT the access predicate. Being billed is a status question:
+    // a subscription that stopped granting (unknown variant, void pause) is
+    // still taking the customer's money, and skipping it here would leave them
+    // holding a lifetime licence AND a live recurring charge — the exact
+    // outcome the outbox exists to prevent.
+    if (!subscriptionIsLive(sub)) continue;
+    // Through the outbox rather than straight at Lemon Squeezy. It used to be a
+    // single fetch with a `console.error` if it failed — and the failure mode of
+    // that shrug is a customer holding a lifetime licence AND a live monthly
+    // charge, invisible until they notice it on their statement. Writing the
+    // intent down first means an outage postpones the cancellation instead of
+    // losing it. Still never throws: the grant has already landed and must not
+    // be undone by the provider being slow.
+    await enqueueAndAttemptCancel(sub.externalId, "lifetime-upgrade");
+  }
 }
 
 export type DrainReport = {

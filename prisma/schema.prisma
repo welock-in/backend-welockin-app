@@ -222,6 +222,13 @@ model Device {
   @@index([userId, name])
   @@index([userId])
   @@index([userId, deviceId])
+  // The precheck's lookup (lib/precheck.ts): "which accounts has THIS device
+  // been seen on?" — deviceId ACROSS users, which none of the userId-prefixed
+  // indexes above can serve. Deploy note: `prisma db push` is NOT how this
+  // reaches the live cluster (on MongoDB it may drop indexes it does not
+  // recognise) — create it additively and verify with
+  // scripts/verify-billing-indexes.mjs.
+  @@index([deviceId])
 }
 
 // An invitation for ONE device to join a focus session started on another.

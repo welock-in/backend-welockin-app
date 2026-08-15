@@ -59,6 +59,16 @@ const REQUIRED = [
       "the lookup behind every eligibility read. Without it the paywall still " +
       "answers correctly, but scans the collection to do it.",
   },
+  {
+    collection: "Device",
+    key: { deviceId: 1 },
+    unique: false,
+    protects:
+      "the precheck's device-to-account lookup (POST /api/auth/precheck), which " +
+      "asks for a deviceId ACROSS users. Every existing Device index is " +
+      "userId-prefixed, so without this one an unauthenticated, rate-limited " +
+      "endpoint scans the whole collection on every call.",
+  },
 ];
 
 /**

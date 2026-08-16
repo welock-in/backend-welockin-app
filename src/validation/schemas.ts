@@ -144,6 +144,16 @@ export const attestRegisterSchema = z.object({
 export const precheckSchema = z.object({
   /** iOS `identifierForVendor` — same bounds discipline as `deviceSchema`. */
   idfv: z.string().trim().min(1).max(128).optional(),
+  /**
+   * Apple's original_transaction_id, when StoreKit could name one for the
+   * Apple ID signed into the phone — the key that lets the precheck consult
+   * the AppleTxOwner registry, which (unlike Device rows) survives account
+   * deletion. `.catch(undefined)` is deliberate: this field is best-effort
+   * advisory knowledge, and a malformed value (wrong type, absurd length)
+   * must degrade to the ordinary device-leg precheck rather than fail the
+   * one call the signup flow depends on.
+   */
+  appleOriginalTransactionId: z.string().trim().min(1).max(128).optional().catch(undefined),
 });
 
 export const appleAuthSchema = z.object({

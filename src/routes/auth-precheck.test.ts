@@ -196,6 +196,13 @@ function fakeClaims(t: Ctx, rows: Row[]) {
   );
 }
 
+/** The AppleTxOwner registry rows the Apple-transaction leg reads. */
+function fakeAppleTxOwners(t: Ctx, rows: Row[]) {
+  return stubMethod(t, prisma.appleTxOwner as any, "findUnique", async (args: any) =>
+    copy(rows.find((r) => r.originalTransactionId === args?.where?.originalTransactionId)),
+  );
+}
+
 /** The paying-owner world most tests start from: one device, one lifetime. */
 function payingOwnerWorld(
   t: Ctx,
@@ -388,6 +395,123 @@ test("PRIVACY PIN: the response never carries the raw email or the account id", 
   assert.ok(!wire.includes(OWNER_EMAIL), "the raw address must never leave the server here");
   assert.ok(!wire.includes(OWNER_ID), "nor the account id");
   assert.ok(wire.includes(maskEmail(OWNER_EMAIL)), "the mask is all a stranger gets");
+});
+
+/* ── the Apple-transaction leg (V1) ───────────────────────────────────────── */
+
+/*
+ * One Apple ID, one WeLockIn account — the leg that works when the device leg
+ * cannot: Device rows die with a hand-deleted account (N13), the AppleTxOwner
+ * row does not. The phone sends StoreKit's original_transaction_id; the
+ * registry answers with the account the money last funded, or with the fact
+ * that it funded a ghost.
+ */
+
+const APPLE_TX = "2000000123456789";
+
+test("a living Apple-transaction owner outranks every device-leg candidate — and always blocks", async (t) => {
+  const APPLE_OWNER_ID = "507f1f77bcf86cd799439055";
+  const APPLE_OWNER_EMAIL = "tx-owner@example.com";
+  // The device leg finds a Lemon Squeezy payer (reportable, never blocking).
+  // The Apple ID's transaction names a DIFFERENT account — one with ZERO
+  // Purchase/Subscription rows, because the receipt itself is the evidence.
+  fakeUsers(t, [
+    { id: OWNER_ID, email: OWNER_EMAIL, passwordHash: "$2a$10$hash" },
+    { id: APPLE_OWNER_ID, email: APPLE_OWNER_EMAIL },
+  ]);
+  fakeDevices(t, [{ deviceId: DEVICE, userId: OWNER_ID, lastSeenAt: new Date() }]);
+  fakePurchases(t, []);
+  fakeSubscriptions(t, [grantingSub(OWNER_ID)]);
+  fakeAuthProviders(t, [{ userId: APPLE_OWNER_ID, provider: "apple" }]);
+  fakeAppleTxOwners(t, [{ originalTransactionId: APPLE_TX, userId: APPLE_OWNER_ID }]);
+
+  const res = await request(app)
+    .post("/api/auth/precheck")
+    .set(deviceHeader)
+    .send({ appleOriginalTransactionId: APPLE_TX });
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.device.payingAccount, {
+    maskedEmail: maskEmail(APPLE_OWNER_EMAIL),
+    billingProvider: "APPLE",
+    loginMethods: ["apple"],
+    blocksSignup: true,
+    isCurrentUser: false,
+  });
+  assert.ok(!("appleTxOrphaned" in res.body.device), "an owner that exists is not an orphan");
+  // The privacy contract holds on this leg too.
+  const wire = JSON.stringify(res.body);
+  assert.ok(!wire.includes(APPLE_OWNER_EMAIL), "the raw address never leaves the server");
+  assert.ok(!wire.includes(APPLE_OWNER_ID), "nor the account id");
+});
+
+test("a ghost owner answers appleTxOrphaned — the Apple ID paid, nobody is left to name", async (t) => {
+  // The hand-deleted-account hole the registry exists to close: Device rows
+  // are gone (cascade), the User is gone, but the AppleTxOwner row survives
+  // pointing at the dead id. The client blocks signup on this flag.
+  const GHOST_ID = "507f1f77bcf86cd799439066";
+  fakeUsers(t, []);
+  fakeDevices(t, []);
+  fakeAppleTxOwners(t, [{ originalTransactionId: APPLE_TX, userId: GHOST_ID }]);
+
+  const res = await request(app)
+    .post("/api/auth/precheck")
+    .set(deviceHeader)
+    .send({ appleOriginalTransactionId: APPLE_TX });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.device.known, false, "the device leg self-healed as N13 promises…");
+  assert.equal(res.body.device.payingAccount, null, "…and names nobody");
+  assert.equal(res.body.device.appleTxOrphaned, true, "but the Apple ID's money is remembered");
+});
+
+test("without the field the response is byte-for-byte the prior wire — no appleTxOrphaned key", async (t) => {
+  payingOwnerWorld(t);
+  const lookups = fakeAppleTxOwners(t, [{ originalTransactionId: APPLE_TX, userId: OWNER_ID }]);
+
+  const res = await request(app).post("/api/auth/precheck").set(deviceHeader).send({});
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.device, {
+    known: true,
+    payingAccount: {
+      maskedEmail: maskEmail(OWNER_EMAIL),
+      billingProvider: "APPLE",
+      loginMethods: ["password", "apple"],
+      blocksSignup: true,
+      isCurrentUser: false,
+    },
+  });
+  assert.equal(lookups.length, 0, "no field, no registry read");
+});
+
+test("a junk transaction id is treated as absent — never a 500, never a refusal", async (t) => {
+  fakeUsers(t, []);
+  fakeDevices(t, []);
+  const lookups = fakeAppleTxOwners(t, []);
+
+  // Beyond the bounds (and even the wrong type): `.catch(undefined)` folds it
+  // to absent instead of failing the one call the signup flow depends on.
+  for (const junk of ["x".repeat(4000), 12345, "   "]) {
+    const res = await request(app)
+      .post("/api/auth/precheck")
+      .set(deviceHeader)
+      .send({ appleOriginalTransactionId: junk });
+    assert.equal(res.status, 200, `junk ${JSON.stringify(junk).slice(0, 20)} must not fail the call`);
+    assert.equal(res.body.device.payingAccount, null);
+    assert.ok(!("appleTxOrphaned" in res.body.device));
+  }
+  assert.equal(lookups.length, 0, "junk never reaches the database");
+
+  // …and a well-formed id that matches nothing is simply case c: unchanged.
+  const unknown = await request(app)
+    .post("/api/auth/precheck")
+    .set(deviceHeader)
+    .send({ appleOriginalTransactionId: "999999999999" });
+  assert.equal(unknown.status, 200);
+  assert.equal(unknown.body.device.payingAccount, null);
+  assert.ok(!("appleTxOrphaned" in unknown.body.device));
+  assert.equal(lookups.length, 1);
 });
 
 /* ── rate limits ──────────────────────────────────────────────────────────── */

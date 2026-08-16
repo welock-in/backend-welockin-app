@@ -4,7 +4,11 @@ import { ledgerHash } from "../lib/hash";
 import { maskEmail } from "../lib/user";
 import { readDeviceId, isReliableDeviceId } from "../lib/device";
 import { parseFingerprint } from "../lib/fingerprint";
-import { findPayingAccountForDevice } from "../lib/precheck";
+import {
+  findOwnerOfAppleTransaction,
+  findPayingAccountForDevice,
+  type AppleTxVerdict,
+} from "../lib/precheck";
 import { verifyToken } from "../lib/jwt";
 import { clientIp, consumeRateLimit } from "../lib/rate-limit";
 import { asyncHandler } from "../middleware/async-handler";
@@ -35,13 +39,41 @@ import { precheckSchema } from "../validation/schemas";
  * blocking interstitial (the signup gates would 409 the same signup) — or
  * false, the paying account is web-billed (Lemon Squeezy), worth mentioning
  * ("plan started on PC") but never a reason to refuse a signup on this phone.
+ *
+ * THE APPLE-TRANSACTION LEG (V1). The body may carry StoreKit's
+ * `appleOriginalTransactionId`, and the AppleTxOwner registry — which,
+ * unlike Device rows, survives account deletion — is consulted with it:
+ *
+ *   owner alive  → that owner IS the payingAccount, outranking every
+ *                  device-leg candidate, blocksSignup: true. The Apple ID
+ *                  already funds an account; sign into it, or create the new
+ *                  account from a computer.
+ *   owner gone   → `device.appleTxOrphaned: true` (wire-additive): the Apple
+ *                  ID demonstrably paid but nobody is left to name. The client
+ *                  blocks with "this Apple ID already has a WeLockIn
+ *                  subscription; create your account from a computer or
+ *                  contact support."
+ *   no row       → unchanged behaviour.
+ *
+ * ANTI-ENUMERATION: accepting the transaction id in an unauthenticated body is
+ * deliberate and acceptable — StoreKit hands original_transaction_id only to a
+ * device signed into the Apple ID that owns the purchase, so it is
+ * device-local knowledge, not something a stranger can guess per-victim; the
+ * ids are opaque, the endpoint is rate-limited like every precheck call, and
+ * the answer is masked exactly like the device leg's.
+ *
+ * ENFORCEMENT NOTE: the server-side signup gates (SIGNUP_PAYING_DEVICE_BLOCK
+ * in routes/auth.ts) are deliberately UNCHANGED — a register/apple call
+ * carries no StoreKit context, so the client-side interstitial built on this
+ * response is the enforcement for the Apple-transaction leg. The gates keep
+ * covering the device leg server-side.
  */
 export const authPrecheckRouter = Router();
 
 authPrecheckRouter.post(
   "/",
   asyncHandler(async (req, res) => {
-    const { idfv } = precheckSchema.parse(req.body ?? {});
+    const { idfv, appleOriginalTransactionId } = precheckSchema.parse(req.body ?? {});
 
     // Both keys, like every sensitive limit here: per-IP stops one host
     // sweeping many devices, per-device stops a proxy pool grinding one
@@ -80,7 +112,16 @@ authPrecheckRouter.post(
       env,
     });
 
-    const paying = result.payingAccount;
+    // The Apple-transaction leg — consulted only when the phone could name a
+    // transaction, and layered ON TOP of the device leg: an owner outranks
+    // every device candidate, an orphan adds its flag without displacing one.
+    let appleTx: AppleTxVerdict = { kind: "none" };
+    if (appleOriginalTransactionId) {
+      appleTx = await findOwnerOfAppleTransaction(appleOriginalTransactionId);
+    }
+
+    const paying = appleTx.kind === "owner" ? appleTx.account : result.payingAccount;
+    const blocking = appleTx.kind === "owner" ? true : result.blocking;
     res.json({
       device: {
         known: result.deviceKnown,
@@ -92,18 +133,23 @@ authPrecheckRouter.post(
               maskedEmail: maskEmail(paying.email),
               billingProvider: paying.billingProvider,
               loginMethods: paying.loginMethods,
-              // Would the server-side signup gates refuse a NEW account on
-              // this device over this binding (SIGNUP_PAYING_DEVICE_BLOCK
-              // on)? True only for an Apple-billed account — see the header.
-              // False means informational only: mention the plan, never show
-              // the blocking interstitial.
-              blocksSignup: result.blocking,
+              // Should the client refuse a NEW account over this binding?
+              // True for an Apple-billed device candidate (the signup gates
+              // would 409 the same signup) and ALWAYS true for an
+              // Apple-transaction owner — the receipt is the evidence. False
+              // means informational only: mention the plan, never show the
+              // blocking interstitial.
+              blocksSignup: blocking,
               // False for every anonymous caller — "is it mine?" is exactly
               // the question an unauthenticated stranger must not get answered
               // beyond the mask.
               isCurrentUser: callerId != null && callerId === paying.userId,
             }
           : null,
+        // Wire-additive, and only ever present as `true`: the Apple ID behind
+        // the supplied transaction id paid for an account that no longer
+        // exists. The client blocks signup on it — see the header.
+        ...(appleTx.kind === "orphaned" ? { appleTxOrphaned: true } : {}),
       },
       serverTime: new Date().toISOString(),
     });

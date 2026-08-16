@@ -108,6 +108,28 @@ export type PrecheckInput = {
 };
 
 /**
+ * How an account can be signed back into — the interstitial's CTA. "password"
+ * comes from the passwordHash, not from an AuthProvider row: registration
+ * never writes one for the password method (see routes/auth.ts), so the hash
+ * IS the record. AuthProvider rows carry the social methods.
+ */
+async function loginMethodsFor(
+  userId: string,
+  passwordHash: string | null,
+): Promise<LoginMethod[]> {
+  const providers = await prisma.authProvider.findMany({
+    where: { userId },
+    select: { provider: true },
+  });
+  const loginMethods: LoginMethod[] = [];
+  if (passwordHash || providers.some((p) => p.provider === "password")) {
+    loginMethods.push("password");
+  }
+  if (providers.some((p) => p.provider === "apple")) loginMethods.push("apple");
+  return loginMethods;
+}
+
+/**
  * Exactly the columns `subscriptionGrants` reads — the full `SubscriptionLike`
  * select, spelled out because a missing column silently disables a security
  * rule (see the type's own comment in lib/subscription.ts).
@@ -233,19 +255,7 @@ export async function findPayingAccountForDevice(input: PrecheckInput): Promise<
     // keep walking for a blocking candidate without another login-methods read.
     if (!blocks && reportable) continue;
 
-    // How they can sign back in. "password" comes from the passwordHash, not
-    // from an AuthProvider row: registration never writes one for the password
-    // method (see routes/auth.ts), so the hash IS the record. AuthProvider
-    // rows carry the social methods.
-    const providers = await prisma.authProvider.findMany({
-      where: { userId },
-      select: { provider: true },
-    });
-    const loginMethods: LoginMethod[] = [];
-    if (user.passwordHash || providers.some((p) => p.provider === "password")) {
-      loginMethods.push("password");
-    }
-    if (providers.some((p) => p.provider === "apple")) loginMethods.push("apple");
+    const loginMethods = await loginMethodsFor(userId, user.passwordHash);
 
     const account: PayingAccount = {
       userId: user.id,
@@ -260,4 +270,69 @@ export async function findPayingAccountForDevice(input: PrecheckInput): Promise<
   }
 
   return { deviceKnown, payingAccount: reportable, blocking: false };
+}
+
+/* ── the Apple-transaction leg (V1) ─────────────────────────────────────── */
+
+/**
+ * What the AppleTxOwner registry says about one Apple transaction id.
+ *
+ *   none     — no row: this Apple ID has never funded an account we know of.
+ *   owner    — the account the money last funded still EXISTS. This verdict
+ *              outranks every device-leg candidate, and it always blocks.
+ *   orphaned — a row exists but its owner is gone (a hand-deleted ghost).
+ *              There is nobody to name, but the Apple ID demonstrably paid:
+ *              the client blocks signup and points at support / the desktop.
+ */
+export type AppleTxVerdict =
+  | { kind: "none" }
+  | { kind: "owner"; account: PayingAccount }
+  | { kind: "orphaned" };
+
+/**
+ * "Has this Apple ID already paid for a WeLockIn account?" — answered from the
+ * AppleTxOwner registry the RevenueCat webhook feeds, keyed on StoreKit's
+ * original_transaction_id.
+ *
+ * THIS LEG EXISTS BECAUSE THE DEVICE LEG DIES WITH THE ACCOUNT: Device rows
+ * cascade on user deletion (N13, by design), so a ghost account's phone reads
+ * as fresh. The registry row deliberately survives, and this lookup is what
+ * finally reads it.
+ *
+ * WHY blocksSignup IS ALWAYS TRUE ON `owner`, with no granting-row check: the
+ * policy is "one Apple ID, one WeLockIn account", and the Apple receipt behind
+ * the registry row IS the billing evidence — a webhook only writes the row for
+ * a transaction RevenueCat saw money on. An owner whose Purchase/Subscription
+ * mirrors have gone stale (or were reset) must still be named rather than let
+ * the same Apple ID fund a second account. Simple and strict, per the policy.
+ *
+ * FAIL-OPEN SHAPE: an id that matches nothing is `none` — the ordinary signup
+ * flow. The column is a plain String, so junk input cannot even raise P2023;
+ * there is no failure mode here that refuses a legitimate fresh phone.
+ */
+export async function findOwnerOfAppleTransaction(
+  originalTransactionId: string,
+): Promise<AppleTxVerdict> {
+  const row = await prisma.appleTxOwner.findUnique({
+    where: { originalTransactionId },
+    select: { userId: true },
+  });
+  if (!row) return { kind: "none" };
+
+  const user = await prisma.user.findUnique({
+    where: { id: row.userId },
+    select: { id: true, email: true, passwordHash: true },
+  });
+  if (!user) return { kind: "orphaned" };
+
+  return {
+    kind: "owner",
+    account: {
+      userId: user.id,
+      email: user.email,
+      // Always APPLE: the registry only ever records App Store money.
+      billingProvider: "APPLE",
+      loginMethods: await loginMethodsFor(user.id, user.passwordHash),
+    },
+  };
 }

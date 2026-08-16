@@ -14,6 +14,14 @@
  * admin courtesy brick a family's shared iPad. A machine trial is not paying
  * either, and needs no case here: it produces no Purchase and no Subscription.
  *
+ * WHO MAY BLOCK is narrower still (`blockingProviders`): the signup gates pass
+ * ["APPLE"], because the refusal's whole justification is "an Apple-billed
+ * purchase is bound to this phone — a second account would double-bill its
+ * store identity". A Lemon Squeezy customer who merely LOGGED IN on an iPhone
+ * is still REPORTED (the paywall's "plan started on PC" copy needs to know)
+ * but must never brick that phone's signups — their money lives on the web,
+ * not in this phone's App Store account.
+ *
  * THE LOOKUP FAILS OPEN at every step, like the trial ledger it borrows its
  * keys from. An unreliable device id (the shared "unidentified" sink), a
  * fingerprint that matches nothing, a claim whose owner deleted their account —
@@ -58,6 +66,15 @@ export type PrecheckResult = {
    */
   deviceKnown: boolean;
   payingAccount: PayingAccount | null;
+  /**
+   * Should a signup on this device be REFUSED over `payingAccount`? Computed
+   * against `blockingProviders` (absent list = any paying account blocks, the
+   * historical behaviour). Kept SEPARATE from `payingAccount` because the two
+   * answer different questions: the account is worth reporting whatever its
+   * provider, but only one whose money is bound to this device's store may
+   * refuse a signup on it — see the module comment.
+   */
+  blocking: boolean;
 };
 
 /** The slice of `env` this reads — the test-row gate, passed like everywhere
@@ -76,6 +93,16 @@ export type PrecheckInput = {
   idfv?: string;
   /** Parsed fingerprint signals (desktop) — the leg that survives a wipe. */
   signals?: Signal[];
+  /**
+   * Which billing worlds may BLOCK a signup on this device. When provided, a
+   * paying candidate billed elsewhere is still reported in `payingAccount`
+   * (informational — `blocking` stays false), and a candidate billed by a
+   * listed provider outranks a more recently seen one that is not: the account
+   * a refusal names must be the one actually bound to this device's store, not
+   * whichever paying account touched the device last. Absent = every paying
+   * candidate blocks (the historical behaviour).
+   */
+  blockingProviders?: BillingProvider[];
   env: TestRowGate;
   now?: Date;
 };
@@ -106,7 +133,7 @@ export async function findPayingAccountForDevice(input: PrecheckInput): Promise<
   // Nothing usable to key on → fail open. An unidentifiable machine gets the
   // ordinary signup flow, never a refusal built on a shared sink value.
   if (!deviceId && !idfv && signals.length === 0) {
-    return { deviceKnown: false, payingAccount: null };
+    return { deviceKnown: false, payingAccount: null, blocking: false };
   }
 
   // The device leg first: live Device rows, most recently seen first, so the
@@ -152,9 +179,15 @@ export async function findPayingAccountForDevice(input: PrecheckInput): Promise<
     }
   }
 
-  // First paying candidate wins, in recency order. Candidates whose User row
-  // no longer exists are skipped, not errors: a stale claim pointing at a
-  // deleted account is exactly the N13 state this must heal through.
+  // First paying candidate wins, in recency order — EXCEPT that a candidate
+  // billed by one of `blockingProviders` outranks any earlier one that is not:
+  // when the refusal fires, the masked address it shows must belong to the
+  // account actually bound to this device's store. The first non-blocking
+  // paying candidate is still remembered, so the result reports it when nobody
+  // blocks. Candidates whose User row no longer exists are skipped, not
+  // errors: a stale claim pointing at a deleted account is exactly the N13
+  // state this must heal through.
+  let reportable: PayingAccount | null = null;
   for (const userId of candidates) {
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -192,6 +225,14 @@ export async function findPayingAccountForDevice(input: PrecheckInput): Promise<
       (grantingSub ? (billingProviderFor(grantingSub.provider) ?? "LEMON_SQUEEZY") : null) ??
       "NONE";
 
+    // May THIS candidate's money refuse a signup? Absent list = yes (the
+    // historical behaviour); otherwise only the listed providers may.
+    const blocks =
+      !input.blockingProviders || input.blockingProviders.includes(billingProvider);
+    // Billed elsewhere and an earlier candidate is already the one to report:
+    // keep walking for a blocking candidate without another login-methods read.
+    if (!blocks && reportable) continue;
+
     // How they can sign back in. "password" comes from the passwordHash, not
     // from an AuthProvider row: registration never writes one for the password
     // method (see routes/auth.ts), so the hash IS the record. AuthProvider
@@ -206,16 +247,17 @@ export async function findPayingAccountForDevice(input: PrecheckInput): Promise<
     }
     if (providers.some((p) => p.provider === "apple")) loginMethods.push("apple");
 
-    return {
-      deviceKnown,
-      payingAccount: {
-        userId: user.id,
-        email: user.email,
-        billingProvider,
-        loginMethods,
-      },
+    const account: PayingAccount = {
+      userId: user.id,
+      email: user.email,
+      billingProvider,
+      loginMethods,
     };
+    if (blocks) {
+      return { deviceKnown, payingAccount: account, blocking: true };
+    }
+    reportable = account;
   }
 
-  return { deviceKnown, payingAccount: null };
+  return { deviceKnown, payingAccount: reportable, blocking: false };
 }

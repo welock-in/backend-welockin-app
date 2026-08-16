@@ -239,6 +239,7 @@ test("a device on a lifetime owner answers known + the masked account (purchase 
     billingProvider: "APPLE",
     loginMethods: ["password", "apple"],
     isCurrentUser: false,
+    blocksSignup: true,
   });
   assert.equal(typeof res.body.serverTime, "string");
 });
@@ -251,6 +252,25 @@ test("a granting subscription is paying too, and names its store", async (t) => 
   assert.equal(res.status, 200);
   assert.equal(res.body.device.known, true);
   assert.equal(res.body.device.payingAccount.billingProvider, "LEMON_SQUEEZY");
+  // Reported, but web money never blocks a signup on this phone.
+  assert.equal(res.body.device.payingAccount.blocksSignup, false);
+});
+
+test("blocksSignup is true for Apple money in either pipe: app_store lifetime or revenuecat sub", async (t) => {
+  payingOwnerWorld(t, { purchase: { provider: "app_store" } });
+  const lifetime = await request(app).post("/api/auth/precheck").set(deviceHeader).send({});
+  assert.equal(lifetime.status, 200);
+  assert.equal(lifetime.body.device.payingAccount.billingProvider, "APPLE");
+  assert.equal(lifetime.body.device.payingAccount.blocksSignup, true);
+
+  payingOwnerWorld(t, {
+    purchase: null,
+    subs: [grantingSub(OWNER_ID, { provider: "revenuecat" })],
+  });
+  const sub = await request(app).post("/api/auth/precheck").set(deviceHeader).send({});
+  assert.equal(sub.status, 200);
+  assert.equal(sub.body.device.payingAccount.billingProvider, "APPLE");
+  assert.equal(sub.body.device.payingAccount.blocksSignup, true);
 });
 
 test("a comp is deliberately NOT a paying account", async (t) => {
@@ -429,6 +449,65 @@ test("register on a paying device: 409 with the mask and the ways back in — fl
   assert.deepEqual(res.body.loginMethods, ["password", "apple"]);
   assert.ok(!JSON.stringify(res.body).includes(OWNER_EMAIL), "the 409 is masked too");
   assert.equal(creates.length, 0, "no account was minted");
+});
+
+test("a LEMON SQUEEZY payer on the device does NOT block registration, even with the flag ON", async (t) => {
+  // The S1/N4 refinement: the block means "an Apple-billed purchase is bound
+  // to this phone". A web-billed account that merely logged in here is
+  // reported by the precheck, but a new signup must go straight through.
+  setEnv(t, { signupPayingDeviceBlock: true });
+  const { creates } = payingOwnerWorld(t, { purchase: null, subs: [grantingSub(OWNER_ID)] });
+  // The verification code the route sends inline.
+  stubMethod(t, prisma.emailVerification as any, "updateMany", async () => ({ count: 0 }));
+  stubMethod(t, prisma.emailVerification as any, "create", async (args: any) => ({
+    id: "ev-0",
+    ...args.data,
+  }));
+
+  const res = await request(app)
+    .post("/api/auth/register")
+    .set(deviceHeader)
+    .send({ email: "newcomer@example.com", password: "hunter2hunter2" });
+
+  assert.equal(res.status, 201);
+  assert.ok(res.body.token);
+  assert.equal(creates.length, 1, "the account was minted despite the web-billed neighbour");
+});
+
+test("mixed candidates: the APPLE-billed account drives the block and its mask is the one shown", async (t) => {
+  setEnv(t, { signupPayingDeviceBlock: true });
+  const APPLE_OWNER_ID = "507f1f77bcf86cd799439044";
+  const APPLE_OWNER_EMAIL = "apple-owner@example.com";
+  // The Lemon Squeezy payer used the phone LAST — recency alone would name
+  // them — but only the Apple-billed account is bound to this phone's store.
+  fakeUsers(t, [
+    { id: OWNER_ID, email: OWNER_EMAIL, passwordHash: "$2a$10$hash" },
+    { id: APPLE_OWNER_ID, email: APPLE_OWNER_EMAIL },
+  ]);
+  fakeDevices(t, [
+    { deviceId: DEVICE, userId: OWNER_ID, lastSeenAt: new Date() },
+    { deviceId: DEVICE, userId: APPLE_OWNER_ID, lastSeenAt: new Date(Date.now() - 60_000) },
+  ]);
+  fakePurchases(t, [{ userId: APPLE_OWNER_ID, provider: "app_store", isRefunded: false }]);
+  fakeSubscriptions(t, [grantingSub(OWNER_ID)]);
+  fakeAuthProviders(t, [{ userId: APPLE_OWNER_ID, provider: "apple" }]);
+
+  const res = await request(app).post("/api/auth/precheck").set(deviceHeader).send({});
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.device.payingAccount.maskedEmail, maskEmail(APPLE_OWNER_EMAIL));
+  assert.equal(res.body.device.payingAccount.billingProvider, "APPLE");
+  assert.equal(res.body.device.payingAccount.blocksSignup, true);
+  assert.deepEqual(res.body.device.payingAccount.loginMethods, ["apple"]);
+
+  // …and the register gate names the SAME account in its 409.
+  const reg = await request(app)
+    .post("/api/auth/register")
+    .set(deviceHeader)
+    .send({ email: "newcomer@example.com", password: "hunter2hunter2" });
+  assert.equal(reg.status, 409);
+  assert.equal(reg.body.code, "DEVICE_LINKED_TO_PAYING_ACCOUNT");
+  assert.equal(reg.body.maskedEmail, maskEmail(APPLE_OWNER_EMAIL));
 });
 
 test("with the flag OFF the same registration goes straight through", async (t) => {

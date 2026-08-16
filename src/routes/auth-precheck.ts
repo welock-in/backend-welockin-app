@@ -29,6 +29,12 @@ import { precheckSchema } from "../validation/schemas";
  * email the CALLER supplied (the schema has no email field — see its comment).
  * The response describes the device in the caller's hand, masked, and nothing
  * else.
+ *
+ * `payingAccount.blocksSignup` says which of the two S1/N4 stories the client
+ * should tell: true — an APPLE-billed purchase is bound to this phone, show the
+ * blocking interstitial (the signup gates would 409 the same signup) — or
+ * false, the paying account is web-billed (Lemon Squeezy), worth mentioning
+ * ("plan started on PC") but never a reason to refuse a signup on this phone.
  */
 export const authPrecheckRouter = Router();
 
@@ -67,6 +73,10 @@ authPrecheckRouter.post(
       deviceId: rawDeviceId,
       idfv,
       signals: fingerprint.signals,
+      // The SAME computation as the signup gates in routes/auth.ts, so
+      // `blocksSignup` below predicts exactly what a register attempt would
+      // meet: only an Apple-billed binding blocks a signup on this phone.
+      blockingProviders: ["APPLE"],
       env,
     });
 
@@ -82,6 +92,12 @@ authPrecheckRouter.post(
               maskedEmail: maskEmail(paying.email),
               billingProvider: paying.billingProvider,
               loginMethods: paying.loginMethods,
+              // Would the server-side signup gates refuse a NEW account on
+              // this device over this binding (SIGNUP_PAYING_DEVICE_BLOCK
+              // on)? True only for an Apple-billed account — see the header.
+              // False means informational only: mention the plan, never show
+              // the blocking interstitial.
+              blocksSignup: result.blocking,
               // False for every anonymous caller — "is it mine?" is exactly
               // the question an unauthenticated stranger must not get answered
               // beyond the mask.

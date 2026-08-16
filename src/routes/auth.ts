@@ -62,18 +62,23 @@ authRouter.post(
 
     // The paying-device gate (S1/N4) — defence in depth behind the client's
     // precheck interstitial: a patched client skips the interstitial, not this.
-    // Only an account with REAL MONEY blocks (a comp or a spent trial does
-    // not), and only a DIFFERENT address: the paying owner re-registering
-    // their own email is stopped by the duplicate-email 409 above, which says
-    // "sign in" — the right advice — rather than this refusal.
+    // Only APPLE-BILLED money blocks (`blockingProviders`): the refusal means
+    // "an Apple-billed purchase is bound to this phone", so a Lemon Squeezy
+    // customer who merely logged in here must not brick the device — their
+    // money is not tied to its store identity. A comp or a spent trial never
+    // blocks, and neither does the SAME address: the paying owner
+    // re-registering their own email is stopped by the duplicate-email 409
+    // above, which says "sign in" — the right advice — rather than this
+    // refusal.
     if (env.signupPayingDeviceBlock) {
       const precheck = await findPayingAccountForDevice({
         deviceId: readDeviceId(req),
         signals: fingerprint.signals,
+        blockingProviders: ["APPLE"],
         env,
       });
       const paying = precheck.payingAccount;
-      if (paying && paying.email !== email) {
+      if (precheck.blocking && paying && paying.email !== email) {
         throw deviceLinkedToPayingAccount(maskEmail(paying.email), paying.loginMethods);
       }
     }
@@ -178,17 +183,21 @@ authRouter.post(
       // blocked — the paying account signing into ITSELF is the precheck's
       // happy ending, not its target. `existing` here means the Apple email
       // already has an account, i.e. the link/converge path below, so the gate
-      // applies exactly when a brand-new account is about to be minted. The
-      // email comparison is belt-and-braces: a paying account with this very
-      // address would have been found by the `existing` lookup above.
+      // applies exactly when a brand-new account is about to be minted. Only
+      // APPLE-BILLED money blocks, for the same reason as /register: the
+      // refusal means "an Apple-billed purchase is bound to this phone", which
+      // a web-billed login here never establishes. The email comparison is
+      // belt-and-braces: a paying account with this very address would have
+      // been found by the `existing` lookup above.
       if (!existing && env.signupPayingDeviceBlock) {
         const precheck = await findPayingAccountForDevice({
           deviceId: readDeviceId(req),
           signals: parseFingerprint(req).signals,
+          blockingProviders: ["APPLE"],
           env,
         });
         const paying = precheck.payingAccount;
-        if (paying && paying.email !== email) {
+        if (precheck.blocking && paying && paying.email !== email) {
           throw deviceLinkedToPayingAccount(maskEmail(paying.email), paying.loginMethods);
         }
       }

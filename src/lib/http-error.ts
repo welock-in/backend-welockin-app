@@ -169,9 +169,12 @@ export const deviceAlreadyClaimed = (
 ) => new HttpError(409, msg, { code: "DEVICE_ALREADY_CLAIMED" });
 
 /**
- * This device already belongs to an account with REAL MONEY on it, and
+ * An APPLE-BILLED purchase is bound to this device, and
  * `SIGNUP_PAYING_DEVICE_BLOCK` says to refuse a second account rather than let
- * someone accidentally pay twice (spec S1/N4).
+ * someone accidentally pay twice (spec S1/N4). Apple-billed ONLY — the gates
+ * pass `blockingProviders: ["APPLE"]` to lib/precheck.ts — because the phone's
+ * App Store identity is what a second account would double-bill; a Lemon
+ * Squeezy account that merely logged in here never blocks.
  *
  * Sibling of `deviceAlreadyClaimed`, but it MUST carry more than a code: the
  * client's interstitial says "this phone already has a paying account —

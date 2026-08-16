@@ -6,7 +6,12 @@ import { signToken } from "../lib/jwt";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { getProvider } from "../lib/purchase-providers";
-import { RC_LIFETIME_PRODUCT_IDS, RC_PRODUCT_YEARLY, type RcSubscriber } from "../lib/revenuecat";
+import {
+  RC_LIFETIME_PRODUCT_IDS,
+  RC_PRODUCT_MONTHLY,
+  RC_PRODUCT_YEARLY,
+  type RcSubscriber,
+} from "../lib/revenuecat";
 import { REAL_ORDER_CREATED } from "./lemonsqueezy-fixtures";
 import { stubAccountGuard, stubNoBillingHolds } from "./test-helpers";
 
@@ -219,6 +224,36 @@ test("a successful refresh answers the resolved view, with plan and validUntil",
   // …and the sync actually wrote what it fetched before resolving.
   assert.equal(db.subUpsert.length, 1);
   assert.equal(db.subUpsert[0][0].update.status, "active");
+});
+
+test("a restore keeps the plan's exact type: the MONTHLY product answers 'monthly', write and view alike", async (t) => {
+  // Criterion N9 of the consolidated report. Restore rides this same refresh,
+  // so the productId→plan mapping must hold through the row the sync WRITES and
+  // the view the client renders — yearly is pinned above, lifetime below;
+  // monthly completes the table, and a restored plan can never change species.
+  providerOpen(t);
+  stubFetch(t, () => ({
+    subscriptions: {
+      [RC_PRODUCT_MONTHLY]: {
+        expires_date: FUTURE.toISOString(),
+        period_type: "normal",
+        is_sandbox: false,
+      },
+    },
+    entitlements: { pro: { product_identifier: RC_PRODUCT_MONTHLY } },
+  }));
+  const db = stubResolver(t, { subscriptions: [rcYearlyRow({ interval: "monthly" })] });
+
+  const res = await request(app).post("/api/billing/revenuecat/refresh").set(auth).send({});
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.isPro, true);
+  assert.equal(res.body.plan, "monthly", "a restored monthly must never resurface as another plan");
+  assert.equal(res.body.validUntil, FUTURE.toISOString());
+  // …and the row the sync wrote says monthly too — the view was not guessing.
+  assert.equal(db.subUpsert.length, 1);
+  assert.equal(db.subUpsert[0][0].update.variantId, RC_PRODUCT_MONTHLY);
+  assert.equal(db.subUpsert[0][0].update.interval, "monthly");
 });
 
 test("auto-renew OFF during an Apple trial still grants, and says trialing", async (t) => {

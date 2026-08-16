@@ -474,6 +474,41 @@ test("a LEMON SQUEEZY payer on the device does NOT block registration, even with
   assert.equal(creates.length, 1, "the account was minted despite the web-billed neighbour");
 });
 
+test("a device holding only FREE accounts never blocks: account after account signs up — flag ON", async (t) => {
+  // The last row of the truth table (criterion N3 of the consolidated report):
+  // Apple money blocks, web money is reported, and NO money — an account that
+  // only ever logged in here — decides nothing. As long as nothing Apple-billed
+  // is bound to the phone, it can mint and hold as many accounts as it likes.
+  setEnv(t, { signupPayingDeviceBlock: true });
+  const { creates } = payingOwnerWorld(t, { purchase: null });
+  // The verification code the route sends inline.
+  stubMethod(t, prisma.emailVerification as any, "updateMany", async () => ({ count: 0 }));
+  stubMethod(t, prisma.emailVerification as any, "create", async (args: any) => ({
+    id: "ev-0",
+    ...args.data,
+  }));
+
+  // The precheck recognises the phone but names no payer.
+  const pre = await request(app).post("/api/auth/precheck").set(deviceHeader).send({});
+  assert.equal(pre.status, 200);
+  assert.equal(pre.body.device.known, true, "the phone is recognised…");
+  assert.equal(pre.body.device.payingAccount, null, "…but nobody on it is paying");
+
+  // …and the register gate lets a second AND a third account through.
+  const second = await request(app)
+    .post("/api/auth/register")
+    .set(deviceHeader)
+    .send({ email: "second@example.com", password: "hunter2hunter2" });
+  const third = await request(app)
+    .post("/api/auth/register")
+    .set(deviceHeader)
+    .send({ email: "third@example.com", password: "hunter2hunter2" });
+
+  assert.equal(second.status, 201);
+  assert.equal(third.status, 201);
+  assert.equal(creates.length, 2, "both new accounts were minted alongside the free owner");
+});
+
 test("mixed candidates: the APPLE-billed account drives the block and its mask is the one shown", async (t) => {
   setEnv(t, { signupPayingDeviceBlock: true });
   const APPLE_OWNER_ID = "507f1f77bcf86cd799439044";

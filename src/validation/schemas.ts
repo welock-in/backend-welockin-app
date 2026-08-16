@@ -674,6 +674,26 @@ export const adminTrialResetSchema = z.object({
   confirmUserId: z.string().trim().min(1),
 });
 
+/**
+ * The test lab's "reset test user" — `POST /api/admin/test/reset-user`.
+ *
+ * Keyed on the EMAIL, because the email is the thing the tester wants back.
+ * Typed TWICE, like every destructive admin verb confirms itself
+ * (confirmUserId on trial-reset and on a permanent grant): this one deletes an
+ * entire account plus its billing state, so it must be unreachable by a
+ * mis-click or an autofill. The match is exact after trimming — a "close
+ * enough" comparison on a destructive tool is how the wrong account dies.
+ */
+export const adminTestResetUserSchema = z
+  .object({
+    email: z.string().trim().email("A valid email is required"),
+    confirmEmail: z.string().trim(),
+  })
+  .refine((v) => v.email === v.confirmEmail, {
+    path: ["confirmEmail"],
+    message: "confirmEmail must match email exactly",
+  });
+
 // --- Checkout ----------------------------------------------------------------
 /**
  * Which plan to buy — a NAME, never a variant id.

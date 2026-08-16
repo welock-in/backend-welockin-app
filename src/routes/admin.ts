@@ -15,6 +15,7 @@ import {
 } from "../lib/billing-tasks";
 
 import { signAdminToken } from "../lib/admin-jwt";
+import { RC_PROVIDER, deleteSubscriber } from "../lib/revenuecat";
 import { toPublicUser } from "../lib/user";
 import { notFound, unauthorized, badRequest, conflict, HttpError } from "../lib/http-error";
 import { clientIp, consumeRateLimit } from "../lib/rate-limit";
@@ -31,6 +32,7 @@ import {
   adminTestSubscriptionCreateSchema,
   adminSubscriptionTimeSchema,
   adminSubscriptionTransitionSchema,
+  adminTestResetUserSchema,
   adminTrialResetSchema,
 } from "../validation/schemas";
 import {
@@ -364,6 +366,49 @@ adminRouter.post(
   }),
 );
 
+/**
+ * STOP CHARGING THE CARD — enqueue (and immediately attempt) a Lemon Squeezy
+ * cancel for every still-billing subscription of one account. Extracted from
+ * DELETE /users/:id so the test reset below unwinds billing through the SAME
+ * outbox machinery instead of a second, driftable copy. Returns how many
+ * cancellations are now owed.
+ *
+ * Test rows filtered — the lab's synthetic ids would dead-letter a task for a
+ * subscription Lemon Squeezy has never heard of. Lemon Squeezy rows only: the
+ * outbox cannot cancel an Apple subscription (the customer does that in their
+ * App Store settings), so enqueueing one would only mint a dead-lettered task.
+ */
+async function enqueueLiveLsCancels(userId: string, reason: string): Promise<number> {
+  const liveSubs = await prisma.subscription.findMany({
+    where: {
+      userId,
+      provider: "lemonsqueezy",
+      ...hideTestRowsFor(userId, env),
+    },
+    select: { externalId: true, status: true },
+  });
+  let enqueued = 0;
+  for (const s of liveSubs) {
+    if (s.status === "expired" || s.status === "cancelled") continue;
+    await enqueueAndAttemptCancel(s.externalId, reason);
+    enqueued += 1;
+  }
+  return enqueued;
+}
+
+/**
+ * The one deleter of an account row. Prisma's emulated cascades take every
+ * relation-bearing collection with it (devices, focusEvents, snapshot,
+ * authProviders, liveSessions, …). ConsumedOrder, TrialClaim and
+ * RcSubscriberClaim have NO user relation on purpose and survive — each is a
+ * ledger that must outlive the account it describes (see schema.prisma).
+ * Shared by the console delete and the test reset so the two can never
+ * cascade differently.
+ */
+async function deleteAccountRow(userId: string): Promise<void> {
+  await prisma.user.delete({ where: { id: userId } });
+}
+
 adminRouter.delete(
   "/users/:id",
   requireAdmin,
@@ -386,29 +431,13 @@ adminRouter.delete(
     // account vanished, Lemon Squeezy was never told, and the customer kept
     // being billed for something nobody could see any more. Enqueued first so an
     // unreachable provider postpones the cancellation instead of losing it.
-    const liveSubs = await prisma.subscription.findMany({
-      // Test rows filtered — the lab's synthetic ids would dead-letter a task for
-      // a subscription Lemon Squeezy has never heard of.
-      // Lemon Squeezy rows only: the outbox cannot cancel an Apple subscription
-      // (the customer does that in their App Store settings), so enqueueing one
-      // would only mint a dead-lettered task.
-      where: {
-        userId: req.params.id,
-        provider: "lemonsqueezy",
-        ...hideTestRowsFor(req.params.id, env),
-      },
-      select: { externalId: true, status: true },
-    });
-    for (const s of liveSubs) {
-      if (s.status === "expired" || s.status === "cancelled") continue;
-      await enqueueAndAttemptCancel(s.externalId, "account-deleted-by-admin");
-    }
+    await enqueueLiveLsCancels(req.params.id, "account-deleted-by-admin");
 
     // Relations (devices, focusEvents, snapshot, authProviders, liveSessions)
     // all cascade on delete in the schema. ConsumedOrder does NOT — it has no
     // user relation on purpose, so a paid order stays spent after the account
     // is gone (see schema.prisma + the audit's recycled-email finding).
-    await prisma.user.delete({ where: { id: req.params.id } });
+    await deleteAccountRow(req.params.id);
     res.json({ deleted: true });
   }),
 );
@@ -643,6 +672,9 @@ async function audit(
   reason: string,
   before: unknown,
   after: unknown,
+  /** Structured extras that fit neither snapshot — e.g. the test reset's
+   *  per-leg report. Omitted from the row entirely when not given. */
+  meta?: unknown,
 ): Promise<void> {
   await prisma.adminAuditLog
     .create({
@@ -654,6 +686,7 @@ async function audit(
         reason,
         before: before as never,
         after: after as never,
+        ...(meta !== undefined ? { meta: meta as never } : {}),
       },
     })
     // Best-effort: losing the audit row must not cost the operator the action
@@ -1404,5 +1437,193 @@ adminRouter.post(
     }, { validUntil: horizon, days, hours, via });
 
     res.status(202).json({ ok: true, validUntil: horizon, via });
+  }),
+);
+
+/* ── Test lab: reset a test user ────────────────────────────────────────────
+ *
+ * THE RESET BUTTON for the tester's own accounts: make an email reusable for a
+ * fresh signup without hand-deleting half a database and leaving the orphaned
+ * states partial deletions create. One call unwinds everything WE control —
+ * outstanding sessions, the RevenueCat subscriber, Lemon Squeezy billing, the
+ * account row, the trial ledger, the RC order tombstones — and reports each
+ * leg separately, because the tool's whole value is TRUST: a reset that claims
+ * more than it did costs an afternoon of confused re-testing.
+ *
+ * WHAT IT NEVER CLAIMS: Apple. Deleting the RevenueCat subscriber removes
+ * RevenueCat's record, never the sandbox receipt in the Apple ID's purchase
+ * history — a Restore re-creates the subscriber from it. The report says so in
+ * as many words on EVERY response (`appleSide`), so nobody reads `ok: true` as
+ * "Apple is clean too".
+ *
+ * Every leg is individually try/caught: one provider being down must not stop
+ * the others from being cleaned, and the report names exactly which legs
+ * failed. LS ORDER TOMBSTONES STAY — a spent Lemon Squeezy order must remain
+ * spent whoever takes this email next (ConsumedOrder exists precisely to
+ * survive account churn); only the RevenueCat tombstones keyed `${userId}:…`
+ * go, because that userId dies with the account and can never be minted again
+ * — after the delete they are pure orphans.
+ */
+
+/**
+ * The one thing this tool cannot clean, said on every response. Static on
+ * purpose: it is documentation, not state, and it must never be omittable.
+ */
+const APPLE_SIDE_NOTE =
+  "NOT cleared — Apple sandbox purchase history can only be cleared in App Store Connect (Users and Access → Sandbox → Clear Purchase History), and an active TestFlight subscription keeps renewing until it expires.";
+
+adminRouter.post(
+  "/test/reset-user",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    requireTestTools();
+    const { email } = adminTestResetUserSchema.parse(req.body);
+
+    // Case-insensitive, the same idiom as the Lemon Squeezy webhook's owner
+    // lookup: registration lowercases, but older rows and hand-edits may not.
+    const user = await prisma.user.findFirst({
+      where: { email: { equals: email, mode: "insensitive" } },
+      select: { id: true, email: true },
+    });
+    // Not found is a 404, not a partial sweep: every remaining leg is keyed on
+    // the userId, and "clean whatever matches nothing" would either no-op or —
+    // worse — invite a variant that touches other accounts' device-keyed rows.
+    if (!user) throw notFound("No account with that email");
+    const userId = user.id;
+
+    // One entry per leg that FAILED, named so the console can render it next
+    // to the legs that ran. A leg failure never aborts the reset — the whole
+    // point is to clean what CAN be cleaned and say honestly what could not.
+    const failures: { step: string; error: string }[] = [];
+    const leg = async <T>(step: string, fallback: T, fn: () => Promise<T>): Promise<T> => {
+      try {
+        return await fn();
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        console.error(`[admin] test reset: ${step} leg failed:`, message);
+        failures.push({ step, error: message });
+        return fallback;
+      }
+    };
+
+    // (1) End every outstanding session NOW — the same lever a password reset
+    // pulls: requireCurrentSession compares each token's iat to this stamp, so
+    // bumping it strands every JWT minted before this instant at every gate
+    // that reads the database.
+    const sessionsRevoked = await leg("sessions", false, async () => {
+      await prisma.user.update({
+        where: { id: userId },
+        data: { passwordChangedAt: new Date() },
+      });
+      return true;
+    });
+
+    // (2) RevenueCat: delete the subscriber(s) so the tester's next account has
+    // no history to inherit and no claim to conflict with. Keys: every claim
+    // registered to this account, plus the account id itself — the id every
+    // sync fetches by, claim or no claim. Per-key outcome reported; a claim row
+    // is removed only once RevenueCat actually released its subscriber (404 =
+    // already gone = released), so a failed delete keeps its claim visible and
+    // retryable instead of becoming an untracked orphan.
+    const rcSubscribersDeleted: string[] = [];
+    const rcSubscriberFailures: { appUserId: string; error: string }[] = [];
+    await leg("revenuecat", undefined, async () => {
+      const claims = await prisma.rcSubscriberClaim.findMany({
+        where: { userId },
+        select: { originalAppUserId: true },
+      });
+      const keys = [...new Set([userId, ...claims.map((c) => c.originalAppUserId)])];
+      for (const appUserId of keys) {
+        try {
+          await deleteSubscriber(appUserId);
+          rcSubscribersDeleted.push(appUserId);
+        } catch (e) {
+          rcSubscriberFailures.push({
+            appUserId,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+      if (rcSubscribersDeleted.length > 0) {
+        await prisma.rcSubscriberClaim.deleteMany({
+          where: { userId, originalAppUserId: { in: rcSubscribersDeleted } },
+        });
+      }
+    });
+
+    // (3) STOP CHARGING THE CARD — the exact outbox machinery the console
+    // delete uses, so an unreachable provider postpones the cancellation
+    // instead of losing it.
+    const lsCancelsEnqueued = await leg("lemonsqueezy", 0, () =>
+      enqueueLiveLsCancels(userId, "test-reset-user"),
+    );
+
+    // (4) The account itself, through the SAME deleter as DELETE /users/:id —
+    // one cascade, never two that drift.
+    const accountDeleted = await leg("account", false, async () => {
+      await deleteAccountRow(userId);
+      return true;
+    });
+
+    // (5) The trial ledger. The claims deliberately have no relation, so the
+    // delete above never touches them — and unlike every ordinary deletion
+    // flow, a TEST reset wants the machine's window back: handing it back is
+    // this tool's job, exactly like /users/:id/trial-reset. Runs keyed on the
+    // captured userId, which the account delete cannot invalidate (firstUserId
+    // is a raw id, not a relation).
+    const trialClaimsDeleted = await leg("trial-ledger", 0, async () => {
+      const claims = await prisma.trialClaim.findMany({
+        where: { firstUserId: userId },
+        select: { id: true },
+      });
+      if (claims.length === 0) return 0;
+      const ids = claims.map((c) => c.id);
+      // The DeviceSignal rows go with the claims — leaving them would keep the
+      // hardware pointing at claims that no longer exist.
+      await prisma.deviceSignal.deleteMany({ where: { claimId: { in: ids } } });
+      const out = await prisma.trialClaim.deleteMany({ where: { id: { in: ids } } });
+      return out.count;
+    });
+
+    // (6) RevenueCat order tombstones ONLY, and only THIS user's: every RC
+    // externalId this backend mints is `${userId}:…`, and the userId dies with
+    // the account. Lemon Squeezy tombstones are keyed on LS's OWN order ids
+    // and STAY — a spent LS order must remain spent.
+    const consumedOrdersDeleted = await leg("consumed-orders", 0, async () => {
+      const out = await prisma.consumedOrder.deleteMany({
+        where: { provider: RC_PROVIDER, externalId: { startsWith: `${userId}:` } },
+      });
+      return out.count;
+    });
+
+    const report = {
+      sessionsRevoked,
+      rcSubscribersDeleted,
+      rcSubscriberFailures,
+      lsCancelsEnqueued,
+      accountDeleted,
+      trialClaimsDeleted,
+      consumedOrdersDeleted,
+      failures,
+    };
+
+    // The audit carries the per-leg report as meta — minus the static Apple
+    // sentence, which is documentation rather than something that happened.
+    await audit(
+      req,
+      "test_reset_user",
+      userId,
+      `test reset of ${user.email}`,
+      { email: user.email },
+      { accountDeleted },
+      report,
+    );
+
+    res.json({
+      // `ok` means EVERY leg landed. A partial reset still answers 200 with
+      // ok:false — the caller's request was fine; the report says what is left.
+      ok: failures.length === 0 && rcSubscriberFailures.length === 0,
+      report: { ...report, appleSide: APPLE_SIDE_NOTE },
+    });
   }),
 );

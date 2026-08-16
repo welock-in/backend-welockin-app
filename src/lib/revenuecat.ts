@@ -217,6 +217,63 @@ export async function fetchSubscriber(appUserId: string): Promise<RcFetchResult>
   return { subscriber, authoritative: true };
 }
 
+/**
+ * Delete one subscriber at RevenueCat — the test-reset tool's lever, and no
+ * part of any sync. `DELETE /v1/subscribers/{id}` removes RevenueCat's customer
+ * record and every alias attached to it, so the same app_user_id can be born
+ * fresh on its next contact instead of inheriting a dead account's history.
+ *
+ * WHAT IT DOES NOT DO, because nothing can: touch Apple. The sandbox receipt
+ * lives in the Apple ID's purchase history, not at RevenueCat, and a Restore
+ * of a still-live purchase simply re-creates the subscriber from it. Callers
+ * must never report this call as "Apple is clean".
+ *
+ * The outcomes:
+ *   2xx → deleted: true.
+ *   404 → deleted: false — already gone, which for a cleanup is success, the
+ *         same way cancelling an already-cancelled subscription is. Never an
+ *         error: the caller wanted absence and absence is what there is.
+ *   anything else / unreachable → RevenueCatApiError, same typed failure as
+ *         fetchSubscriber so the caller can report it without string-matching.
+ *
+ * Same timeout and no-echo discipline as fetchSubscriber: never logs or
+ * rethrows response bodies wholesale, never echoes the request (it carried the
+ * secret key).
+ */
+export async function deleteSubscriber(appUserId: string): Promise<{ deleted: boolean }> {
+  if (!env.revenuecatSecretApiKey) {
+    throw new RevenueCatApiError("RevenueCat is not configured");
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  let response: Response;
+  try {
+    response = await fetch(
+      `${env.revenuecatApiBase}/v1/subscribers/${encodeURIComponent(appUserId)}`,
+      {
+        method: "DELETE",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${env.revenuecatSecretApiKey}`,
+        },
+        signal: controller.signal,
+      },
+    );
+  } catch (e) {
+    throw new RevenueCatApiError(
+      `RevenueCat is unreachable: ${e instanceof Error ? e.message : "network error"}`,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (response.status === 404) return { deleted: false };
+  if (!response.ok) {
+    throw new RevenueCatApiError(`RevenueCat answered HTTP ${response.status}`, response.status);
+  }
+  return { deleted: true };
+}
+
 /* ── the pure projection: subscriber JSON → write plan ──────────────────── */
 
 /** A timestamp we cannot parse must become null, never an Invalid Date —

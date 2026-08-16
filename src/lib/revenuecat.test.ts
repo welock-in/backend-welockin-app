@@ -7,6 +7,8 @@ import {
   RC_PRODUCT_MONTHLY,
   RC_PRODUCT_YEARLY,
   RC_PROVIDER,
+  RevenueCatApiError,
+  deleteSubscriber,
   projectSubscriber,
   statusForSubscription,
   syncUserFromRevenueCat,
@@ -1313,4 +1315,63 @@ test("losing the first-claim race is judged like any later caller", async (t) =>
 
   assert.deepEqual(result.conflict, { ownerUserId: OTHER_USER });
   assert.equal(db.subUpsert.length, 0, "the race loser is granted nothing");
+});
+
+/* ── deleteSubscriber — the test-reset tool's lever ─────────────────────── */
+
+/** Env + fetch scaffolding for the DELETE calls, mirroring stubSync's shape. */
+function stubDelete(t: Ctx, respond: (url: string, init: any) => Response | Promise<Response>) {
+  const before = env.revenuecatSecretApiKey;
+  (env as any).revenuecatSecretApiKey = "sk_test";
+  t.after(() => {
+    (env as any).revenuecatSecretApiKey = before;
+  });
+  return stubMethod(t, globalThis as any, "fetch", async (url: any, init: any) =>
+    respond(String(url), init),
+  );
+}
+
+test("deleteSubscriber issues a DELETE for the encoded id and reports deleted", async (t) => {
+  const calls = stubDelete(t, () => new Response("{}", { status: 200 }));
+
+  const out = await deleteSubscriber("user with spaces");
+
+  assert.deepEqual(out, { deleted: true });
+  assert.equal(calls.length, 1);
+  const [url, init] = calls[0];
+  assert.ok(String(url).endsWith(`/v1/subscribers/${encodeURIComponent("user with spaces")}`), url);
+  assert.equal(init.method, "DELETE");
+  assert.equal(init.headers.Authorization, "Bearer sk_test");
+});
+
+test("a 404 on delete is 'already gone' — success for a cleanup, never a throw", async (t) => {
+  stubDelete(t, () => new Response("{}", { status: 404 }));
+  assert.deepEqual(await deleteSubscriber(USER), { deleted: false });
+});
+
+test("any other refusal throws the typed error, like fetchSubscriber's", async (t) => {
+  stubDelete(t, () => new Response("{}", { status: 500 }));
+  await assert.rejects(
+    () => deleteSubscriber(USER),
+    (e: unknown) => e instanceof RevenueCatApiError && e.status === 500,
+  );
+});
+
+test("an unreachable RevenueCat throws rather than pretending it deleted", async (t) => {
+  stubDelete(t, () => {
+    throw new Error("ECONNREFUSED");
+  });
+  await assert.rejects(
+    () => deleteSubscriber(USER),
+    (e: unknown) => e instanceof RevenueCatApiError && /unreachable/.test((e as Error).message),
+  );
+});
+
+test("deleteSubscriber refuses to run without a configured key", async (t) => {
+  const before = env.revenuecatSecretApiKey;
+  (env as any).revenuecatSecretApiKey = "";
+  t.after(() => {
+    (env as any).revenuecatSecretApiKey = before;
+  });
+  await assert.rejects(() => deleteSubscriber(USER), RevenueCatApiError);
 });

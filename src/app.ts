@@ -119,7 +119,12 @@ export function createApp(): Express {
   app.use("/api/focus-events", gated, focusEventsRouter);
   app.use("/api/analytics", gated, analyticsRouter);
   app.use("/api/feedback", gated, feedbackRouter);
-  app.use("/api/attest", attestRouter);
+  // Session-freshness only, composed like /api/onboarding below: the router's
+  // own requireAuth is a stateless signature check, so without the account
+  // guard a deleted user's JWT kept minting challenges and registering keys
+  // for up to thirty days. Not `gated`: iOS has no code screen yet, and App
+  // Attest must not be the thing an unverified address is locked out of.
+  app.use("/api/attest", requireAuth, requireCurrentSession, attestRouter);
   app.use("/api/breaks", gated, breaksRouter);
   app.use("/api/notifications", gated, notificationsRouter);
   // Live-session heartbeats, reported by the client while a focus runs.
@@ -136,8 +141,12 @@ export function createApp(): Express {
   // /api/admin so the admin console reaches it through its existing proxy.
   app.use("/api/admin/health/lemonsqueezy", requireAdmin, healthLemonSqueezyRouter);
   // Addiction protection: the curated list + partner-OTP / dated lock (client),
-  // and the admin CRUD + active-protection panel.
-  app.use("/api/addiction-protection", addictionProtectionRouter);
+  // and the admin CRUD + active-protection panel. Session-freshness only, like
+  // /api/attest above and for the same reason — a deleted account's stateless
+  // JWT must not keep reading the list or driving the lock. Verification is
+  // deliberately NOT required: the enforcer on a locked machine reads status
+  // to keep the block up, and a 403 it cannot act on must not become a lever.
+  app.use("/api/addiction-protection", requireAuth, requireCurrentSession, addictionProtectionRouter);
   app.use("/api/admin/addiction-protection", adminProtectionRouter);
   app.use("/api/admin/releases", adminReleasesRouter);
   app.use("/api/admin/notifications", adminNotificationsRouter);

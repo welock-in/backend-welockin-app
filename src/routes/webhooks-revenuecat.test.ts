@@ -467,6 +467,7 @@ test("an anonymous app_user_id is understood, logged without the id, and skipped
   configured(t);
   const fetches = stubFetch(t);
   const db = stubDb(t);
+  const errors = stubMethod(t, console as any, "error", () => {});
 
   const res = await deliver(
     eventBody({ app_user_id: "$RCAnonymousID:87c6049c58069238dce29853f9644e44" }),
@@ -476,9 +477,13 @@ test("an anonymous app_user_id is understood, logged without the id, and skipped
   assert.equal(res.body.status, "skipped");
   assert.equal(fetches.length, 0);
   assert.equal(finalStatus(db.eventMark), "skipped");
+  // Anonymous-only stays QUIET — an identity that never was an account is not
+  // an incident, and its reason string is the old one, without ids.
+  assert.equal(db.eventMark.at(-1)?.[0]?.data?.error, "no account to sync");
+  assert.equal(errors.length, 0);
 });
 
-test("an id shaped like ours but matching no account is skipped, not guessed at", async (t) => {
+test("an id shaped like ours but matching no account is skipped, not guessed at — and the row says whose", async (t) => {
   configured(t);
   const fetches = stubFetch(t);
   const db = stubDb(t, { userFind: async () => null });
@@ -489,6 +494,41 @@ test("an id shaped like ours but matching no account is skipped, not guessed at"
   assert.equal(res.body.status, "skipped");
   assert.equal(fetches.length, 0);
   assert.equal(finalStatus(db.eventMark), "skipped");
+  // A valid ObjectId matching nobody is an ORPHANED receipt (deleted owner) —
+  // the WebhookEvent row must carry the id so support can find the money.
+  const reason = String(db.eventMark.at(-1)?.[0]?.data?.error);
+  assert.match(reason, /orphaned/);
+  assert.ok(reason.includes(USER), "the reason names the orphaned id");
+});
+
+test("a TRANSFER touching only a deleted account is LOUD, and terminal all the same", async (t) => {
+  configured(t);
+  const fetches = stubFetch(t);
+  const db = stubDb(t, { userFind: async () => null });
+  const errors = stubMethod(t, console as any, "error", () => {});
+
+  const res = await deliver(
+    eventBody({
+      id: "evt-transfer-orphan",
+      type: "TRANSFER",
+      store: undefined,
+      product_id: undefined,
+      app_user_id: USER,
+      transferred_to: [],
+      transferred_from: [],
+    }),
+  );
+
+  assert.equal(res.status, 200, "terminal — a redelivery cannot resurrect the owner");
+  assert.equal(res.body.status, "skipped");
+  assert.equal(fetches.length, 0);
+  assert.equal(finalStatus(db.eventMark), "skipped");
+  const reason = String(db.eventMark.at(-1)?.[0]?.data?.error);
+  assert.match(reason, /orphaned/);
+  assert.ok(reason.includes(USER), "the WebhookEvent row carries the evidence");
+  assert.equal(errors.length, 1, "an orphaned receipt is money with no account — never silent");
+  assert.match(String(errors[0][0]), /TRANSFER/);
+  assert.ok(String(errors[0][0]).includes(USER), "the log names the orphaned id (our own Mongo id)");
 });
 
 test("a TRANSFER re-syncs BOTH sides — the loser must lose access too", async (t) => {

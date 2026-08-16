@@ -275,8 +275,24 @@ revenueCatWebhookRouter.post(
       }
 
       if (known.length === 0) {
-        await markWebhookEvent(RC_PROVIDER, event.id, "skipped", "no account to sync");
-        res.status(200).json({ ok: true, status: "skipped", note: "no account to sync" });
+        // Nobody to sync — but WHICH nobody matters. Ids that were valid
+        // ObjectIds yet matched no User row are OUR OWN ids whose owner is
+        // gone (a deleted account, another environment's id space): that is a
+        // receipt with real money behind it and no account to attach it to,
+        // so it is logged LOUDLY and the ids go into the WebhookEvent reason —
+        // the row is the evidence support will need. (They are our Mongo ids,
+        // no PII beyond that.) Anonymous-only deliveries stay quiet: an
+        // identity that never was an account has nothing to find. Terminal
+        // 200 either way — a redelivery cannot make the owner exist again.
+        const reason =
+          ids.length > 0
+            ? `orphaned: ${ids.join(", ")} (account deleted?)`
+            : "no account to sync";
+        if (ids.length > 0) {
+          console.error(`[revenuecat] ${event.type}: ${reason} — receipt has no account`);
+        }
+        await markWebhookEvent(RC_PROVIDER, event.id, "skipped", reason);
+        res.status(200).json({ ok: true, status: "skipped", note: reason });
         return;
       }
 

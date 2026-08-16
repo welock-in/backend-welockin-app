@@ -53,6 +53,27 @@ export const transactionForeign = (msg = "This transaction belongs to another ap
   new HttpError(400, msg, { code: "TRANSACTION_FOREIGN" });
 export const transactionUnknownProduct = (msg = "Unknown product") =>
   new HttpError(400, msg, { code: "TRANSACTION_UNKNOWN_PRODUCT" });
+/**
+ * This App Store transaction is already recorded on ANOTHER account that still
+ * exists — one Apple purchase, one WeLockIn account.
+ *
+ * A 409, not a 400: the transaction itself is valid and Apple-signed, and the
+ * refusal is about OWNERSHIP, so the client must not treat it as a broken
+ * payload to drop. It replaces a silent cross-account update that used to
+ * re-point nothing while quietly refreshing account A's row on account B's
+ * behalf. Like `deviceLinkedToPayingAccount`, it carries `maskedEmail` (the
+ * `maskEmail` form, never the raw address — the caller has NOT authenticated
+ * as the owner) so the client's "this purchase belongs to another account"
+ * copy can name an account its owner will recognise.
+ */
+export const purchaseOwnedByAnotherAccount = (
+  maskedEmail: string,
+  msg = "This purchase already belongs to another WeLockIn account. Sign in with that account instead.",
+) =>
+  new HttpError(409, msg, {
+    code: "PURCHASE_OWNED_BY_OTHER_ACCOUNT",
+    details: { maskedEmail },
+  });
 
 // --- Subscriptions ----------------------------------------------------------
 /**

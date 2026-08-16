@@ -8,10 +8,12 @@ import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import {
   accountGone,
+  purchaseOwnedByAnotherAccount,
   transactionForeign,
   transactionInvalid,
   transactionUnknownProduct,
 } from "../lib/http-error";
+import { maskEmail } from "../lib/user";
 import { APP_STORE, isSellableProductId, purchaseEffect } from "../lib/entitlement";
 import { InvalidTransaction, verifySignedTransaction } from "../lib/apple-jws";
 import { assertCanWrite } from "../lib/purchase-providers";
@@ -150,16 +152,68 @@ purchasesRouter.post(
  * `isRefunded` is written on every pass rather than only on insert — a refund
  * reaches us as a REPLAY of the same transaction carrying `revocationDate`, so an
  * insert-only write would leave a refunded customer holding a live licence.
+ *
+ * ONE APPLE PURCHASE, ONE WELOCKIN ACCOUNT. This path, unlike the RevenueCat
+ * mirror, IS globally unique on `originalTransactionId` — but the upsert used
+ * to make that uniqueness a lie: a second account replaying the same JWS (a
+ * restore on a phone signed into account B) landed on account A's row and
+ * silently REFRESHED it, telling B "recorded" while granting them nothing and
+ * letting B's replay rewrite A's refund state. Now ownership is explicit:
+ *
+ *   row owned by the caller   → the ordinary replay; refresh as ever.
+ *   row owned by a LIVING other account
+ *                             → 409 PURCHASE_OWNED_BY_OTHER_ACCOUNT with the
+ *                               owner's masked email — the client says "this
+ *                               purchase belongs to another account".
+ *   row owned by a DELETED account
+ *                             → ADOPT: the receipt is real money whose owner is
+ *                               gone, and Apple has just proven it restores to
+ *                               the caller. `userId` enters the update clause
+ *                               ONLY through this branch, and the adoption is
+ *                               written to the audit log.
+ *
+ * The read-then-upsert is not atomic; the residual race (two accounts posting
+ * the same JWS in the same instant) converges on the next replay, which
+ * StoreKit guarantees — and the loser's next post gets the honest 409.
+ *
+ * Exported for tests: the route in front of it cannot be exercised without a
+ * transaction Apple actually signed (see apple-jws.test.ts).
  */
-async function recordLifetime(
+export async function recordLifetime(
   userId: string,
   tx: { originalTransactionId: string; productId: string; purchaseDate: number },
   refunded: boolean,
 ): Promise<void> {
+  const where = {
+    provider_externalId: { provider: APP_STORE, externalId: tx.originalTransactionId },
+  };
+
+  let adoptedFromUserId: string | null = null;
+  const existing = await prisma.purchase.findUnique({
+    where,
+    select: { userId: true },
+  });
+  if (existing && existing.userId !== userId) {
+    const owner = await prisma.user.findUnique({
+      where: { id: existing.userId },
+      select: { email: true },
+    });
+    if (owner) {
+      console.warn(
+        `[purchases] refused: transaction ${tx.originalTransactionId} belongs to ` +
+          `${existing.userId}, posted by ${userId}`,
+      );
+      throw purchaseOwnedByAnotherAccount(maskEmail(owner.email));
+    }
+    adoptedFromUserId = existing.userId;
+    console.warn(
+      `[purchases] adopting orphaned transaction ${tx.originalTransactionId}: ` +
+        `previous owner ${adoptedFromUserId} no longer exists, moving to ${userId}`,
+    );
+  }
+
   await prisma.purchase.upsert({
-    where: {
-      provider_externalId: { provider: APP_STORE, externalId: tx.originalTransactionId },
-    },
+    where,
     create: {
       userId,
       provider: APP_STORE,
@@ -173,8 +227,32 @@ async function recordLifetime(
     update: {
       isRefunded: refunded,
       ...(refunded ? { refundedAt: new Date() } : { refundedAt: null }),
+      // Ownership moves ONLY on an adoption — every other pass leaves the
+      // create-time owner exactly as every other billing writer does.
+      ...(adoptedFromUserId ? { userId } : {}),
     },
   });
+
+  if (adoptedFromUserId) {
+    // The audit trail: an ownership move with no admin in the loop must still
+    // be explainable later. Best-effort like the admin console's own audit —
+    // losing the row must not cost the customer the licence they just proved.
+    await prisma.adminAuditLog
+      .create({
+        data: {
+          actorId: userId,
+          action: "adopt_orphaned_purchase",
+          targetUserId: userId,
+          reason: `previous owner ${adoptedFromUserId} deleted; App Store replay proves the receipt restores to the caller`,
+          meta: {
+            provider: APP_STORE,
+            externalId: tx.originalTransactionId,
+            previousUserId: adoptedFromUserId,
+          },
+        },
+      })
+      .catch((e) => console.error("[purchases] adoption audit row failed:", e));
+  }
 
   // Deliberately NOT touching `User.plan`. The cache has ONE writer —
   // `resolveAndCache`, which the route calls right after this and which writes

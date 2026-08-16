@@ -928,6 +928,40 @@ model ConsumedOrder {
   @@unique([provider, externalId])
 }
 
+/// The ownership registry for the RevenueCat path: one Apple purchase history,
+/// one WeLockIn account.
+///
+/// WHY IT EXISTS. Every RC row is keyed `userId:productId` — the caller's OWN
+/// id is inside the key — so `@@unique([provider, externalId])` can never say
+/// "this Apple transaction already belongs to account A" when account B
+/// restores the same receipt. What IS stable across accounts is RevenueCat's
+/// `original_app_user_id`: the identity the subscriber was first created as,
+/// which survives restores and is what TRANSFER events move. So the subscriber,
+/// not the transaction, is what gets claimed — and `syncUserFromRevenueCat`
+/// consults this registry before it writes a single granting row.
+///
+/// `userId` is DELIBERATELY NOT a relation. The claim must outlive the account
+/// that made it: if the owner deletes their account, the claim stays behind
+/// pointing at a userId that matches nobody — which is exactly how the sync
+/// detects an ORPHANED subscriber and lets the next legitimate restore adopt
+/// it, instead of the cascade silently freeing the receipt for anyone.
+///
+/// DEPLOY NOTE: the `@unique` is the concurrency lock (two first-claims collide
+/// in the database instead of racing check-then-act), and on MongoDB it only
+/// exists once built in the cluster. `prisma db push` creates it in dev; on the
+/// live billing database create it ADDITIVELY (db push may drop indexes it does
+/// not recognise) and verify with scripts/verify-billing-indexes.mjs.
+model RcSubscriberClaim {
+  id                String   @id @default(auto()) @map("_id") @db.ObjectId
+  /// RevenueCat's original_app_user_id — the subscriber's birth identity, the
+  /// one identifier that is the same whichever of our accounts restores it.
+  originalAppUserId String   @unique
+  /// Current owner. NOT a relation — must survive user deletion (see above).
+  userId            String   @db.ObjectId
+  claimedAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
 /// The anti-abuse ledger: one free trial per MACHINE, forever.
 ///
 /// This model exists because the previous answer — stamping `User.trialEndsAt`

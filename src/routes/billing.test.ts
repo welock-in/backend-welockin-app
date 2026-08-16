@@ -123,6 +123,11 @@ function stubResolver(
       (rows.subscriptions ?? []).filter((r) => visibleUnder(args?.where, r)),
     ),
     claimFindFirst: stubMethod(t, prisma.trialClaim as any, "findFirst", async () => null),
+    // The ownership registry the sync consults before granting (R2). Baseline:
+    // unclaimed; conflict tests re-stub rcClaimFind after calling stubResolver.
+    rcClaimFind: stubMethod(t, prisma.rcSubscriberClaim as any, "findUnique", async () => null),
+    rcClaimCreate: stubMethod(t, prisma.rcSubscriberClaim as any, "create", async () => ({})),
+    rcClaimUpdate: stubMethod(t, prisma.rcSubscriberClaim as any, "update", async () => ({})),
     userUpdate: stubMethod(t, prisma.user as any, "update", async () => ({})),
     subUpsert: stubMethod(t, prisma.subscription as any, "upsert", async () => ({})),
     purchaseUpsert: stubMethod(t, prisma.purchase as any, "upsert", async () => ({})),
@@ -210,6 +215,7 @@ test("a successful refresh answers the resolved view, with plan and validUntil",
   assert.equal(res.body.isPro, true);
   assert.equal(res.body.plan, "yearly");
   assert.equal(res.body.validUntil, FUTURE.toISOString());
+  assert.equal("restoreConflict" in res.body, false, "no conflict, no field — absence is the signal");
   // …and the sync actually wrote what it fetched before resolving.
   assert.equal(db.subUpsert.length, 1);
   assert.equal(db.subUpsert[0][0].update.status, "active");
@@ -321,6 +327,106 @@ test("a transferred-away lifetime loser is swept refunded — but a same-user LS
   // …and the LS lifetime the sweep never touched still grants.
   assert.equal(res.body.status, "active");
   assert.equal(res.body.plan, "lifetime");
+});
+
+/* ── the restore conflict: "this purchase belongs to another account" ────── */
+
+/*
+ * The RC path's ownership registry (RcSubscriberClaim — see lib/revenuecat) can
+ * refuse a sync: the fetched subscriber is claimed by a DIFFERENT, still-living
+ * account. What the route owes the client is a 200 that says so: the normal
+ * EntitlementView (honest about this account holding nothing) PLUS
+ * `restoreConflict.maskedEmail`, which is what the iOS client renders as
+ * "this purchase belongs to another account (o•••@ex•••.com)".
+ */
+
+/** The caller's user reads, with the OWNER (a different account) answerable. */
+function stubUsersWithOwner(t: Ctx, owner: { id: string; email?: string } | ((args: any) => any)) {
+  return stubMethod(t, prisma.user as any, "findUnique", async (args: any) => {
+    if (args?.where?.id === OTHER) {
+      return typeof owner === "function" ? owner(args) : owner;
+    }
+    return {
+      id: args?.where?.id ?? USER,
+      email: "user@example.com",
+      emailVerified: true,
+      passwordChangedAt: null,
+      trialEndsAt: null,
+      compActive: false,
+      compedUntil: null,
+      accessRevoked: false,
+    };
+  });
+}
+
+test("restoring ANOTHER account's purchase is a 200 with restoreConflict — and grants nothing", async (t) => {
+  providerOpen(t);
+  stubFetch(t, yearlySubscriber);
+  const db = stubResolver(t); // no rows: the view honestly shows nothing owned
+  stubMethod(t, prisma.rcSubscriberClaim as any, "findUnique", async () => ({
+    id: "claim1",
+    originalAppUserId: USER,
+    userId: OTHER,
+  }));
+  stubUsersWithOwner(t, { id: OTHER, email: "owner@example.com" });
+  stubMethod(t, console as any, "error", () => {});
+
+  const res = await request(app).post("/api/billing/revenuecat/refresh").set(auth).send({});
+
+  assert.equal(res.status, 200, "a conflict is an answer, not an error");
+  assert.deepEqual(res.body.restoreConflict, { maskedEmail: "o•••@ex•••.com" });
+  assert.equal(res.body.isPro, false, "the caller was granted nothing");
+  assert.equal(db.subUpsert.length, 0, "not one granting row was written");
+  assert.equal(db.purchaseUpsert.length, 0);
+  // The caller's stale RC rows were revoked on the way — the conflict sweep.
+  assert.equal(db.subSweep.length, 1);
+  assert.deepEqual(db.subSweep[0][0].where.externalId.notIn, []);
+  // …and the owner keeps the claim: nothing rewrote it.
+  assert.equal(db.rcClaimCreate.length, 0);
+  assert.equal(db.rcClaimUpdate.length, 0);
+});
+
+test("the resync's RC leg carries the same restoreConflict", async (t) => {
+  providerOpen(t);
+  stubFetch(t, yearlySubscriber);
+  stubResolver(t);
+  stubMethod(t, prisma.rcSubscriberClaim as any, "findUnique", async () => ({
+    id: "claim1",
+    originalAppUserId: USER,
+    userId: OTHER,
+  }));
+  stubUsersWithOwner(t, { id: OTHER, email: "owner@example.com" });
+  stubMethod(t, console as any, "error", () => {});
+
+  const res = await request(app).post("/api/billing/resync").set(auth).send();
+
+  assert.equal(res.status, 200);
+  // The leg RAN — the conflict is its verdict, not its failure.
+  assert.deepEqual(res.body.resynced, { lemonsqueezy: 0, revenuecat: true });
+  assert.deepEqual(res.body.restoreConflict, { maskedEmail: "o•••@ex•••.com" });
+});
+
+test("an owner email that cannot be read masks to null — the conflict still surfaces", async (t) => {
+  providerOpen(t);
+  stubFetch(t, yearlySubscriber);
+  stubResolver(t);
+  stubMethod(t, prisma.rcSubscriberClaim as any, "findUnique", async () => ({
+    id: "claim1",
+    originalAppUserId: USER,
+    userId: OTHER,
+  }));
+  // The sync's owner-EXISTS check (select id) succeeds; the route's email
+  // lookup (select email) hits a database blip. The 200 must survive it.
+  stubUsersWithOwner(t, (args: any) => {
+    if (args?.select?.email === true) throw new Error("replica set unavailable");
+    return { id: OTHER };
+  });
+  stubMethod(t, console as any, "error", () => {});
+
+  const res = await request(app).post("/api/billing/revenuecat/refresh").set(auth).send({});
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.restoreConflict, { maskedEmail: null });
 });
 
 test("a RevenueCat outage is a clean 502 the client can retry — never a fake view", async (t) => {

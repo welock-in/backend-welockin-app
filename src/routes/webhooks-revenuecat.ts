@@ -296,6 +296,25 @@ revenueCatWebhookRouter.post(
         return;
       }
 
+      // A TRANSFER is RevenueCat telling us it has ALREADY moved the receipt
+      // between subscribers — so the ownership registry (RcSubscriberClaim)
+      // must follow before either side re-syncs, or the receiving account's
+      // sync would find the loser's claim still standing and refuse the very
+      // transfer RevenueCat performed. RC is authoritative about a transfer it
+      // made; ours is only to mirror it. Minimal on purpose: move any claim the
+      // losing account holds to the receiving one, ids validated like every
+      // other app_user_id here (malformed ids must never reach Prisma).
+      if (event.type.toUpperCase() === "TRANSFER") {
+        const to = (event.transferred_to ?? []).find(isObjectId);
+        const from = (event.transferred_from ?? []).filter(isObjectId);
+        if (to && from.length > 0) {
+          await prisma.rcSubscriberClaim.updateMany({
+            where: { userId: { in: from } },
+            data: { userId: to },
+          });
+        }
+      }
+
       // THE WORK: re-fetch each touched subscriber and mirror the snapshot.
       // The event's own claims are never written — see the header comment.
       for (const userId of known) {

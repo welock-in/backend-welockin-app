@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { Prisma } from "@prisma/client";
 import {
   RC_KNOWN_PRODUCT_IDS,
   RC_LIFETIME_PRODUCT_IDS,
@@ -440,6 +441,12 @@ function stubSync(
   // recurring plan, so nothing is ever owed unless a test installs rows.
   stubMethod(t, prisma.subscription as any, "findMany", async () => []);
   return {
+    // The ownership registry the sync consults before granting (R2). Baseline:
+    // nobody has claimed this subscriber, and every claim write succeeds. Tests
+    // about the registry itself re-stub these after calling stubSync.
+    claimFind: stubMethod(t, prisma.rcSubscriberClaim as any, "findUnique", async () => null),
+    claimCreate: stubMethod(t, prisma.rcSubscriberClaim as any, "create", async (a: any) => a.data),
+    claimUpdate: stubMethod(t, prisma.rcSubscriberClaim as any, "update", async (a: any) => a.data),
     subUpsert: stubMethod(
       t,
       prisma.subscription as any,
@@ -1154,4 +1161,156 @@ test("a broken Lemon Squeezy read cannot fail the RevenueCat sync", async (t) =>
 
   const result = await syncUserFromRevenueCat(USER);
   assert.equal(result.managementUrl, null, "the sync still answers");
+});
+
+/* ── the ownership registry: one Apple purchase, one WeLockIn account ───── */
+
+/*
+ * Every row the sync writes is keyed `userId:productId` — the caller's own id
+ * is INSIDE the key — so `@@unique([provider, externalId])` can never bind an
+ * Apple receipt to one account: account B restoring account A's purchase mints
+ * B-keyed rows BESIDE A's, and both grant. The RcSubscriberClaim registry
+ * closes that: the subscriber's original_app_user_id is claimed once, and the
+ * sync refuses to grant a caller whose subscriber belongs to another LIVING
+ * account — while a claim whose owner deleted their account is adoptable,
+ * because the claim deliberately outlives the user row.
+ */
+
+const ORIGINAL_ID = "$RCAnonymousID:0123456789abcdef";
+
+test("the first sync claims the subscriber under its original_app_user_id, then grants", async (t) => {
+  const sub = subscriberWith({ expires_date: FUTURE, period_type: "normal" });
+  sub.original_app_user_id = ORIGINAL_ID;
+  const db = stubSync(t, ok(sub));
+
+  const result = await syncUserFromRevenueCat(USER);
+
+  assert.equal(result.conflict, undefined);
+  assert.equal(db.claimCreate.length, 1);
+  assert.deepEqual(db.claimCreate[0][0].data, { originalAppUserId: ORIGINAL_ID, userId: USER });
+  assert.equal(db.subUpsert.length, 1, "the grant proceeds once the claim is taken");
+});
+
+test("a subscriber naming no original_app_user_id is claimed under the fetched id", async (t) => {
+  const sub = subscriberWith({ expires_date: FUTURE });
+  delete (sub as { original_app_user_id?: unknown }).original_app_user_id;
+  const db = stubSync(t, ok(sub));
+
+  await syncUserFromRevenueCat(USER);
+
+  assert.equal(db.claimCreate.length, 1);
+  assert.equal(db.claimCreate[0][0].data.originalAppUserId, USER);
+});
+
+test("an EMPTY snapshot claims nothing — a transfer-loser must not grab a claim on its way out", async (t) => {
+  const db = stubSync(t, ok({}));
+
+  await syncUserFromRevenueCat(USER);
+
+  assert.equal(db.claimFind.length, 0, "the registry is not even read");
+  assert.equal(db.claimCreate.length, 0);
+  assert.equal(db.subSweep.length, 1, "…and the authoritative sweep still runs");
+});
+
+test("a second account restoring a CLAIMED subscriber is refused: nothing granted, stale rows revoked", async (t) => {
+  const db = stubSync(t, ok(subscriberWith({ expires_date: FUTURE, period_type: "normal" })));
+  stubMethod(t, prisma.rcSubscriberClaim as any, "findUnique", async () => ({
+    id: "claim1",
+    originalAppUserId: USER,
+    userId: OTHER_USER,
+  }));
+  const ownerReads = stubMethod(t, prisma.user as any, "findUnique", async () => ({
+    id: OTHER_USER,
+  }));
+  const errors = stubMethod(t, console as any, "error", () => {});
+
+  const result = await syncUserFromRevenueCat(USER);
+
+  assert.deepEqual(result.conflict, { ownerUserId: OTHER_USER });
+  assert.equal(ownerReads[0][0].where.id, OTHER_USER, "the verdict hinges on the owner LIVING");
+  assert.equal(db.subUpsert.length, 0, "not one granting row for the caller");
+  assert.equal(db.purchaseUpsert.length, 0);
+  // The caller's stale RC rows are revoked with the sweep's own shape — nothing
+  // spared (notIn: []), scoped to this user + this provider only.
+  for (const sweep of [db.subSweep, db.purchaseSweep]) {
+    assert.equal(sweep.length, 1);
+    const where = sweep[0][0].where;
+    assert.equal(where.userId, USER);
+    assert.equal(where.provider, RC_PROVIDER);
+    assert.deepEqual(where.externalId.notIn, []);
+    assert.equal(Object.keys(where).sort().join(","), "externalId,provider,userId");
+  }
+  assert.equal(db.subSweep[0][0].data.status, "expired");
+  assert.equal(db.purchaseSweep[0][0].data.isRefunded, true);
+  // The claim itself is untouched: the owner keeps it.
+  assert.equal(db.claimCreate.length, 0);
+  assert.equal(db.claimUpdate.length, 0);
+  // Loud, with both ids: a restore dispute needs both sides on the log line.
+  assert.equal(errors.length, 1);
+  assert.ok(String(errors[0][0]).includes(USER));
+  assert.ok(String(errors[0][0]).includes(OTHER_USER));
+});
+
+test("a claim whose owner is DELETED is adopted: the claim moves and the sync proceeds", async (t) => {
+  const db = stubSync(t, ok(subscriberWith({ expires_date: FUTURE, period_type: "normal" })));
+  stubMethod(t, prisma.rcSubscriberClaim as any, "findUnique", async () => ({
+    id: "claim1",
+    originalAppUserId: USER,
+    userId: OTHER_USER,
+  }));
+  stubMethod(t, prisma.user as any, "findUnique", async () => null); // the owner is gone
+  const warns = stubMethod(t, console as any, "warn", () => {});
+
+  const result = await syncUserFromRevenueCat(USER);
+
+  assert.equal(result.conflict, undefined);
+  assert.equal(db.claimUpdate.length, 1, "the claim moves to the caller");
+  assert.deepEqual(db.claimUpdate[0][0].where, { originalAppUserId: USER });
+  assert.deepEqual(db.claimUpdate[0][0].data, { userId: USER });
+  assert.equal(db.subUpsert.length, 1, "…and the grant lands");
+  assert.equal(warns.length, 1, "an adoption is a loud event");
+  assert.match(String(warns[0][0]), /adopting orphaned/);
+});
+
+test("the owner's own re-sync leaves the registry alone: no conflict, no churn", async (t) => {
+  const db = stubSync(t, ok(subscriberWith({ expires_date: FUTURE, period_type: "normal" })));
+  stubMethod(t, prisma.rcSubscriberClaim as any, "findUnique", async () => ({
+    id: "claim1",
+    originalAppUserId: USER,
+    userId: USER,
+  }));
+
+  const result = await syncUserFromRevenueCat(USER);
+
+  assert.equal(result.conflict, undefined);
+  assert.equal(db.claimCreate.length, 0, "no second claim");
+  assert.equal(db.claimUpdate.length, 0, "no rewrite of the one that exists");
+  assert.equal(db.subUpsert.length, 1, "the mirror proceeds as ever");
+  // The ordinary scoped sweep, sparing the row just written — never the
+  // conflict's revoke-everything.
+  assert.deepEqual(db.subSweep[0][0].where.externalId.notIn, [`${USER}:${RC_PRODUCT_MONTHLY}`]);
+});
+
+test("losing the first-claim race is judged like any later caller", async (t) => {
+  const db = stubSync(t, ok(subscriberWith({ expires_date: FUTURE, period_type: "normal" })));
+  // First read: nobody. The create then collides on the unique index — someone
+  // claimed it between the read and the write — and the re-read shows a living
+  // winner, so the loser gets the same conflict any later caller would.
+  let reads = 0;
+  stubMethod(t, prisma.rcSubscriberClaim as any, "findUnique", async () =>
+    ++reads === 1 ? null : { id: "claim1", originalAppUserId: USER, userId: OTHER_USER },
+  );
+  stubMethod(t, prisma.rcSubscriberClaim as any, "create", async () => {
+    throw new Prisma.PrismaClientKnownRequestError("duplicate", {
+      code: "P2002",
+      clientVersion: "5",
+    });
+  });
+  stubMethod(t, prisma.user as any, "findUnique", async () => ({ id: OTHER_USER }));
+  stubMethod(t, console as any, "error", () => {});
+
+  const result = await syncUserFromRevenueCat(USER);
+
+  assert.deepEqual(result.conflict, { ownerUserId: OTHER_USER });
+  assert.equal(db.subUpsert.length, 0, "the race loser is granted nothing");
 });

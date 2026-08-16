@@ -8,7 +8,8 @@ import { clientIp, consumeRateLimit } from "../lib/rate-limit";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { assertCanWrite } from "../lib/purchase-providers";
-import { RevenueCatApiError, syncUserFromRevenueCat } from "../lib/revenuecat";
+import { RevenueCatApiError, syncUserFromRevenueCat, type RcSyncResult } from "../lib/revenuecat";
+import { maskEmail } from "../lib/user";
 import {
   isSellableOrder,
   parseOrderEvent,
@@ -33,6 +34,25 @@ import { resolveAndCache } from "./entitlement";
 export const billingRouter = Router();
 
 /**
+ * The wire form of a sync's ownership conflict: `restoreConflict` rides ON TOP
+ * of the normal EntitlementView in a 200 — the view is still the truth about
+ * THIS account (which, after a conflict, holds no RC grant), and the extra
+ * field is why the restore changed nothing. The iOS client renders its "this
+ * purchase belongs to another account" copy from it, naming `maskedEmail` so
+ * the owner can recognise their own account without the server handing a
+ * stranger a full address. Null when the owner could not be looked up — the
+ * copy then simply names no account.
+ */
+async function restoreConflictFor(
+  conflict: NonNullable<RcSyncResult["conflict"]>,
+): Promise<{ maskedEmail: string | null }> {
+  const owner = await prisma.user
+    .findUnique({ where: { id: conflict.ownerUserId }, select: { email: true } })
+    .catch(() => null);
+  return { maskedEmail: owner ? maskEmail(owner.email) : null };
+}
+
+/**
  * POST /api/billing/revenuecat/refresh — re-sync MY account from RevenueCat,
  * then answer with the freshly resolved entitlement.
  *
@@ -50,8 +70,9 @@ billingRouter.post(
     assertCanWrite("revenuecat");
 
     const userId = req.user!.id;
+    let sync: RcSyncResult;
     try {
-      await syncUserFromRevenueCat(userId);
+      sync = await syncUserFromRevenueCat(userId);
     } catch (err) {
       if (err instanceof RevenueCatApiError) {
         // OUR upstream failed, not the caller: a clean 502 the client can
@@ -64,7 +85,13 @@ billingRouter.post(
       throw err;
     }
 
-    res.json(await resolveAndCache(userId, readDeviceId(req)));
+    // A conflict is a 200, not an error: the refresh itself worked, and the
+    // view below honestly says this account holds nothing. `restoreConflict`
+    // is the WHY — see restoreConflictFor.
+    res.json({
+      ...(await resolveAndCache(userId, readDeviceId(req))),
+      ...(sync.conflict ? { restoreConflict: await restoreConflictFor(sync.conflict) } : {}),
+    });
   }),
 );
 
@@ -123,9 +150,10 @@ billingRouter.post(
     // outage makes the answer PARTIAL, never failed — the LS leg's work has
     // already landed, and throwing here would report it as lost.
     let revenuecat = false;
+    let rcConflict: RcSyncResult["conflict"];
     if (env.revenuecatEnabled) {
       try {
-        await syncUserFromRevenueCat(userId);
+        rcConflict = (await syncUserFromRevenueCat(userId)).conflict;
         revenuecat = true;
       } catch (err) {
         if (!(err instanceof RevenueCatApiError)) throw err;
@@ -139,6 +167,9 @@ billingRouter.post(
       // purchase" versus "nothing new — contact support" versus "Apple could
       // not be reached, try again".
       resynced: { lemonsqueezy, revenuecat },
+      // Same field, same copy, as the refresh: the RC leg ran and found the
+      // Apple purchase funding ANOTHER live account.
+      ...(rcConflict ? { restoreConflict: await restoreConflictFor(rcConflict) } : {}),
     });
   }),
 );

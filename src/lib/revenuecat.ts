@@ -1,3 +1,4 @@
+import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { env } from "./env";
 import { LIFETIME_PRODUCT_ID } from "./entitlement";
@@ -525,6 +526,122 @@ export function projectSubscriber(userId: string, subscriber: RcSubscriber, now:
   return { subscriptions, purchases, managementUrl };
 }
 
+/* ── one Apple purchase, one WeLockIn account ───────────────────────────── */
+
+/**
+ * What one sync ended in. `conflict` is present when the fetched subscriber is
+ * CLAIMED by a different, still-existing account: nothing was granted to the
+ * caller, their stale RC rows were revoked, and `ownerUserId` names who holds
+ * the claim so the route can tell the client whose purchase this is.
+ */
+export type RcSyncResult = {
+  managementUrl: string | null;
+  conflict?: { ownerUserId: string };
+};
+
+const isDuplicateKey = (err: unknown) =>
+  err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
+
+/**
+ * Claim the subscriber for `userId`, or report who already owns it.
+ *
+ * WHY THE ROW KEYS CANNOT DO THIS. Every row the sync writes is keyed
+ * `userId:productId` — the caller's own id is INSIDE the key — so
+ * `@@unique([provider, externalId])` can never collide across accounts: account
+ * B restoring account A's receipt simply mints B-keyed rows next to A's. The
+ * one identifier that IS the same whoever fetches it is RevenueCat's
+ * `original_app_user_id`, the subscriber's birth identity. So that (falling
+ * back to the fetched app_user_id when RC omits it) is what gets claimed, in a
+ * registry whose unique index makes two simultaneous first-claims collide in
+ * the database instead of racing check-then-act.
+ *
+ * The verdicts, in order:
+ *   no claim              → claim it for the caller, proceed.
+ *   claimed by the caller → proceed. Nothing is rewritten — a re-sync is the
+ *                           ordinary case and must churn nothing.
+ *   claimed by a LIVING other account
+ *                         → CONFLICT. The purchase already funds an account
+ *                           that still exists; granting the caller too would be
+ *                           the one-purchase-N-accounts leak this registry
+ *                           exists to close.
+ *   claimed by a DELETED account
+ *                         → ADOPT. The claim outlived its owner on purpose (no
+ *                           relation, no cascade): the receipt is real money
+ *                           with nobody attached, and the caller has just
+ *                           proven — via RevenueCat — that Apple hands it to
+ *                           them. Move the claim, proceed.
+ *
+ * TRANSFER events do not need this fallback: the webhook moves the claim
+ * explicitly when RevenueCat says it moved the receipt (see
+ * routes/webhooks-revenuecat.ts), so the transferred-to account never
+ * false-conflicts with the transferred-from one here.
+ */
+async function claimSubscriber(
+  userId: string,
+  subscriber: RcSubscriber,
+): Promise<{ ownerUserId: string } | null> {
+  const originalAppUserId =
+    typeof subscriber.original_app_user_id === "string" && subscriber.original_app_user_id
+      ? subscriber.original_app_user_id
+      : userId;
+
+  let claim = await prisma.rcSubscriberClaim.findUnique({ where: { originalAppUserId } });
+  if (!claim) {
+    try {
+      await prisma.rcSubscriberClaim.create({ data: { originalAppUserId, userId } });
+      return null;
+    } catch (err) {
+      // Two first-claims raced on the unique index — the loser re-reads and is
+      // judged against whoever actually won, like any later caller.
+      if (!isDuplicateKey(err)) throw err;
+      claim = await prisma.rcSubscriberClaim.findUnique({ where: { originalAppUserId } });
+      if (!claim) return null; // won and vanished between the two reads — nothing to dispute
+    }
+  }
+  if (claim.userId === userId) return null;
+
+  const owner = await prisma.user.findUnique({ where: { id: claim.userId }, select: { id: true } });
+  if (!owner) {
+    // The owner deleted their account; the claim deliberately survived so this
+    // moment is detectable. The caller is whoever Apple now restores to.
+    console.warn(
+      `[revenuecat] adopting orphaned RC subscriber ${originalAppUserId}: ` +
+        `previous owner ${claim.userId} no longer exists, claim moves to ${userId}`,
+    );
+    await prisma.rcSubscriberClaim.update({
+      where: { originalAppUserId },
+      data: { userId },
+    });
+    return null;
+  }
+
+  // Ownership conflict. Loud, with both ids: this is either a customer signed
+  // into the wrong account (support will need both sides) or an attempt to fan
+  // one purchase out across accounts (so will we).
+  console.error(
+    `[revenuecat] ownership conflict: subscriber ${originalAppUserId} is claimed by ` +
+      `${claim.userId}, refusing to grant to ${userId}`,
+  );
+
+  // Sweep-revoke whatever `revenuecat` rows the caller already holds — the same
+  // shape as the authoritative sweep with nothing spared (`notIn: []` matches
+  // every RC row of this user). Any such row predates the registry or slipped
+  // in before a conflict was detectable, and every one of them mirrors a
+  // receipt that funds someone else's account. Scoped exactly like the sweep:
+  // this user, this provider — a Lemon Squeezy licence or a comp is never in range.
+  const now = new Date();
+  await prisma.subscription.updateMany({
+    where: { userId, provider: RC_PROVIDER, externalId: { notIn: [] } },
+    data: { status: "expired", revokedAt: now, willRenew: false },
+  });
+  await prisma.purchase.updateMany({
+    where: { userId, provider: RC_PROVIDER, externalId: { notIn: [] } },
+    data: { isRefunded: true, revokedAt: now },
+  });
+
+  return { ownerUserId: claim.userId };
+}
+
 /* ── the I/O glue both entry points share ───────────────────────────────── */
 
 /**
@@ -563,10 +680,20 @@ export function projectSubscriber(userId: string, subscriber: RcSubscriber, now:
  * — only genuinely transferred-away receipts vanish. Re-running the same
  * TRANSFER re-fetches the same empty snapshot and re-revokes idempotently.
  */
-export async function syncUserFromRevenueCat(userId: string): Promise<{ managementUrl: string | null }> {
+export async function syncUserFromRevenueCat(userId: string): Promise<RcSyncResult> {
   const now = new Date();
   const { subscriber, authoritative } = await fetchSubscriber(userId);
   const plan = projectSubscriber(userId, subscriber, now);
+
+  // ONE APPLE PURCHASE, ONE WELOCKIN ACCOUNT — checked before a single granting
+  // row is written, and only when something WOULD be written: an empty plan has
+  // nothing to claim (and the transfer-loser's empty re-fetch must keep
+  // sweeping below, never acquire a claim on its way out). A conflict grants
+  // nothing and revokes the caller's stale RC rows inside claimSubscriber.
+  if (plan.subscriptions.length > 0 || plan.purchases.length > 0) {
+    const conflict = await claimSubscriber(userId, subscriber);
+    if (conflict) return { managementUrl: plan.managementUrl, conflict };
+  }
 
   for (const sub of plan.subscriptions) {
     await prisma.subscription.upsert({

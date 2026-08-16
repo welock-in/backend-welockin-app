@@ -122,6 +122,12 @@ function stubDb(t: Ctx, overrides: Record<string, (...args: any[]) => any> = {})
     purchaseFindMany: stubMethod(t, prisma.purchase as any, "findMany", pick("purchaseFindMany", async () => [])),
     purchaseSweep: stubMethod(t, prisma.purchase as any, "updateMany", pick("purchaseSweep", async () => ({ count: 0 }))),
     claimFindFirst: stubMethod(t, prisma.trialClaim as any, "findFirst", pick("claimFindFirst", async () => null)),
+    // The ownership registry (RcSubscriberClaim). Baseline: unclaimed, every
+    // claim write succeeds, and a TRANSFER's claim-move touches nothing.
+    rcClaimFind: stubMethod(t, prisma.rcSubscriberClaim as any, "findUnique", pick("rcClaimFind", async () => null)),
+    rcClaimCreate: stubMethod(t, prisma.rcSubscriberClaim as any, "create", pick("rcClaimCreate", async () => ({}))),
+    rcClaimUpdate: stubMethod(t, prisma.rcSubscriberClaim as any, "update", pick("rcClaimUpdate", async () => ({}))),
+    rcClaimMove: stubMethod(t, prisma.rcSubscriberClaim as any, "updateMany", pick("rcClaimMove", async () => ({ count: 0 }))),
     userFind: stubMethod(
       t,
       prisma.user as any,
@@ -578,6 +584,65 @@ test("a TRANSFER re-syncs BOTH sides — the loser must lose access too", async 
   const winnerSweep = sweeps.find((s) => s.userId === USER);
   assert.ok(winnerSweep, "the winner is swept too, sparing what it just mirrored");
   assert.deepEqual(winnerSweep!.notIn, [`${USER}:${RC_PRODUCT_MONTHLY}`]);
+});
+
+test("a TRANSFER moves the ownership claim to the receiver BEFORE either side re-syncs", async (t) => {
+  // RC has already moved the receipt; the RcSubscriberClaim registry must
+  // follow FIRST, or the receiver's sync would find the loser's claim still
+  // standing and refuse the very transfer RevenueCat performed.
+  configured(t);
+  const sequence: string[] = [];
+  stubMethod(t, globalThis as any, "fetch", async () => {
+    sequence.push("fetch");
+    return new Response(JSON.stringify({ subscriber: subscriber() }), { status: 200 });
+  });
+  const db = stubDb(t, {
+    rcClaimMove: async () => {
+      sequence.push("move");
+      return { count: 1 };
+    },
+  });
+
+  const res = await deliver(
+    eventBody({
+      id: "evt-transfer-claim",
+      type: "TRANSFER",
+      store: undefined,
+      product_id: undefined,
+      app_user_id: undefined,
+      transferred_to: [USER],
+      transferred_from: [OTHER_USER],
+    }),
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.status, "processed");
+  assert.equal(db.rcClaimMove.length, 1);
+  assert.deepEqual(db.rcClaimMove[0][0].where, { userId: { in: [OTHER_USER] } });
+  assert.deepEqual(db.rcClaimMove[0][0].data, { userId: USER });
+  assert.equal(sequence[0], "move", "the claim moves before the first re-fetch");
+  assert.ok(sequence.filter((s) => s === "fetch").length >= 1, "…and the syncs still run");
+});
+
+test("a TRANSFER to an anonymous app_user_id moves no claim — malformed ids never reach Prisma", async (t) => {
+  configured(t);
+  stubFetch(t, () => subscriber({ subscriptions: {}, entitlements: {} }));
+  const db = stubDb(t);
+
+  const res = await deliver(
+    eventBody({
+      id: "evt-transfer-anon",
+      type: "TRANSFER",
+      store: undefined,
+      product_id: undefined,
+      app_user_id: undefined,
+      transferred_to: ["$RCAnonymousID:87c6049c58069238dce29853f9644e44"],
+      transferred_from: [USER],
+    }),
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(db.rcClaimMove.length, 0, "no valid receiver, nothing to move the claim to");
 });
 
 test("a RevenueCat outage marks the event failed and asks for redelivery", async (t) => {

@@ -69,6 +69,16 @@ const REQUIRED = [
       "userId-prefixed, so without this one an unauthenticated, rate-limited " +
       "endpoint scans the whole collection on every call.",
   },
+  {
+    collection: "RcSubscriberClaim",
+    key: { originalAppUserId: 1 },
+    unique: true,
+    protects:
+      "one Apple purchase history, one WeLockIn account. The claim registry is " +
+      "what stops a second account from restoring the same App Store receipt " +
+      "into a second licence, and the unique key is its concurrency lock: two " +
+      "simultaneous first-claims must collide here, not race check-then-act.",
+  },
 ];
 
 /**

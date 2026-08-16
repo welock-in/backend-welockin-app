@@ -70,6 +70,16 @@ const REQUIRED = [
       "endpoint scans the whole collection on every call.",
   },
   {
+    collection: "TrialReminderSent",
+    key: { userId: 1, endsAt: 1 },
+    unique: true,
+    protects:
+      "one trial-end reminder per (user, trial end). The cron checks a marker " +
+      "before sending, but the unique key is what makes that race-proof: two " +
+      "overlapping runs that both read 'not yet reminded' collide here instead " +
+      "of each emailing the same customer about the same payment.",
+  },
+  {
     collection: "RcSubscriberClaim",
     key: { originalAppUserId: 1 },
     unique: true,

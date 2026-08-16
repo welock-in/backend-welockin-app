@@ -962,6 +962,41 @@ model RcSubscriberClaim {
   updatedAt         DateTime @updatedAt
 }
 
+/// One trial-end reminder per (user, trial end) — the durable dedupe behind
+/// `GET|POST /api/cron/trial-reminders`.
+///
+/// The cron runs hourly and the reminder window is a day wide, so every ending
+/// trial is seen by many runs; this row is what makes them ONE email instead of
+/// two dozen. Keyed on the END of the window rather than "sent today": if the
+/// end ever moves (a support extension, a provider correction), the new date is
+/// a new reminder — which is right, because the sentence being sent ("your
+/// trial ends {date}") is about that date.
+///
+/// Written ONLY after the mail provider accepts the email. A failed send writes
+/// nothing, so the next run retries; the unique index is the concurrency lock
+/// that keeps two overlapping runs from both sending (the loser's duplicate-key
+/// error reads as "already reminded", never as a failure).
+///
+/// `userId` is deliberately NOT a relation — nothing needs the join, and the
+/// row is swept explicitly on account deletion in routes/me.ts like the other
+/// relation-less per-user collections (Break, NotificationDelivery).
+///
+/// DEPLOY NOTE: on MongoDB the unique index only exists once built in the
+/// cluster. Create it ADDITIVELY (never `prisma db push` against the live
+/// billing database) and verify with scripts/verify-billing-indexes.mjs.
+model TrialReminderSent {
+  id     String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId String   @db.ObjectId
+  /// The trial end this reminder described — the server-authoritative instant,
+  /// straight from the entitlement view.
+  endsAt DateTime
+  /// "email" | "email+push" — what actually went out. For support, never logic.
+  channels String?
+  sentAt DateTime @default(now())
+
+  @@unique([userId, endsAt])
+}
+
 /// The anti-abuse ledger: one free trial per MACHINE, forever.
 ///
 /// This model exists because the previous answer — stamping `User.trialEndsAt`

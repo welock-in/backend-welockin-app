@@ -1,4 +1,5 @@
 import { env } from "./env";
+import type { BillingProvider } from "./entitlement";
 
 // Minimal Resend (resend.com) transactional-email client — used to email the
 // addiction-protection partner OTP. No SDK dependency: one fetch to their REST
@@ -163,6 +164,126 @@ export function sendPasswordResetLink(
         The link works once and expires in ${ttlMinutes} minutes. If you didn't ask
         for this, ignore this email — your password stays as it is.
       </p>`);
+  return send(to, subject, html, text);
+}
+
+/**
+ * Is this BCP-47 tag French-speaking? Only the language matters — "fr",
+ * "fr-FR", "fr-CH" and friends all read the French copy; everything else
+ * (including nothing at all) falls back to English, because a reminder about
+ * money must never be skipped over a locale string we failed to parse.
+ */
+export const isFrenchLocale = (locale: string | null | undefined): boolean =>
+  /^fr\b/i.test((locale ?? "").trim());
+
+/**
+ * The trial end as the words the reminder copy prints — date and time as two
+ * parts, because the email and the push phrase the join differently ("on X at
+ * Y" / "le X à Y").
+ *
+ * UTC, and LABELLED UTC by every caller. The server does not know the reader's
+ * timezone, and an unlabelled local-looking time that is hours off is worse
+ * than an honest UTC one — this is the instant a payment fires or access ends.
+ */
+export function trialEndParts(endsAt: Date, fr: boolean): { date: string; time: string } {
+  const locale = fr ? "fr-FR" : "en-GB";
+  return {
+    date: new Intl.DateTimeFormat(locale, {
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+      timeZone: "UTC",
+    }).format(endsAt),
+    time: new Intl.DateTimeFormat(locale, {
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+      timeZone: "UTC",
+    }).format(endsAt),
+  };
+}
+
+export interface TrialReminderOpts {
+  /** The server-authoritative end of the window — the resolver's, never a guess. */
+  endsAt: Date;
+  /** Will the trial CONVERT (a payment fires) — or merely stop (access ends)? */
+  willRenew: boolean;
+  /** Whose store holds the money, for the "where to manage it" sentence. */
+  billingProvider: BillingProvider;
+  /** BCP-47, from the onboarding profile. Anything non-French reads English. */
+  locale?: string | null;
+}
+
+/**
+ * Remind someone their trial ends within the next day.
+ *
+ * The one rule of this copy: NEVER promise an action we cannot take. An Apple
+ * subscription can only be cancelled by its owner in Apple's own settings, and
+ * a Lemon Squeezy one in the billing portal — so every sentence points, none
+ * performs. The subject carries the date and time for the same reason the
+ * verification code rides its subject line: most people read it from a
+ * notification and never open the message.
+ */
+export function sendTrialEndingReminder(to: string, opts: TrialReminderOpts): Promise<SendResult> {
+  const fr = isFrenchLocale(opts.locale);
+  const { date, time } = trialEndParts(opts.endsAt, fr);
+  // What happens at the boundary, and where to act on it. `willRenew` is only
+  // meaningful when a store is billing; a machine trial (NONE) always ends.
+  const converts = opts.willRenew && opts.billingProvider !== "NONE";
+
+  if (fr) {
+    const subject = `Votre essai WeLockin se termine le ${date} à ${time} UTC`;
+    const next = converts
+      ? "Sans action de votre part, votre abonnement démarre à ce moment-là et votre premier paiement est prélevé."
+      : "Votre accès s'arrête à ce moment-là — aucun paiement ne sera prélevé.";
+    const manage =
+      opts.billingProvider === "APPLE"
+        ? converts
+          ? "Pour vérifier ou annuler avant cette date, ouvrez Réglages sur votre iPhone → votre nom → Abonnements. Apple gère la facturation, donc c'est là que les changements prennent effet — nous ne pouvons pas annuler un abonnement Apple à votre place."
+          : "Pour conserver l'accès, réactivez le renouvellement dans Réglages sur votre iPhone → votre nom → Abonnements."
+        : opts.billingProvider === "LEMON_SQUEEZY"
+          ? converts
+            ? "Pour vérifier ou annuler avant cette date, ouvrez Réglages → Gérer l'abonnement dans l'application — vous arriverez sur votre portail de facturation."
+            : "Pour conserver l'accès, ouvrez Réglages → Gérer l'abonnement dans l'application."
+          : "Pour que vos blocages et vos plannings continuent, choisissez une formule dans les Réglages de l'application.";
+    const text =
+      `Votre essai WeLockin se termine le ${date} à ${time} (UTC).\n\n` +
+      `${next}\n\n${manage}`;
+    const html = shell(`
+      <h2 style="font-size:18px;margin:0 0 8px">Votre essai se termine</h2>
+      <p style="font-size:14px;line-height:1.5;color:#5b5448;margin:0 0 20px">
+        Votre essai <strong>WeLockin</strong> se termine le
+        <strong>${date} à ${time} (UTC)</strong>.
+      </p>
+      <p style="font-size:14px;line-height:1.5;color:#5b5448;margin:0 0 20px">${next}</p>
+      <p style="font-size:13px;line-height:1.5;color:#8a8175;margin:0">${manage}</p>`);
+    return send(to, subject, html, text);
+  }
+
+  const subject = `Your WeLockin trial ends ${date} at ${time} UTC`;
+  const next = converts
+    ? "If you do nothing, your subscription starts then and your first payment is taken."
+    : "Your access ends then — no payment will be taken.";
+  const manage =
+    opts.billingProvider === "APPLE"
+      ? converts
+        ? "To review or cancel before then, open Settings on your iPhone → your name → Subscriptions. Apple handles the billing, so that is where changes take effect — we cannot cancel an Apple subscription for you."
+        : "To keep access, turn renewal back on in Settings on your iPhone → your name → Subscriptions."
+      : opts.billingProvider === "LEMON_SQUEEZY"
+        ? converts
+          ? "To review or cancel before then, open the app's Settings → Manage subscription — it takes you to your billing portal."
+          : "To keep access, open the app's Settings → Manage subscription."
+        : "To keep your blocks and schedules running, choose a plan in the app's Settings.";
+  const text =
+    `Your WeLockin trial ends on ${date} at ${time} (UTC).\n\n` + `${next}\n\n${manage}`;
+  const html = shell(`
+      <h2 style="font-size:18px;margin:0 0 8px">Your trial is ending</h2>
+      <p style="font-size:14px;line-height:1.5;color:#5b5448;margin:0 0 20px">
+        Your <strong>WeLockin</strong> trial ends on
+        <strong>${date} at ${time} (UTC)</strong>.
+      </p>
+      <p style="font-size:14px;line-height:1.5;color:#5b5448;margin:0 0 20px">${next}</p>
+      <p style="font-size:13px;line-height:1.5;color:#8a8175;margin:0">${manage}</p>`);
   return send(to, subject, html, text);
 }
 

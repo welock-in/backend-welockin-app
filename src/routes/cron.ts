@@ -4,6 +4,7 @@ import { env } from "../lib/env";
 import { asyncHandler } from "../middleware/async-handler";
 import { unauthorized, HttpError } from "../lib/http-error";
 import { drainCancels } from "../lib/billing-tasks";
+import { sendTrialReminders } from "../lib/trial-reminders";
 
 /**
  * Scheduled work.
@@ -91,3 +92,29 @@ cronRouter.get(
     res.json(report);
   }),
 );
+
+/**
+ * Remind everyone whose trial ends within the next day — by email, and by push
+ * where a device holds a token (see lib/trial-reminders.ts for the window and
+ * the once-per-(user, trial end) dedupe).
+ *
+ * Same guard, same posture as the billing drain: 200 with a report even when
+ * some reminders failed, because a cron that 500s gets platform-retried on a
+ * schedule that fights the hourly one — the report is where failure is visible.
+ * Safe to call twice: the durable marker makes a repeat run a no-op.
+ */
+const runTrialReminders = asyncHandler(async (req, res) => {
+  requireCronSecret(req.header("authorization") ?? undefined);
+  const report = await sendTrialReminders();
+  console.info(
+    `[cron] trial reminders: candidates=${report.candidates} sent=${report.sent} ` +
+      `pushed=${report.pushed} repeats=${report.alreadySent} ` +
+      `notTrialing=${report.notTrialing} failed=${report.failed}`,
+  );
+  res.json(report);
+});
+
+// GET for Vercel's scheduler, POST for an operator's curl — one handler, so the
+// two verbs cannot drift apart the way two copies would.
+cronRouter.get("/trial-reminders", runTrialReminders);
+cronRouter.post("/trial-reminders", runTrialReminders);

@@ -179,6 +179,7 @@ meRouter.delete(
       del(prisma.vote),
       del(prisma.pushToken),
       del(prisma.notificationDelivery),
+      del(prisma.trialReminderSent),
       // Both hold the address the person asked to be forgotten, so they go with
       // the account rather than waiting for a TTL sweep to notice them.
       del(prisma.emailVerification),

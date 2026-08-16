@@ -127,6 +127,73 @@ test("GET is accepted for the scheduler, and guarded the same way", async (t) =>
   assert.equal(good.status, 200);
 });
 
+/** The reminder pass reads three candidate queries; nothing here is about what it finds. */
+function stubNoEndingTrials(t: TestContext) {
+  const targets = [
+    prisma.subscription as any,
+    prisma.trialClaim as any,
+    prisma.user as any,
+  ];
+  const before = targets.map((m) => m.findMany);
+  for (const m of targets) m.findMany = async () => [];
+  t.after(() => {
+    targets.forEach((m, i) => {
+      m.findMany = before[i];
+    });
+  });
+}
+
+/*
+ * The trial-reminder route reaches customers' inboxes, so its guard matters the
+ * same way the drain's does: an open endpoint would let anyone on the internet
+ * spend the mail quota and spam every trialist — and both verbs must refuse
+ * identically, because a guard applied to only one of them is no guard.
+ */
+test("the trial-reminder route is guarded like the drain, on both verbs", async (t) => {
+  setSecret(t, SECRET);
+  stubNoEndingTrials(t);
+  quiet(t);
+
+  assert.equal((await request(app).get("/api/cron/trial-reminders")).status, 401);
+  assert.equal(
+    (
+      await request(app)
+        .post("/api/cron/trial-reminders")
+        .set("authorization", "Bearer not-the-secret")
+    ).status,
+    401,
+  );
+
+  const good = await request(app)
+    .get("/api/cron/trial-reminders")
+    .set("authorization", `Bearer ${SECRET}`);
+  assert.equal(good.status, 200);
+  assert.deepEqual(good.body, {
+    candidates: 0,
+    sent: 0,
+    pushed: 0,
+    alreadySent: 0,
+    notTrialing: 0,
+    failed: 0,
+  });
+
+  const manual = await request(app)
+    .post("/api/cron/trial-reminders")
+    .set("authorization", `Bearer ${SECRET}`);
+  assert.equal(manual.status, 200);
+});
+
+test("with no CRON_SECRET configured the trial-reminder route refuses everyone too", async (t) => {
+  setSecret(t, "");
+  quiet(t);
+
+  const res = await request(app)
+    .get("/api/cron/trial-reminders")
+    .set("authorization", "Bearer anything");
+
+  assert.equal(res.status, 503);
+});
+
 test("the secret is accepted with or without the Bearer prefix", async (t) => {
   // Schedulers and curl one-liners disagree about this often enough that a
   // rejection here would read as "the cron is broken" rather than "wrong header".

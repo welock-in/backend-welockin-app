@@ -278,7 +278,16 @@ subscriptionRouter.get(
         // subscription still inside its paid-through window can be un-cancelled
         // (POST /reactivate). Same Apple rule as above — and an RC row is never
         // status "cancelled" anyway (see lib/revenuecat.ts).
-        reactivatable: provider === "revenuecat" ? false : live.status === "cancelled",
+        //
+        // STILL GRANTING is part of the offer, not decoration. A cancelled row
+        // PAST its window is still "live" (it has not flipped to `expired` yet),
+        // so it is still the display row — but POST /reactivate filters on
+        // `subscriptionGrants` and would answer 409. The flag must make the same
+        // test, or this screen draws a button that leads to a guaranteed refusal.
+        reactivatable:
+          provider === "revenuecat"
+            ? false
+            : live.status === "cancelled" && subscriptionGrants(live, now),
       },
     });
   }),
@@ -565,9 +574,12 @@ subscriptionRouter.post(
  * `ends_at` clears. After `ends_at` the subscription is `expired` and there is
  * nothing to resume — the customer starts a fresh checkout instead.
  *
- * Found from the TOKEN, never named by the request, exactly like /cancel. The
- * webhook remains the sole writer of the row; this only asks LS to resume and
- * reports the new renews_at so the client can repaint immediately.
+ * Found from the TOKEN, never named by the request, exactly like /cancel — and
+ * mirrored optimistically, exactly like /cancel: the desktop re-reads
+ * GET /subscription the instant this answers, and a row still saying
+ * `cancelled` until the webhook lands redrew the very button the customer had
+ * just pressed. The webhook stays the authority (providerUpdatedAt untouched);
+ * this writes only what was asked for and is about to be confirmed.
  */
 subscriptionRouter.post(
   "/reactivate",
@@ -582,6 +594,7 @@ subscriptionRouter.post(
     const subs = await prisma.subscription.findMany({
       where: { userId, provider: PROVIDER, ...hideTestRowsFor(userId, env) },
       select: {
+        id: true,
         externalId: true,
         status: true,
         validUntil: true,
@@ -661,8 +674,7 @@ subscriptionRouter.post(
       throw badRequest(`Could not reactivate the subscription — ${why}`);
     }
 
-    // Best-effort read of the new renewal date, like /cancel reads ends_at. The
-    // webhook is still the writer; this just lets the client say it now.
+    // Best-effort read of the new renewal date, like /cancel reads ends_at.
     let renewsAt: string | null = null;
     try {
       const body = (await response.json()) as {
@@ -672,6 +684,30 @@ subscriptionRouter.post(
     } catch {
       /* the reactivation still happened */
     }
+
+    // Mirror the new status NOW rather than waiting for the webhook — the same
+    // move, for the same reason, as /cancel a page up. The desktop re-reads
+    // GET /subscription the moment this answers, and while the row still said
+    // `cancelled` that re-read drew the exact screen the customer had just acted
+    // on — Reactivate button included. A button that survives its own success
+    // is indistinguishable from a button that does nothing.
+    //
+    // Only what we just asked for and are about to be told again is written:
+    // status back to active, the paid-through stop cleared, and the renewal date
+    // when Lemon Squeezy said it (without one, the old validUntil is still a
+    // true lower bound on access, so it is kept rather than guessed at).
+    // `providerUpdatedAt` is left untouched, so the real event still applies
+    // over this on arrival.
+    await prisma.subscription
+      .update({
+        where: { id: resumable.id },
+        data: {
+          status: "active",
+          endsAt: null,
+          ...(renewsAt ? { renewsAt: new Date(renewsAt), validUntil: new Date(renewsAt) } : {}),
+        },
+      })
+      .catch((e) => console.error("[subscription] optimistic reactivate write failed:", e));
 
     res.status(202).json({ ok: true, renewsAt });
   }),

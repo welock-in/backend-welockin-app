@@ -900,6 +900,139 @@ test("reactivate still works for a cancelled PAID subscription", async (t) => {
   assert.equal(res.status, 202);
 });
 
+/*
+ * The button that "did nothing". The desktop re-reads GET /subscription the
+ * moment reactivate answers 202 — and the row still said `cancelled` until the
+ * webhook landed, so the pane redrew the exact screen the customer had just
+ * acted on, Reactivate button included. /cancel mirrors optimistically for the
+ * mirror-image reason; this pins that /reactivate now does too.
+ */
+test("a successful reactivate mirrors the row NOW — the desktop re-reads before the webhook lands", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
+  configured(t);
+  const inTenDays = new Date(Date.now() + 10 * 86_400_000);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    {
+      id: "row-1",
+      externalId: "77001",
+      status: "cancelled",
+      validUntil: inTenDays,
+      endsAt: inTenDays,
+      trialEndsAt: null,
+      trialCancelledAt: null,
+      pauseMode: null,
+      variantId: "",
+      providerUpdatedAt: new Date(),
+      createdAt: new Date(),
+    },
+  ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  const writes = stubMethod(t, prisma.subscription as any, "update", async () => ({}));
+  stubFetch(t, async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ data: { attributes: { renews_at: "2026-10-01T00:00:00.000Z" } } }),
+  }));
+
+  const res = await request(app).post("/api/subscription/reactivate").set(auth);
+
+  assert.equal(res.status, 202);
+  assert.equal(writes.length, 1, "the row is mirrored immediately, like /cancel does");
+  const [{ where, data }] = writes[0] as [{ where: any; data: any }];
+  assert.equal(where.id, "row-1");
+  assert.equal(data.status, "active", "un-cancelled: LS returns the subscription to active");
+  assert.equal(data.endsAt, null, "the paid-through stop is cleared — nothing is ending any more");
+  assert.equal(data.renewsAt?.toISOString(), "2026-10-01T00:00:00.000Z");
+  assert.equal(data.validUntil?.toISOString(), "2026-10-01T00:00:00.000Z");
+  // The webhook stays the authority: its staleness guard compares this stamp,
+  // and writing it here would let the optimistic guess outrank the real event.
+  assert.ok(!("providerUpdatedAt" in data), "providerUpdatedAt is the webhook's to write");
+});
+
+test("a reactivate answered without a renewal date mirrors the status and keeps the old window", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
+  configured(t);
+  const inTenDays = new Date(Date.now() + 10 * 86_400_000);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    {
+      id: "row-1",
+      externalId: "77001",
+      status: "cancelled",
+      validUntil: inTenDays,
+      endsAt: inTenDays,
+      trialEndsAt: null,
+      trialCancelledAt: null,
+      pauseMode: null,
+      variantId: "",
+      providerUpdatedAt: new Date(),
+      createdAt: new Date(),
+    },
+  ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+  const writes = stubMethod(t, prisma.subscription as any, "update", async () => ({}));
+  // A body we cannot read: the reactivation still happened.
+  stubFetch(t, async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({}),
+  }));
+
+  const res = await request(app).post("/api/subscription/reactivate").set(auth);
+
+  assert.equal(res.status, 202);
+  assert.equal(writes.length, 1);
+  const [{ data }] = writes[0] as [{ data: any }];
+  assert.equal(data.status, "active");
+  assert.equal(data.endsAt, null);
+  // Only what we KNOW is written. The old validUntil (the paid-through end) is
+  // still a true lower bound on access, and the webhook corrects it shortly.
+  assert.ok(!("renewsAt" in data), "no renewal date to invent");
+  assert.ok(!("validUntil" in data), "the paid-through window is kept, not guessed");
+});
+
+/*
+ * GET / must not offer a button POST /reactivate will refuse. A cancelled row
+ * PAST its paid-through window is still "live" (it has not flipped to expired
+ * yet), so it is still the display row — but there is nothing left to resume,
+ * and the POST answers 409. Flagging it reactivatable sent the customer to a
+ * guaranteed refusal.
+ */
+test("a cancelled row past its window is not offered as reactivatable", async (t) => {
+  stubMethod(t, prisma.acquisitionLock as any, "findUnique", async () => null);
+  stubMethod(t, prisma.checkoutIntent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.purchase as any, "findFirst", async () => null);
+  stubMethod(t, prisma.trialClaim as any, "findUnique", async () => null);
+  configured(t);
+  const yesterday = new Date(Date.now() - 86_400_000);
+  stubMethod(t, prisma.subscription as any, "findMany", async () => [
+    {
+      status: "cancelled",
+      interval: "monthly",
+      validUntil: yesterday,
+      trialEndsAt: null,
+      trialCancelledAt: null,
+      renewsAt: null,
+      endsAt: yesterday,
+      pauseMode: null,
+      variantId: "",
+      providerUpdatedAt: new Date(),
+      createdAt: new Date(),
+    },
+  ]);
+  stubMethod(t, prisma.billingTask as any, "findMany", async () => []);
+
+  const res = await request(app).get("/api/subscription").set(auth);
+
+  assert.equal(res.body.subscription.status, "cancelled", "the row still displays");
+  assert.equal(res.body.subscription.reactivatable, false, "but the dead button is not offered");
+});
+
 /* ── provider unification: GET / sees BOTH stores ────────────────────────
  *
  * The drift this section pins shut: this route used to read Lemon Squeezy rows

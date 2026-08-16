@@ -96,6 +96,11 @@ const rcWebhookSchema = z
         store: z.string().optional(),
         app_id: z.string().optional(),
         product_id: z.string().optional(),
+        /** Apple's transaction identity — carried by every subscription
+         *  lifecycle event (INITIAL_PURCHASE, RENEWAL, CANCELLATION,
+         *  UNCANCELLATION, EXPIRATION, BILLING_ISSUE, PRODUCT_CHANGE…). It is
+         *  what feeds the AppleTxOwner registry below. */
+        original_transaction_id: z.string().optional(),
         transferred_from: z.array(z.string()).optional(),
         transferred_to: z.array(z.string()).optional(),
       })
@@ -291,9 +296,56 @@ revenueCatWebhookRouter.post(
         if (ids.length > 0) {
           console.error(`[revenuecat] ${event.type}: ${reason} — receipt has no account`);
         }
+        // NOTE what is deliberately NOT done here: the AppleTxOwner row (if
+        // one exists) is left EXACTLY as it is. It records the last KNOWN
+        // owner of this Apple transaction, and an orphan event is precisely
+        // the moment that record becomes the only evidence left — the
+        // precheck reads it to refuse a second phone-side purchase on an
+        // Apple ID whose account was hand-deleted.
         await markWebhookEvent(RC_PROVIDER, event.id, "skipped", reason);
         res.status(200).json({ ok: true, status: "skipped", note: reason });
         return;
+      }
+
+      // THE APPLE-TRANSACTION REGISTRY (AppleTxOwner) — recorded BEFORE the
+      // syncs, so ownership evidence lands even on a delivery whose RevenueCat
+      // re-fetch fails (the 500 redelivers, and the upsert re-runs
+      // idempotently). Written only when the event names both halves of the
+      // mapping: Apple's transaction identity AND an app_user_id that is a
+      // KNOWN account. Ownership is decided at create and never moved by a
+      // later lifecycle event — a RENEWAL refreshes lastEventAt/productId,
+      // nothing else; only a TRANSFER (below) moves rows, because only then
+      // has RevenueCat said the receipt itself moved.
+      const originalTransactionId =
+        typeof event.original_transaction_id === "string" && event.original_transaction_id
+          ? event.original_transaction_id
+          : null;
+      if (
+        originalTransactionId &&
+        event.app_user_id &&
+        isObjectId(event.app_user_id) &&
+        known.includes(event.app_user_id)
+      ) {
+        const lastEventAt =
+          typeof event.event_timestamp_ms === "number"
+            ? new Date(event.event_timestamp_ms)
+            : new Date();
+        await prisma.appleTxOwner.upsert({
+          where: { originalTransactionId },
+          create: {
+            originalTransactionId,
+            userId: event.app_user_id,
+            productId: event.product_id ?? null,
+            environment: event.environment ?? null,
+            lastEventAt,
+          },
+          // No userId here, ever — see the create/update split above.
+          update: {
+            ...(event.product_id ? { productId: event.product_id } : {}),
+            ...(event.environment ? { environment: event.environment } : {}),
+            lastEventAt,
+          },
+        });
       }
 
       // A TRANSFER is RevenueCat telling us it has ALREADY moved the receipt
@@ -309,6 +361,14 @@ revenueCatWebhookRouter.post(
         const from = (event.transferred_from ?? []).filter(isObjectId);
         if (to && from.length > 0) {
           await prisma.rcSubscriberClaim.updateMany({
+            where: { userId: { in: from } },
+            data: { userId: to },
+          });
+          // The Apple-transaction registry follows the receipt the same way:
+          // whatever transactions the losing account owned now fund the
+          // receiving one, so the precheck keeps pointing at the account the
+          // money actually lives on.
+          await prisma.appleTxOwner.updateMany({
             where: { userId: { in: from } },
             data: { userId: to },
           });

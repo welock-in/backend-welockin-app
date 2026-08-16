@@ -962,6 +962,50 @@ model RcSubscriberClaim {
   updatedAt         DateTime @updatedAt
 }
 
+/// The Apple-transaction registry: which account an Apple ID's purchase last
+/// belonged to — one Apple ID, one WeLockIn account, enforceable BEFORE signup.
+///
+/// WHY IT EXISTS when RcSubscriberClaim already registers ownership. The claim
+/// is keyed on RevenueCat's `original_app_user_id` — an identifier only a
+/// RevenueCat SYNC can present, i.e. only after an account exists and restores.
+/// The precheck's question comes earlier: "may this phone CREATE an account at
+/// all?" — and the one key the phone holds before any account exists is Apple's
+/// `original_transaction_id`, which StoreKit hands the device and RevenueCat's
+/// webhooks carry on every subscription lifecycle event. This registry maps
+/// that key to the account the money last funded, fed by the webhook and read
+/// by POST /api/auth/precheck.
+///
+/// `userId` is DELIBERATELY NOT a relation, and that is the entire point: the
+/// device-based precheck already fails exactly when it is needed most, because
+/// Device rows cascade with `prisma.user.delete` (spec N13 — by design). This
+/// row survives, recording the LAST KNOWN owner; a row pointing at a userId
+/// that matches nobody is how the precheck detects "this Apple ID paid for an
+/// account that no longer exists" and blocks a second phone-side purchase.
+///
+/// Ownership discipline mirrors every other billing writer: decided at create,
+/// never moved by a later lifecycle event — only a TRANSFER (RevenueCat saying
+/// it moved the receipt) moves rows, in the webhook, alongside the claim move.
+///
+/// DEPLOY NOTE: on MongoDB the unique index only exists once built in the
+/// cluster. Create it ADDITIVELY (never `prisma db push` against the live
+/// billing database) and verify with scripts/verify-billing-indexes.mjs.
+model AppleTxOwner {
+  id                    String   @id @default(auto()) @map("_id") @db.ObjectId
+  /// Apple's original_transaction_id — the identity of the purchase itself,
+  /// stable across renewals, restores, devices and account deletions.
+  originalTransactionId String   @unique
+  /// Last known owner. NOT a relation — must survive user deletion (see above).
+  userId                String   @db.ObjectId
+  /// The product the last event named — for support and copy, never for logic.
+  productId             String?
+  /// "SANDBOX" | "PRODUCTION", as the last event reported it.
+  environment           String?
+  /// When the last webhook evidence about this transaction arrived.
+  lastEventAt           DateTime
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
 /// One trial-end reminder per (user, trial end) — the durable dedupe behind
 /// `GET|POST /api/cron/trial-reminders`.
 ///

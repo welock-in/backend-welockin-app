@@ -89,6 +89,17 @@ const REQUIRED = [
       "into a second licence, and the unique key is its concurrency lock: two " +
       "simultaneous first-claims must collide here, not race check-then-act.",
   },
+  {
+    collection: "AppleTxOwner",
+    key: { originalTransactionId: 1 },
+    unique: true,
+    protects:
+      "one row per Apple transaction in the ownership registry the precheck " +
+      "reads. Without uniqueness, two webhook deliveries racing on the same " +
+      "original_transaction_id can each create a row, and 'who owns this " +
+      "Apple ID's purchase' stops having one answer — on the lookup that " +
+      "decides whether a phone may create an account.",
+  },
 ];
 
 /**

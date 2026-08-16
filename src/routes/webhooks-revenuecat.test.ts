@@ -128,6 +128,10 @@ function stubDb(t: Ctx, overrides: Record<string, (...args: any[]) => any> = {})
     rcClaimCreate: stubMethod(t, prisma.rcSubscriberClaim as any, "create", pick("rcClaimCreate", async () => ({}))),
     rcClaimUpdate: stubMethod(t, prisma.rcSubscriberClaim as any, "update", pick("rcClaimUpdate", async () => ({}))),
     rcClaimMove: stubMethod(t, prisma.rcSubscriberClaim as any, "updateMany", pick("rcClaimMove", async () => ({ count: 0 }))),
+    // The Apple-transaction registry (AppleTxOwner) the precheck reads.
+    // Baseline: every upsert succeeds, and a TRANSFER's row-move touches nothing.
+    txOwnerUpsert: stubMethod(t, prisma.appleTxOwner as any, "upsert", pick("txOwnerUpsert", async () => ({}))),
+    txOwnerMove: stubMethod(t, prisma.appleTxOwner as any, "updateMany", pick("txOwnerMove", async () => ({ count: 0 }))),
     userFind: stubMethod(
       t,
       prisma.user as any,
@@ -643,6 +647,120 @@ test("a TRANSFER to an anonymous app_user_id moves no claim — malformed ids ne
 
   assert.equal(res.status, 200);
   assert.equal(db.rcClaimMove.length, 0, "no valid receiver, nothing to move the claim to");
+});
+
+/* ── the Apple-transaction registry (AppleTxOwner) ──────────────────────── */
+
+/*
+ * One Apple ID, one WeLockIn account — the registry the precheck reads. The
+ * device-based precheck dies with the Device rows when an account is
+ * hand-deleted (N13, by design); Apple's original_transaction_id does not, so
+ * every lifecycle event that carries one records who the money last funded.
+ */
+
+const APPLE_TX = "2000000123456789";
+
+test("INITIAL_PURCHASE records the Apple transaction's owner", async (t) => {
+  configured(t);
+  stubFetch(t);
+  const db = stubDb(t);
+  const stamp = Date.now();
+
+  const res = await deliver(
+    eventBody({ id: "evt-tx-initial", original_transaction_id: APPLE_TX, event_timestamp_ms: stamp }),
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.status, "processed");
+  assert.equal(db.txOwnerUpsert.length, 1);
+  const written = db.txOwnerUpsert[0][0];
+  assert.deepEqual(written.where, { originalTransactionId: APPLE_TX });
+  assert.equal(written.create.originalTransactionId, APPLE_TX);
+  assert.equal(written.create.userId, USER, "ownership is decided at create");
+  assert.equal(written.create.productId, RC_PRODUCT_MONTHLY);
+  assert.equal(written.create.environment, "PRODUCTION");
+  assert.equal(written.create.lastEventAt.getTime(), stamp);
+});
+
+test("a RENEWAL refreshes lastEventAt — never the owner", async (t) => {
+  configured(t);
+  stubFetch(t);
+  const db = stubDb(t);
+  const stamp = Date.now();
+
+  const res = await deliver(
+    eventBody({
+      id: "evt-tx-renewal",
+      type: "RENEWAL",
+      original_transaction_id: APPLE_TX,
+      event_timestamp_ms: stamp,
+    }),
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(db.txOwnerUpsert.length, 1);
+  const written = db.txOwnerUpsert[0][0];
+  assert.equal(written.update.lastEventAt.getTime(), stamp);
+  assert.equal(written.update.productId, RC_PRODUCT_MONTHLY);
+  assert.ok(
+    !("userId" in written.update),
+    "the update must not carry userId — a lifecycle event can never MOVE ownership",
+  );
+});
+
+test("a TRANSFER moves the Apple-transaction rows with the claim", async (t) => {
+  configured(t);
+  stubFetch(t, () => subscriber({ subscriptions: {}, entitlements: {} }));
+  const db = stubDb(t);
+
+  const res = await deliver(
+    eventBody({
+      id: "evt-tx-transfer",
+      type: "TRANSFER",
+      store: undefined,
+      product_id: undefined,
+      app_user_id: undefined,
+      transferred_to: [USER],
+      transferred_from: [OTHER_USER],
+    }),
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.status, "processed");
+  assert.equal(db.txOwnerMove.length, 1);
+  assert.deepEqual(db.txOwnerMove[0][0].where, { userId: { in: [OTHER_USER] } });
+  assert.deepEqual(db.txOwnerMove[0][0].data, { userId: USER });
+});
+
+test("an orphan event leaves the registry row as-is — it is the evidence", async (t) => {
+  // The owner hand-deleted their account: the event's app_user_id is a valid
+  // ObjectId matching nobody. The row must NOT be rewritten and must NOT be
+  // removed — the last known owner is exactly what the precheck needs to
+  // refuse a second phone-side purchase on this Apple ID.
+  configured(t);
+  stubFetch(t);
+  const db = stubDb(t, { userFind: async () => null });
+
+  const res = await deliver(
+    eventBody({ id: "evt-tx-orphan", original_transaction_id: APPLE_TX }),
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.status, "skipped");
+  assert.equal(db.txOwnerUpsert.length, 0, "no rewrite — the row records the LAST KNOWN owner");
+  assert.equal(db.txOwnerMove.length, 0);
+});
+
+test("an event without original_transaction_id writes no registry row", async (t) => {
+  configured(t);
+  stubFetch(t);
+  const db = stubDb(t);
+
+  const res = await deliver(eventBody({ id: "evt-tx-none" }));
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.status, "processed", "the sync itself is untouched");
+  assert.equal(db.txOwnerUpsert.length, 0);
 });
 
 test("a RevenueCat outage marks the event failed and asks for redelivery", async (t) => {

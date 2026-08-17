@@ -6,12 +6,44 @@ import { asyncHandler } from "../middleware/async-handler";
 import { protectionLockSchema, protectionUnlockSchema } from "../validation/schemas";
 import { badRequest, forbidden, unauthorized } from "../lib/http-error";
 import { sendOtpEmail } from "../lib/resend";
+import { consumeRateLimit } from "../lib/rate-limit";
 
 export const addictionProtectionRouter = Router();
 
 // Wrong-code attempts allowed against one OTP before it is invalidated (forcing a
 // resend, which re-emails the partner). Caps brute-force of the 6-digit code.
 const MAX_OTP_ATTEMPTS = 5;
+
+const minutes = (n: number) => n * 60 * 1000;
+
+/**
+ * Caps on the partner OTP mail, in two INDEPENDENT dimensions.
+ *
+ * Both /lock and /resend hand a caller-supplied address to `sendOtpEmail`, so
+ * without a counter any signed-in account is a mail cannon aimed wherever it
+ * likes, firing from protection@welock.in.
+ *
+ * The per-USER cap stops one account hammering the button. It does not stop the
+ * abuse that matters, because someone who wants to bury one inbox just registers
+ * more accounts — every one of them with its own fresh budget. The per-RECIPIENT
+ * cap is the leg that actually protects the victim, and it is deliberately
+ * SHARED by the two routes: split one key per route and it stops being a cap on
+ * "mail sent to this person" and becomes two budgets to spend on them.
+ *
+ * The legitimate flow is "lock once, maybe resend once or twice", so five an
+ * hour is several times what a real user needs and still a rounding error as an
+ * attack.
+ */
+const OTP_PER_USER_HOURLY = 5;
+const OTP_PER_RECIPIENT_HOURLY = 5;
+
+/**
+ * The shared per-recipient key. NORMALISED (trim + lowercase) the way `emailRule`
+ * in validation/schemas.ts normalises every address the auth flows key on —
+ * `protectionLockSchema` only trims, and without the fold `Victim@x.com` and
+ * `victim@x.com` would be two budgets pointed at one inbox.
+ */
+const recipientOtpKey = (email: string) => `protect-otp:to:${email.trim().toLowerCase()}`;
 
 function genOtp(): string {
   return crypto.randomInt(0, 1_000_000).toString().padStart(6, "0");
@@ -67,9 +99,35 @@ addictionProtectionRouter.post(
   asyncHandler(async (req, res) => {
     const input = protectionLockSchema.parse(req.body);
     const userId = req.user!.id;
+
+    // Before ANY database work: a caller who is over the line must not still get
+    // a write out of the request.
+    await consumeRateLimit(`protect-lock:user:${userId}`, OTP_PER_USER_HOURLY, minutes(60));
+
     const now = new Date();
     const isPartner = input.method === "partner";
     const otp = isPartner ? genOtp() : null;
+    const willEmail = Boolean(isPartner && input.partnerContact && otp);
+
+    // ORDERING: the recipient cap is consumed BEFORE the upsert, not merely
+    // before the send.
+    //
+    // Putting it after the write is what wedges the user. The lock would already
+    // be ACTIVE carrying a freshly minted OTP, and the 429 would then suppress
+    // the one mail that delivers that OTP to the only person who can lift it —
+    // protection on, nobody holding the key, and /resend throttled on this very
+    // same shared key so there is no way out. A 429 has to mean "nothing
+    // happened", and here that is only true if it lands first.
+    //
+    // Spent only when a mail is actually owed: a `date` lock never touches
+    // anyone else's inbox and must not eat their budget.
+    if (willEmail) {
+      await consumeRateLimit(
+        recipientOtpKey(input.partnerContact!),
+        OTP_PER_RECIPIENT_HOURLY,
+        minutes(60),
+      );
+    }
 
     const data = {
       active: true,
@@ -109,14 +167,33 @@ addictionProtectionRouter.post(
   "/resend",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const lock = await prisma.protectionLock.findUnique({ where: { userId: req.user!.id } });
+    const userId = req.user!.id;
+
+    // Two per-user limits, the same pair and for the same reasons as
+    // /api/auth/verify-email/request: "Send it again" is a BUTTON, so the
+    // per-minute cap is what stops an impatient double-tap from becoming two
+    // mails, and the hourly one is what bounds the day. Both before any DB work.
+    await consumeRateLimit(`protect-resend-burst:user:${userId}`, 1, minutes(1));
+    await consumeRateLimit(`protect-resend:user:${userId}`, OTP_PER_USER_HOURLY, minutes(60));
+
+    const lock = await prisma.protectionLock.findUnique({ where: { userId } });
     if (!lock || !lock.active) throw badRequest("Protection is not active");
     if (lock.method !== "partner") throw badRequest("Resend only applies to the partner method");
     if (!lock.partnerContact) throw badRequest("No partner contact on file");
 
+    // Same ordering rule as /lock, same reason: consumed before the OTP is
+    // rotated, because rotating first would invalidate the code the partner is
+    // already holding and then refuse to send its replacement — strictly worse
+    // than doing nothing.
+    await consumeRateLimit(
+      recipientOtpKey(lock.partnerContact),
+      OTP_PER_RECIPIENT_HOURLY,
+      minutes(60),
+    );
+
     const otp = genOtp();
     await prisma.protectionLock.update({
-      where: { userId: req.user!.id },
+      where: { userId },
       data: { otp, otpSentAt: new Date(), otpAttempts: 0 },
     });
     const r = await sendOtpEmail(lock.partnerContact, otp);

@@ -30,7 +30,15 @@ async function dispatch(event: string, ctx: NotificationContext): Promise<void> 
     where: { event, enabled: true },
     orderBy: { priority: "desc" },
   });
-  if (rules.length === 0) return;
+  if (rules.length === 0) {
+    // Rules are DATA (seeded by notifications:seed, editable from the admin
+    // console) — an event firing into a database with no enabled rule for it is
+    // the classic silent way this feature dies in production, indistinguishable
+    // from success without this line. Warn, don't throw: the caller's request
+    // must never break on a notification gap.
+    console.warn(`[notifications] "${event}" fired but no enabled rule matches — was notifications:seed run?`);
+    return;
+  }
 
   const vars = ctx as Record<string, unknown>;
 
@@ -38,10 +46,24 @@ async function dispatch(event: string, ctx: NotificationContext): Promise<void> 
     if (!matchCondition(rule.condition, vars)) continue;
 
     const template = await prisma.notificationTemplate.findUnique({ where: { key: rule.templateKey } });
-    if (!template || !template.active) continue;
+    if (!template || !template.active) {
+      console.warn(
+        `[notifications] rule ${rule.id} (${event}) points at template "${rule.templateKey}" which is ${template ? "inactive" : "missing"} — nothing sent`,
+      );
+      continue;
+    }
 
     const targets = await resolveAudience(rule.audience as unknown as AudienceSpec, ctx);
-    if (targets.length === 0) continue;
+    if (targets.length === 0) {
+      // The other silent death: the rule matched, the template exists, and the
+      // audience resolved to nobody — usually a PushToken whose deviceId no
+      // longer matches the Device row, or every token invalidated. Name the
+      // user so the delivery table's absence of rows has a paper trail.
+      console.warn(
+        `[notifications] rule ${rule.id} (${event}) resolved an empty audience for user ${ctx.userId ?? "?"} — no valid push token matched`,
+      );
+      continue;
+    }
 
     const payload = {
       title: renderString(template.title, vars),

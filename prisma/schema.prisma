@@ -1415,3 +1415,41 @@ model AcquisitionLock {
 
   @@unique([userId, scope])
 }
+
+/// One day of arrivals from one tagged link — today, the QR code on the flyers.
+///
+/// A BUCKET, not a row per visit. A printed code is scanned by strangers with no
+/// account, so there is nothing to attach a visit to and nothing about it worth
+/// keeping beyond how many there were. One document per source per day stays
+/// bounded whatever a campaign does, and still answers "today", "this week" and
+/// "since the flyers went out" from the same rows.
+///
+/// What this counts is SCANS THAT OPENED THE PAGE, deduplicated to one per
+/// browser tab session by the site. It is a campaign signal, not an audited
+/// figure: the endpoint that feeds it is public by necessity (its callers have
+/// no account), so anyone who wants to inflate it can. Nothing is gated on it.
+model ReferralHit {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  /// The `?ref=` value, checked against the route's allow-list BEFORE it is
+  /// written — so this column holds campaign names we chose, never whatever a
+  /// caller put in the query string.
+  source String
+
+  /// "YYYY-MM-DD", UTC. A string rather than a DateTime because it is a
+  /// grouping key and not an instant: two scans either side of midnight in
+  /// different timezones must land in the same bucket, and a DateTime would
+  /// invite someone to compare it against a local `new Date()`.
+  day String
+
+  /// Only ever moved by an atomic `increment`. This API runs on serverless, so
+  /// two scans in the same second are two instances; a read-then-write would
+  /// lose one of them and undercount exactly when a campaign is working.
+  count Int @default(0)
+
+  firstAt   DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([source, day])
+  @@index([source])
+}

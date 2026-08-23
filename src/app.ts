@@ -11,6 +11,7 @@ import { authRouter } from "./routes/auth";
 import { authEmailRouter } from "./routes/auth-email";
 import { authPrecheckRouter } from "./routes/auth-precheck";
 import { contactRouter } from "./routes/contact";
+import { referralsRouter, adminReferralsRouter } from "./routes/referrals";
 import { meRouter } from "./routes/me";
 import { devicesRouter } from "./routes/devices";
 import { focusInvitesRouter } from "./routes/focus-invites";
@@ -100,6 +101,11 @@ export function createApp(): Express {
   // token is the one thing they cannot supply. Abuse is handled by rate limits
   // inside the route, not by auth.
   app.use("/api/contact", contactRouter);
+  // Where a printed link sent someone. PUBLIC for the same reason as the
+  // contact form above: its callers have not signed up yet — that is the very
+  // thing being measured. What bounds it is an allow-list of campaign names
+  // and a write ceiling inside the route, not auth.
+  app.use("/api/referrals", referralsRouter);
   // Every router below is authenticated on EVERY route, so the guard can be
   // mounted here rather than threaded through each one. `requireAuth` runs again
   // inside them; that is a signature check with no database read, and paying it
@@ -149,6 +155,10 @@ export function createApp(): Express {
   app.use("/api/addiction-protection", requireAuth, requireCurrentSession, addictionProtectionRouter);
   app.use("/api/admin/addiction-protection", adminProtectionRouter);
   app.use("/api/admin/releases", adminReleasesRouter);
+  // The read side of /api/referrals. Mounted under /api/admin so the console
+  // reaches it through the proxy it already has, which forwards that prefix
+  // and nothing else.
+  app.use("/api/admin/referrals", adminReferralsRouter);
   app.use("/api/admin/notifications", adminNotificationsRouter);
   // Session-freshness only: the funnel pushes its answers immediately after
   // creating the account and BEFORE the code screen, so requiring verification

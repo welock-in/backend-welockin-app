@@ -46,6 +46,7 @@ function row(overrides: Partial<OnboardingProfile> = {}): OnboardingProfile {
     displayName: "Hedi",
     ageBand: "25_34",
     profileSlug: "founder_or_freelancer",
+    university: null,
     goalSlug: "focus_better",
     distractingAppSlugs: ["instagram", "tiktok", "youtube"],
     selfReportedDailyHours: 6,
@@ -89,6 +90,7 @@ function stubCreate(t: { after: (fn: () => void) => void }) {
     row({
       displayName: null,
       profileSlug: null,
+      university: null,
       goalSlug: null,
       distractingAppSlugs: [],
       clientProjection: null,
@@ -266,6 +268,95 @@ test("a partial re-submit leaves the omitted answers untouched", async (t) => {
   assert.equal("profileSlug" in data, false);
   assert.equal("goalSlug" in data, false);
   assert.equal("distractingAppSlugs" in data, false);
+});
+
+test("a submission carrying a university stores it and returns it", async (t) => {
+  stubMethod(t, prisma.onboardingProfile as any, "findUnique", async () => null);
+  const createCalls = stubCreate(t);
+  stubUserUpdate(t);
+
+  const res = await request(app)
+    .post("/api/onboarding")
+    .set(auth)
+    .send(body({ profile: "undergraduate", university: "EPFL" }));
+
+  assert.equal(res.status, 201);
+  const data = createCalls[0][0].data as Record<string, unknown>;
+  // Free text, stored verbatim — never slug-normalised.
+  assert.equal(data.university, "EPFL");
+  assert.equal(res.body.onboarding.university, "EPFL");
+  assert.equal(res.body.onboarding.profile, "undergraduate");
+});
+
+test("an edit without a university leaves the stored value untouched", async (t) => {
+  const existing = row({ profileSlug: "undergraduate", university: "EPFL" });
+  stubMethod(t, prisma.onboardingProfile as any, "findUnique", async () => existing);
+  const updateCalls = stubUpdate(t, existing);
+  stubUserUpdate(t);
+
+  const res = await request(app).post("/api/onboarding").set(auth).send({
+    clientSubmissionId: "submission-0000-0002",
+    funnelVersion: "phone_v7",
+    displayName: "Hédi",
+  });
+
+  assert.equal(res.status, 200);
+  const data = updateCalls[0][0].data as Record<string, unknown>;
+  // Same conditional-spread semantics as every other optional answer.
+  assert.equal("university" in data, false);
+  assert.equal(res.body.onboarding.university, "EPFL");
+});
+
+test("an edit sending university: null CLEARS the stored value", async (t) => {
+  // The contract: every v2 submission carries `university ?? null`, so a re-run
+  // switching 'undergraduate' → 'working' must null the column — omit ≠ null.
+  const existing = row({ profileSlug: "undergraduate", university: "EPFL" });
+  stubMethod(t, prisma.onboardingProfile as any, "findUnique", async () => existing);
+  const updateCalls = stubUpdate(t, existing);
+  stubUserUpdate(t);
+
+  const res = await request(app)
+    .post("/api/onboarding")
+    .set(auth)
+    .send(
+      body({ clientSubmissionId: "submission-0000-0002", profile: "working", university: null }),
+    );
+
+  assert.equal(res.status, 200);
+  const data = updateCalls[0][0].data as Record<string, unknown>;
+  assert.equal("university" in data, true, "null must reach the update, not be dropped");
+  assert.equal(data.university, null);
+  assert.equal(res.body.onboarding.university, null);
+});
+
+test("university: null on a FIRST submission is accepted and stores null", async (t) => {
+  // A non-student's very first run sends the key too (always-sent contract) —
+  // it must not 400, and the column starts out null.
+  stubMethod(t, prisma.onboardingProfile as any, "findUnique", async () => null);
+  const createCalls = stubCreate(t);
+  stubUserUpdate(t);
+
+  const res = await request(app).post("/api/onboarding").set(auth).send(body({ university: null }));
+
+  assert.equal(res.status, 201);
+  const data = createCalls[0][0].data as Record<string, unknown>;
+  assert.equal(data.university, null);
+  assert.equal(res.body.onboarding.university, null);
+});
+
+test("a university over 160 characters is refused with a 400", async (t) => {
+  const findCalls = stubMethod(t, prisma.onboardingProfile as any, "findUnique", async () => null);
+  const createCalls = stubCreate(t);
+  stubUserUpdate(t);
+
+  const res = await request(app)
+    .post("/api/onboarding")
+    .set(auth)
+    .send(body({ university: "a".repeat(161) }));
+
+  assert.equal(res.status, 400);
+  assert.equal(findCalls.length, 0);
+  assert.equal(createCalls.length, 0);
 });
 
 test("a raced create (P2002) returns the winner and still mirrors to User", async (t) => {

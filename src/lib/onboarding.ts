@@ -67,10 +67,17 @@ export function computeOnboardingProjection(hours: number): OnboardingProjection
  * POSTing, so an unknown slug is stored verbatim rather than 400'd.
  */
 export const KNOWN_PROFILE_SLUGS = [
+  // Legacy set (pre-v2 funnels) — kept because old binaries still POST them.
   "student",
   "working_professional",
   "founder_or_freelancer",
   "profile_other",
+  // Funnel-v2 set (desktop_v2 / phone_v7).
+  "high_school",
+  "undergraduate",
+  "postgraduate",
+  "phd_student",
+  "working",
 ] as const;
 export const KNOWN_GOAL_SLUGS = [
   "focus_better",

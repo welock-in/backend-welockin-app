@@ -563,6 +563,11 @@ model OnboardingProfile {
   // corrupt on insertion) and NOT Prisma enums (a new option would need a
   // `db push` on the live cluster). Unknown slugs are stored verbatim.
   profileSlug            String? // e.g. "founder_or_freelancer"
+  // Free-TEXT university name (funnel v2, student profiles only) — picked from
+  // a client-bundled list or typed by hand, so NOT a slug: stored verbatim.
+  // Optional like every column added after launch (create-time defaults never
+  // rewrite existing documents on MongoDB); absent on pre-v2 rows.
+  university             String?
   goalSlug               String? // e.g. "focus_better"
   // SELF-DECLARED distractions from a fixed list — NOT the FamilyControls
   // selection (those tokens are opaque and never leave the device). Order is the

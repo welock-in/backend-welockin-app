@@ -567,6 +567,15 @@ export const onboardingSubmitSchema = z.object({
   // fabricated one inside the band.
   age: z.number().int().min(1).max(99).optional(),
   profile: answerSlug.optional(),
+  // Free TEXT, deliberately not `answerSlug`: the university name (funnel v2,
+  // student profiles only) is picked from a client-bundled list OR typed by
+  // hand, so accents, spaces and casing are all legal. Nullable AND optional,
+  // and the two are different writes: null CLEARS the stored value — a re-run
+  // that switches a student profile to 'working' must not leave a stale
+  // university on the row — while an absent key leaves it untouched like every
+  // other answer. v2 clients always send the key (`answers.university ?? null`);
+  // only pre-v2 binaries omit it.
+  university: z.string().trim().min(1).max(160).nullable().optional(),
   goal: answerSlug.optional(),
   // Tap order is preserved (screen 12 renders the first three). 32 is a raw-input
   // bound; the normaliser dedupes and stores at most 16.

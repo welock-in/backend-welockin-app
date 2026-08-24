@@ -51,6 +51,7 @@ function onboardingProfileDto(p: OnboardingProfile) {
     displayName: p.displayName ?? null,
     ageBand: p.ageBand,
     profile: p.profileSlug ?? null,
+    university: p.university ?? null,
     goal: p.goalSlug ?? null,
     distractingApps: p.distractingAppSlugs,
     selfReportedDailyHours: p.selfReportedDailyHours,
@@ -141,6 +142,10 @@ onboardingRouter.post(
         : {}),
       ...(input.displayName !== undefined ? { displayName: input.displayName } : {}),
       ...(input.profile !== undefined ? { profileSlug: normalizeSlug(input.profile) } : {}),
+      // Free text, so no slug normalisation — zod already trimmed it. null flows
+      // through on purpose: it CLEARS the column (student → non-student re-run),
+      // which is exactly why absent and null must stay distinguishable here.
+      ...(input.university !== undefined ? { university: input.university } : {}),
       ...(input.goal !== undefined ? { goalSlug: normalizeSlug(input.goal) } : {}),
       ...(input.distractingApps !== undefined
         ? { distractingAppSlugs: normalizeSlugList(input.distractingApps) }

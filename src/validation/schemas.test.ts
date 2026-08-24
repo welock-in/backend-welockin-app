@@ -121,6 +121,27 @@ test("onboarding normalises answer casing and rejects non-slug shapes", () => {
   assert.throws(() => onboardingSubmitSchema.parse({ ...submission, profile: "a".repeat(41) }));
 });
 
+test("onboarding accepts a free-text university and bounds it at 160 chars", () => {
+  // Free text, NOT a slug: picked from a bundled list or typed by hand, so
+  // accents, spaces and casing must all survive verbatim.
+  assert.equal(
+    onboardingSubmitSchema.parse({ ...submission, university: "  École Polytechnique " })
+      .university,
+    "École Polytechnique",
+  );
+  assert.equal(onboardingSubmitSchema.parse(submission).university, undefined);
+  // null parses AND survives distinct from absent: every v2 submission carries
+  // `university ?? null`, and null must reach the route to CLEAR the column.
+  assert.equal(onboardingSubmitSchema.parse({ ...submission, university: null }).university, null);
+  assert.doesNotThrow(() =>
+    onboardingSubmitSchema.parse({ ...submission, university: "a".repeat(160) }),
+  );
+  assert.throws(() =>
+    onboardingSubmitSchema.parse({ ...submission, university: "a".repeat(161) }),
+  );
+  assert.throws(() => onboardingSubmitSchema.parse({ ...submission, university: "   " }));
+});
+
 test("onboarding leaves the age policy gate to the route, not zod", () => {
   // 15 PARSES: the refusal must be a branchable 403 AGE_BELOW_MINIMUM, not a
   // generic validation string the client's 400 handler would swallow.

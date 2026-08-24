@@ -109,6 +109,20 @@ test("normalizeSlug never resolves an answer through Object.prototype", () => {
   assert.deepEqual(normalizeSlugList(["constructor", "instagram"]), ["constructor", "instagram"]);
 });
 
+test("the profile catalogue carries the funnel-v2 set AND the legacy four", () => {
+  // Old binaries still POST the legacy slugs; dropping one from the catalogue
+  // would be read as "safe to stop handling it", which it is not.
+  const v2 = ["high_school", "undergraduate", "postgraduate", "phd_student", "working"];
+  const legacy = ["student", "working_professional", "founder_or_freelancer", "profile_other"];
+  for (const slug of [...legacy, ...v2]) {
+    assert.ok(
+      (KNOWN_PROFILE_SLUGS as readonly string[]).includes(slug),
+      `${slug} must stay catalogued`,
+    );
+  }
+  assert.equal(KNOWN_PROFILE_SLUGS.length, legacy.length + v2.length);
+});
+
 test("every catalogued slug survives normalisation unchanged", () => {
   for (const slug of [...KNOWN_PROFILE_SLUGS, ...KNOWN_GOAL_SLUGS, ...KNOWN_APP_SLUGS]) {
     assert.equal(normalizeSlug(slug), slug, `alias map rewrites the canonical slug ${slug}`);

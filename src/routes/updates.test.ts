@@ -150,10 +150,13 @@ test("darwin/aarch64 answers 204 while only a Windows release exists", async (t)
 });
 
 /**
- * THE one that matters. An Intel Mac handed the Apple-silicon build would
- * install it and then fail to launch — a worse outcome than never updating.
+ * THE one that matters, arch-isolation edition. The build is universal now,
+ * but each slice still asks for its own (target, arch) pair — an Intel Mac
+ * must be told nothing while only an aarch64 row exists, never handed that
+ * row's build. This is what makes forgetting the x86_64 registration a
+ * SILENT failure: the row's absence looks exactly like "up to date".
  */
-test("an Intel Mac is never offered the Apple-silicon build", async (t) => {
+test("an Intel Mac is never offered another arch's row", async (t) => {
   fakeReleases(t, [
     release({
       id: "r2",
@@ -166,6 +169,38 @@ test("an Intel Mac is never offered the Apple-silicon build", async (t) => {
 
   const res = await request(app).get("/api/updates/darwin/x86_64/stable/0.2.0");
   assert.equal(res.status, 204);
+});
+
+test("darwin/x86_64 is served from its own row once one is live", async (t) => {
+  // The universal release registers as two rows carrying the SAME artifact —
+  // this is the Intel half answering on its own.
+  fakeReleases(t, [
+    release({
+      id: "r2",
+      target: "darwin",
+      arch: "aarch64",
+      version: "0.2.13",
+      versionKey: toSortKey("0.2.13"),
+      url: "https://cdn/WeLockIn_0.2.13_universal.app.tar.gz",
+      signature: "MAC_SIG",
+    }),
+    release({
+      id: "r3",
+      target: "darwin",
+      arch: "x86_64",
+      version: "0.2.13",
+      versionKey: toSortKey("0.2.13"),
+      url: "https://cdn/WeLockIn_0.2.13_universal.app.tar.gz",
+      signature: "MAC_SIG",
+    }),
+  ]);
+
+  const res = await request(app).get("/api/updates/darwin/x86_64/stable/0.2.12");
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.version, "0.2.13");
+  assert.equal(res.body.signature, "MAC_SIG");
+  assert.ok(res.body.url.endsWith(".app.tar.gz"));
 });
 
 test("a platform nobody supports is refused without touching the database", async (t) => {
@@ -363,11 +398,56 @@ test("a Mac download 404s while no macOS release is published", async (t) => {
 
 test("a misspelled platform is a 400, not a .exe", async (t) => {
   fakeReleases(t, [release()]);
-  for (const q of ["?target=macos&arch=aarch64", "?target=darwin&arch=x86_64", "?target=linux&arch=x86_64"]) {
+  for (const q of ["?target=macos&arch=aarch64", "?target=windows&arch=aarch64", "?target=linux&arch=x86_64"]) {
     const res = await request(app).get(`/api/updates/download${q}`);
     assert.equal(res.status, 400, q);
     assert.match(String(res.body.error), /darwin\/aarch64/);
   }
+});
+
+/**
+ * `?target=darwin` with no arch resolves through askedFor()'s x86_64 default.
+ * Before the universal build that pair was unsupported, so this exact query
+ * was a 400; now it is valid, and with both rows carrying the same universal
+ * DMG the answer is right whichever row serves it. Pinned so the widened list
+ * changing this stays a decision, not an accident.
+ */
+test("a bare ?target=darwin resolves through the x86_64 row", async (t) => {
+  fakeReleases(t, [
+    release({
+      id: "r3",
+      target: "darwin",
+      arch: "x86_64",
+      version: "0.2.13",
+      versionKey: toSortKey("0.2.13"),
+      url: "https://cdn/WeLockIn_0.2.13_universal.app.tar.gz",
+      installerUrl: "https://cdn/WeLockIn_0.2.13_universal.dmg",
+    }),
+  ]);
+
+  const res = await request(app).get("/api/updates/download?target=darwin");
+
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.location.endsWith("universal.dmg"), res.headers.location);
+});
+
+test("an Intel Mac's download resolves through its own row to the dmg", async (t) => {
+  fakeReleases(t, [
+    release({
+      id: "r3",
+      target: "darwin",
+      arch: "x86_64",
+      version: "0.2.13",
+      versionKey: toSortKey("0.2.13"),
+      url: "https://cdn/WeLockIn_0.2.13_universal.app.tar.gz",
+      installerUrl: "https://cdn/WeLockIn_0.2.13_universal.dmg",
+    }),
+  ]);
+
+  const res = await request(app).get("/api/updates/download?target=darwin&arch=x86_64");
+
+  assert.equal(res.status, 302);
+  assert.ok(res.headers.location.endsWith(".dmg"), res.headers.location);
 });
 
 /**

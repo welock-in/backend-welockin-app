@@ -39,8 +39,9 @@ function nothing(res: import("express").Response): void {
 // ONE ENTRY PER PLATFORM, not one entry total. A single slot was right while
 // there was a single platform; with two, a Windows request and a Mac request
 // evict each other on every alternation, so the cache would hold nothing on a
-// container serving both. Bounded by lib/update-targets — two rows today, and
-// it can only ever hold as many as there are supported pairs.
+// container serving both. Bounded by lib/update-targets — three pairs today
+// (the universal Mac build answers as two), and it can only ever hold as many
+// as there are supported pairs.
 const TTL_MS = 30_000;
 const cache = new Map<string, { at: number; row: Release | null }>();
 
@@ -117,11 +118,10 @@ updatesRouter.get(
     // Validate before touching the DB, so a crafted path can't cost us a query.
     //
     // Checked as a PAIR, against lib/update-targets. Testing the two fields
-    // independently would let `darwin/x86_64` through to the query, where it
-    // would find nothing today — but would quietly start serving the aarch64
-    // build the moment someone registered one under a looser arch. An Intel Mac
-    // that installs an Apple-silicon build does not fail to update, it fails to
-    // start.
+    // independently would let `windows/aarch64` through to the query — nothing
+    // there today, but the moment a row landed under a loosely-written arch it
+    // would start being served to machines it was never built for. A
+    // wrong-architecture install does not fail to update, it fails to start.
     if (!isSupportedTarget(target, arch)) return nothing(res);
     if (!/^([0-9]|[1-9][0-9]|stable)$/.test(bucket)) return nothing(res);
     if (!isValid(version)) return nothing(res);

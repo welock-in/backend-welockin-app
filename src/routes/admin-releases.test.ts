@@ -109,18 +109,67 @@ test("the plausible typo is refused, not silently accepted", async (t) => {
   assert.equal(created.length, 0, "and nothing was written");
 });
 
-test("an unsupported architecture for a supported platform is refused", async (t) => {
+test("the Intel row registers now that the macOS build is universal", async (t) => {
   const created = stubCreate(t);
 
-  // The macOS build is Apple-silicon only; registering an Intel one would create
-  // a row the public route is built to refuse — better to say so here.
   const res = await request(app)
     .post("/api/admin/releases")
     .set(auth)
     .send({ ...VALID, target: "darwin", arch: "x86_64" });
 
+  assert.equal(res.status, 201);
+  assert.equal(created[0][0].data.target, "darwin");
+  assert.equal(created[0][0].data.arch, "x86_64");
+});
+
+test("an arch no build ever reports is still refused", async (t) => {
+  const created = stubCreate(t);
+
+  // Tauri's triple says `aarch64`; `arm64` is the macOS-native spelling a
+  // person might paste from `lipo -archs`. A row under it would sit in a
+  // draft, publish cleanly, and be requested by nothing, ever.
+  const res = await request(app)
+    .post("/api/admin/releases")
+    .set(auth)
+    .send({ ...VALID, target: "darwin", arch: "arm64" });
+
   assert.equal(res.status, 400);
   assert.equal(created.length, 0);
+});
+
+/**
+ * The exact shape the universal release runbook produces: one version, one
+ * artifact URL, TWO rows. If this ever starts failing, the Mac release
+ * pipeline's second registration will 400 after a 15-minute build and burn
+ * the version number.
+ */
+test("one universal version registers under both darwin arches", async (t) => {
+  const rows: any[] = [];
+  stubMethod(t, prisma.release as any, "findFirst", async (args: any) => {
+    const w = args.where;
+    return (
+      rows.find(
+        (r) =>
+          r.channel === w.channel &&
+          r.target === w.target &&
+          r.arch === w.arch &&
+          r.version === w.version,
+      ) ?? null
+    );
+  });
+  const created = stubMethod(t, prisma.release as any, "create", async (a: any) => {
+    rows.push(a.data);
+    return { id: `r${rows.length}`, ...a.data };
+  });
+
+  for (const arch of ["aarch64", "x86_64"]) {
+    const res = await request(app)
+      .post("/api/admin/releases")
+      .set(auth)
+      .send({ ...VALID, target: "darwin", arch });
+    assert.equal(res.status, 201, arch);
+  }
+  assert.equal(created.length, 2, "two rows, one universal artifact");
 });
 
 test("mixing one platform's arch with another's is refused", async (t) => {
@@ -176,4 +225,77 @@ test("registering a release requires an admin token", async (t) => {
   const res = await request(app).post("/api/admin/releases").send(VALID);
   assert.ok(res.status === 401 || res.status === 403, `got ${res.status}`);
   assert.equal(created.length, 0);
+});
+
+/* ── lifecycle actions name the darwin sibling they did not touch ────────── */
+
+/**
+ * The universal build is one release as two rows, but pause/rollout/rollback
+ * act on one id. The half-done state is silent from the outside — the
+ * forgotten fleet's checks just answer as usual — so the response itself must
+ * carry the reminder. These pin that it does, and that Windows never pays for
+ * a sibling lookup it cannot have.
+ */
+const darwinRow = (arch: string, over: Record<string, unknown> = {}) => ({
+  id: `row-${arch}`,
+  channel: "stable",
+  target: "darwin",
+  arch,
+  version: "0.2.13",
+  status: "live",
+  rolloutPercent: 100,
+  ...over,
+});
+
+test("pausing one darwin row warns about the sibling it did not touch", async (t) => {
+  stubMethod(t, prisma.release as any, "findUnique", async () => darwinRow("aarch64"));
+  stubMethod(t, prisma.release as any, "findFirst", async (args: any) =>
+    args.where.arch === "x86_64" ? darwinRow("x86_64") : null,
+  );
+  stubMethod(t, prisma.release as any, "update", async (a: any) => ({
+    ...darwinRow("aarch64"),
+    ...a.data,
+  }));
+
+  const res = await request(app).post("/api/admin/releases/row-aarch64/pause").set(auth);
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.status, "paused");
+  assert.match(String(res.body.siblingWarning), /darwin\/x86_64/);
+  assert.match(String(res.body.siblingWarning), /NOT touched/);
+});
+
+test("a darwin row with no registered sibling says the fleet is missing", async (t) => {
+  stubMethod(t, prisma.release as any, "findUnique", async () => darwinRow("x86_64"));
+  stubMethod(t, prisma.release as any, "findFirst", async () => null);
+  stubMethod(t, prisma.release as any, "update", async (a: any) => ({
+    ...darwinRow("x86_64"),
+    ...a.data,
+  }));
+
+  const res = await request(app).post("/api/admin/releases/row-x86_64/pause").set(auth);
+
+  assert.equal(res.status, 200);
+  assert.match(String(res.body.siblingWarning), /no darwin\/aarch64 row exists/);
+});
+
+test("a Windows row's lifecycle carries no sibling warning", async (t) => {
+  const winRow = {
+    id: "w1",
+    channel: "stable",
+    target: "windows",
+    arch: "x86_64",
+    version: "0.3.34",
+    status: "live",
+    rolloutPercent: 100,
+  };
+  stubMethod(t, prisma.release as any, "findUnique", async () => winRow);
+  const lookups = stubMethod(t, prisma.release as any, "findFirst", async () => null);
+  stubMethod(t, prisma.release as any, "update", async (a: any) => ({ ...winRow, ...a.data }));
+
+  const res = await request(app).post("/api/admin/releases/w1/pause").set(auth);
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.siblingWarning, undefined);
+  assert.equal(lookups.length, 0, "windows never pays the sibling lookup");
 });

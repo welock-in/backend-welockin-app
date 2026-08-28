@@ -83,6 +83,53 @@ function offsetFor(version: string): number {
   return Math.abs(h) % 100;
 }
 
+/**
+ * The universal macOS build is ONE release as TWO rows (darwin/aarch64 +
+ * darwin/x86_64, same artifact — see lib/update-targets), but the lifecycle
+ * endpoints below act on one row by id. So every emergency gesture on a darwin
+ * row — pause, ramp, rollback — is HALF an action until its sibling gets the
+ * same call, and the half-done state is invisible: the forgotten fleet just
+ * keeps being offered (or denied) the build, which reads as "up to date".
+ *
+ * Auto-coupling the rows here would guess intent wrong (a sibling may be a
+ * draft, or deliberately staged), so instead every lifecycle response for a
+ * darwin row names the row that did NOT move. The caller sees the warning in
+ * the same terminal that issued the curl; ignoring it is now a choice.
+ */
+async function darwinSiblingWarning(rel: {
+  channel: string;
+  target: string;
+  arch: string;
+  version: string;
+}): Promise<string | null> {
+  if (rel.target !== "darwin") return null;
+  const otherArch = rel.arch === "aarch64" ? "x86_64" : "aarch64";
+  const sibling = await prisma.release.findFirst({
+    where: { channel: rel.channel, target: "darwin", arch: otherArch, version: rel.version },
+  });
+  if (!sibling) {
+    return (
+      `no darwin/${otherArch} row exists for ${rel.version} — if this version shipped ` +
+      `universal, that fleet was never registered (release.mjs --publish-only registers it)`
+    );
+  }
+  return (
+    `sibling darwin/${otherArch} row ${sibling.id} is ${sibling.status} at ` +
+    `${sibling.rolloutPercent}% and was NOT touched by this call — the universal build ` +
+    `is one release as two rows; apply the same action there too`
+  );
+}
+
+/** res.json(row), plus the sibling warning when there is one to give. */
+async function jsonWithSiblingWarning(
+  res: import("express").Response,
+  rel: { channel: string; target: string; arch: string; version: string },
+  body: Record<string, unknown>,
+): Promise<void> {
+  const siblingWarning = await darwinSiblingWarning(rel);
+  res.json(siblingWarning ? { ...body, siblingWarning } : body);
+}
+
 /** GET / — every release, newest first. */
 adminReleasesRouter.get(
   "/",
@@ -154,7 +201,7 @@ adminReleasesRouter.post(
       data: { status: "live", rolloutPercent, publishedAt: new Date(), pausedAt: null },
     });
     invalidateReleaseCache();
-    res.json(updated);
+    await jsonWithSiblingWarning(res, updated, updated);
   }),
 );
 
@@ -172,7 +219,7 @@ adminReleasesRouter.patch(
       data: { rolloutPercent },
     });
     invalidateReleaseCache();
-    res.json(updated);
+    await jsonWithSiblingWarning(res, updated, updated);
   }),
 );
 
@@ -195,7 +242,10 @@ adminReleasesRouter.post(
       data: { status: "paused", pausedAt: new Date() },
     });
     invalidateReleaseCache();
-    res.json(updated);
+    // The one place the warning matters most: "pause the Mac release" pausing
+    // only the aarch64 row LOOKS complete (the website alias resolves through
+    // that row and starts 404ing) while Intel keeps being offered the build.
+    await jsonWithSiblingWarning(res, updated, updated);
   }),
 );
 
@@ -211,7 +261,7 @@ adminReleasesRouter.post(
       data: { status: "live", pausedAt: null },
     });
     invalidateReleaseCache();
-    res.json(updated);
+    await jsonWithSiblingWarning(res, updated, updated);
   }),
 );
 
@@ -245,7 +295,7 @@ adminReleasesRouter.post(
       });
     }
     invalidateReleaseCache();
-    res.json({ rolledBack: rel.version, promoted });
+    await jsonWithSiblingWarning(res, rel, { rolledBack: rel.version, promoted });
   }),
 );
 

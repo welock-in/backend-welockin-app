@@ -27,6 +27,11 @@
  * updater path — an updater asking for `macos` is a client with a wrong build
  * triple and must be told so. Here it is the ONLY spelling, because here it is
  * a person typing a URL, not a machine reporting what it is.
+ *
+ * `macos` resolves through the darwin/aarch64 ROW. That is fine precisely
+ * because the two darwin rows carry the same universal artifacts — but it means
+ * the website's Mac button lives and dies with the aarch64 row's status. One
+ * more reason the two rows move in lockstep (see UPDATE_TARGETS below).
  */
 export const DOWNLOAD_ALIASES: Record<string, { target: string; arch: string }> = {
   windows: { target: "windows", arch: "x86_64" },
@@ -36,15 +41,22 @@ export const DOWNLOAD_ALIASES: Record<string, { target: string; arch: string }> 
 export const UPDATE_TARGETS = [
   { target: "windows", arch: "x86_64" },
   /**
-   * The macOS build is Apple-silicon only.
+   * The macOS build is UNIVERSAL — one artifact carrying both CPUs. It was
+   * Apple-silicon only until 0.2.12, and `darwin/x86_64` was deliberately
+   * absent then so an Intel Mac could never be handed a build that installs
+   * and fails to launch.
    *
-   * `darwin/x86_64` is deliberately ABSENT rather than merely unbuilt. An Intel
-   * Mac asking for an update must be told there is nothing — if it were ever
-   * handed the aarch64 build it would download it, verify its signature happily,
-   * install it, and then fail to launch. A missing update is a machine that
-   * keeps working; a wrong-architecture update is a machine that does not.
+   * A universal binary reports the arch of the slice it is RUNNING — aarch64
+   * on Apple silicon, x86_64 on Intel — so ONE macOS release is TWO rows here,
+   * and both must point at the SAME universal `.app.tar.gz` and `.dmg`.
+   * Nothing downstream enforces that pairing: registering or publishing only
+   * one row silently strands the other CPU's fleet (its checks answer 204
+   * forever), and pointing the rows at different files splits the fleet across
+   * builds. The macos repo's release.mjs and publish.mjs handle both rows in
+   * one run — ship, ramp, pause and roll back the two together, always.
    */
   { target: "darwin", arch: "aarch64" },
+  { target: "darwin", arch: "x86_64" },
 ] as const;
 
 export type UpdateTarget = (typeof UPDATE_TARGETS)[number];
@@ -54,7 +66,7 @@ export function isSupportedTarget(target: string, arch: string): boolean {
   return UPDATE_TARGETS.some((t) => t.target === target && t.arch === arch);
 }
 
-/** "windows/x86_64, darwin/aarch64" — for error messages a human has to act on. */
+/** "windows/x86_64, darwin/aarch64, darwin/x86_64" — for error messages a human has to act on. */
 export function supportedTargetList(): string {
   return UPDATE_TARGETS.map((t) => `${t.target}/${t.arch}`).join(", ");
 }

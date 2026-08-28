@@ -1458,3 +1458,87 @@ model ReferralHit {
   @@unique([source, day])
   @@index([source])
 }
+
+/// One walk through the desktop signup funnel, on one machine — from the
+/// "Click to continue" click to wherever it stopped.
+///
+/// ONE DOCUMENT PER RUN, not a row per event. The client re-sends the WHOLE
+/// step log on every transition and the route replaces the document, so a lost
+/// packet, a retry or an out-of-order delivery can never corrupt the record —
+/// the newest complete picture wins (guarded by `eventCount`, see the route).
+/// A run has at most ~14 steps, so the document stays small by construction.
+///
+/// The writer is PUBLIC by necessity: most of the funnel happens BEFORE the
+/// account exists — that is the very thing being measured. What bounds it is
+/// the shape caps in the route (step-name length, step-count ceiling, write
+/// rate per run), not auth. Like ReferralHit, it is a product signal, not an
+/// audited figure; nothing in the product is gated on it.
+model FunnelRun {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  /// The client's onboarding submission id — minted by the app when the run
+  /// begins and reused for every packet of the same run, which is what makes
+  /// this collection idempotent. Also the join key to OnboardingProfile
+  /// (`clientSubmissionId`) once the run turns into an account.
+  runId String @unique
+
+  /// "windows" | "macos" — checked against an allow-list before write.
+  platform String
+
+  /// The install's stable id (win-<guid> / mac-<uuid>), pre-account.
+  deviceId String?
+
+  /// The machine's human name (COMPUTERNAME / scutil ComputerName) — what the
+  /// admin console shows on the card. First-party operational data, same as
+  /// the `deviceName` the session heartbeat already reports.
+  deviceName String?
+
+  osVersion     String?
+  appVersion    String?
+  funnelVersion String?
+  locale        String?
+
+  /// Whether this walk includes the account/verify screens (signup path).
+  withAccount Boolean?
+
+  /// How many screens THIS run's walk has — the funnel is variable-length
+  /// (university is student-only, account/verify signup-only).
+  screenTotal Int?
+
+  /// The instant the intro CTA was clicked — the run's t0.
+  startedAt DateTime
+
+  /// Set when the walk finished (the last screen was left). Null = still in
+  /// progress, or abandoned; the console tells those apart by lastSeenAt.
+  completedAt DateTime?
+
+  /// The step the user was last seen on — the drop-off point of an
+  /// abandoned run, or the final screen of a completed one.
+  lastStep String?
+
+  /// The client's per-run packet sequence number — bumped on every mutation of
+  /// its log and persisted with it. THE ordering guard: the route only replaces
+  /// the document when the incoming seq is not behind this one, so a delayed
+  /// earlier packet can never roll a run backwards. Log LENGTH cannot do that
+  /// job alone: the completion packet does not grow the log, so equal-length
+  /// packets with different content exist and must still be ordered.
+  seq Int @default(0)
+
+  /// How many step entries the stored log holds. Display data, not a guard.
+  eventCount Int @default(0)
+
+  /// The ordered step log: [{ step, enteredAt, leftAt, ms }]. `ms` is the
+  /// client's own dwell measurement; enteredAt/leftAt are ISO instants.
+  steps Json
+
+  /// The server clock at the last accepted packet — what "active right now"
+  /// and the retention window are measured against.
+  lastSeenAt DateTime
+
+  firstAt   DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([lastSeenAt])
+  @@index([platform, lastSeenAt])
+  @@map("funnel_runs")
+}

@@ -12,6 +12,7 @@ import { authEmailRouter } from "./routes/auth-email";
 import { authPrecheckRouter } from "./routes/auth-precheck";
 import { contactRouter } from "./routes/contact";
 import { referralsRouter, adminReferralsRouter } from "./routes/referrals";
+import { funnelRouter, adminFunnelRouter } from "./routes/funnel";
 import { meRouter } from "./routes/me";
 import { devicesRouter } from "./routes/devices";
 import { focusInvitesRouter } from "./routes/focus-invites";
@@ -106,6 +107,12 @@ export function createApp(): Express {
   // thing being measured. What bounds it is an allow-list of campaign names
   // and a write ceiling inside the route, not auth.
   app.use("/api/referrals", referralsRouter);
+  // Step-by-step signup-funnel telemetry from the desktop apps. PUBLIC for the
+  // same reason as /api/referrals: the funnel runs BEFORE the account exists,
+  // so a bearer token is the one thing its callers cannot supply. Bounded by a
+  // platform allow-list, hard shape caps and a per-run write ceiling inside
+  // the route, not by auth.
+  app.use("/api/funnel", funnelRouter);
   // Every router below is authenticated on EVERY route, so the guard can be
   // mounted here rather than threaded through each one. `requireAuth` runs again
   // inside them; that is a signature check with no database read, and paying it
@@ -159,6 +166,9 @@ export function createApp(): Express {
   // reaches it through the proxy it already has, which forwards that prefix
   // and nothing else.
   app.use("/api/admin/referrals", adminReferralsRouter);
+  // The read side of /api/funnel — under /api/admin so the console's proxy
+  // (which forwards that prefix and nothing else) can reach it.
+  app.use("/api/admin/funnel", adminFunnelRouter);
   app.use("/api/admin/notifications", adminNotificationsRouter);
   // Session-freshness only: the funnel pushes its answers immediately after
   // creating the account and BEFORE the code screen, so requiring verification

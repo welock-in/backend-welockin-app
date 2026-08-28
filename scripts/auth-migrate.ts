@@ -96,6 +96,14 @@ async function createIndexes(): Promise<void> {
       name: "ttl_windowStartedAt",
       expireAfterSeconds: 86_400,
     }),
+    // Funnel telemetry runs. The write endpoint is public (its callers have no
+    // account yet), so nothing but this bounds the collection's lifetime; 120
+    // days comfortably outlives the admin console's widest window (90 days).
+    buildIndex("funnel_runs", {
+      key: { lastSeenAt: 1 },
+      name: "ttl_lastSeenAt",
+      expireAfterSeconds: 120 * 86_400,
+    }),
   ]);
 
   const ok = results.filter(Boolean).length;

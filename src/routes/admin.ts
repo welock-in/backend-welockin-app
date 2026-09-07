@@ -17,6 +17,9 @@ import {
 import { signAdminToken } from "../lib/admin-jwt";
 import { RC_PROVIDER, deleteSubscriber } from "../lib/revenuecat";
 import { toPublicUser } from "../lib/user";
+import { hashPassword } from "../lib/password";
+import { MIN_AGE, ageBandFor } from "../lib/onboarding";
+import { deterministicObjectId } from "../lib/deterministic-id";
 import { notFound, unauthorized, badRequest, conflict, HttpError } from "../lib/http-error";
 import { clientIp, consumeRateLimit } from "../lib/rate-limit";
 import { readLemonSqueezyError } from "../lib/lemonsqueezy";
@@ -29,6 +32,7 @@ import {
   adminRevokeSchema,
   adminSetPlanSchema,
   GRANTING_PLAN_NAMES,
+  adminCreateUserSchema,
   adminTestSubscriptionCreateSchema,
   adminSubscriptionTimeSchema,
   adminSubscriptionTransitionSchema,
@@ -59,6 +63,13 @@ const GRANTING_PLANS = GRANTING_PLAN_NAMES;
  * silent revocation — see the check in POST /users/:id/plan.
  */
 const WITHDRAWING_PLANS = new Set(["free", "none", "expired", "revoked"]);
+
+/**
+ * The funnel tag on answers an OPERATOR typed rather than a user walked. The
+ * slugs are funnel-v2's, but no funnel produced them — same reasoning as
+ * scripts/grant-lifetime.ts, which writes this tag for the same rows.
+ */
+const OPERATOR_FUNNEL_VERSION = "operator_v2";
 
 export const adminRouter = Router();
 
@@ -156,6 +167,132 @@ adminRouter.get(
         sortDir,
       }),
     );
+  }),
+);
+
+/**
+ * Provision an account — password, verified address, funnel answers and grant.
+ *
+ * The console equivalent of `scripts/grant-lifetime.ts`, and for its reason:
+ * every half of this already has a door, and none of them can be used on
+ * somebody else's behalf. `POST /api/auth/register` mails a six-digit code to
+ * an address the operator cannot read; `POST /api/onboarding` is fifteen
+ * screens that would have to be answered AS them. This performs the same
+ * writes, in the same shapes, from one form.
+ *
+ * CREATE ONLY — an existing address is a 409, never an update. The script may
+ * upsert because an operator typed `--apply` after reading a dry run; a form
+ * cannot, because "create account" quietly overwriting a live account's
+ * password is how a mistyped address locks a real customer out of their own.
+ * Topping up an existing account is what `POST /users/:id/plan` is for.
+ */
+adminRouter.post(
+  "/users",
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const input = adminCreateUserSchema.parse(req.body);
+
+    // The gate runs on the DECLARED age and only the band survives it — the
+    // exact integer never reaches the database (src/lib/onboarding.ts).
+    const ageBand = ageBandFor(input.age);
+    if (!ageBand) {
+      throw badRequest(`Age must be between ${MIN_AGE} and 99.`);
+    }
+
+    const existing = await prisma.user.findUnique({ where: { email: input.email } });
+    if (existing) {
+      throw conflict(
+        `${input.email} already has an account. Open it to change its plan instead of creating a second one.`,
+      );
+    }
+
+    const now = new Date();
+    const plan = input.plan.toLowerCase();
+    const until = input.until ?? null;
+    const passwordHash = await hashPassword(input.password);
+
+    // The comp is written in the EXACT shape POST /users/:id/plan writes it,
+    // reason prefix included: two operators who granted the same thing by
+    // different doors must leave rows support can read the same way.
+    const user = await prisma.user.create({
+      data: {
+        email: input.email,
+        passwordHash,
+        // The create-time legacy default, exactly as registration writes it; it
+        // lasts until the first resolve overwrites it with the real status.
+        plan: "trial",
+        // The whole point of this door: no six-digit code to an inbox the
+        // operator cannot read.
+        emailVerified: true,
+        emailVerifiedAt: now,
+        compActive: true,
+        compReason: `set plan ${input.plan}: ${input.reason}`,
+        compedUntil: until,
+        compedAt: now,
+      },
+    });
+
+    // NO trialEndsAt and no TrialClaim — registration stopped stamping a window
+    // on the ACCOUNT on purpose (a trial belongs to a machine now), and a grant
+    // has nothing to count down to anyway.
+
+    // Deterministic id keyed on userId alone, matching POST /api/onboarding, so
+    // a row written here and a row written by the app are the same row.
+    const profile = await prisma.onboardingProfile.create({
+      data: {
+        id: deterministicObjectId("onboarding", user.id),
+        userId: user.id,
+        // No funnel produced these — an operator typed them on someone's
+        // behalf. Writing a real funnel tag would make the audit anchor claim a
+        // screen was shown that never was. Nothing in src/ branches on it.
+        funnelVersion: OPERATOR_FUNNEL_VERSION,
+        clientSubmissionId: `operator-${deterministicObjectId("operator-create", input.email)}`,
+        ageBand,
+        selfReportedDailyHours: input.hours,
+        ...(input.name !== undefined ? { displayName: input.name } : {}),
+        ...(input.university !== undefined ? { university: input.university } : {}),
+        completedAt: now,
+        revision: 1,
+        distractingAppSlugs: [],
+      },
+    });
+
+    // The same two-field mirror `mirrorToUser` writes, for the same reason:
+    // GET /api/me answers "resume the funnel or not" from one response with no
+    // join. Nothing else in the backend repairs this if it is skipped.
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        onboardingCompletedAt: profile.completedAt,
+        ...(profile.displayName ? { displayName: profile.displayName } : {}),
+      },
+    });
+
+    // Report what the RESOLVER says rather than what was intended — the two
+    // disagreeing is exactly the bug a provisioning door should surface. No
+    // device id: a server-side recompute for the console, not a client asking
+    // whether IT may run.
+    const view = await resolveAndCache(user.id, "");
+    const created = await prisma.user.findUniqueOrThrow({ where: { id: user.id } });
+
+    await audit(
+      req,
+      "create_user",
+      user.id,
+      input.reason,
+      { existed: false },
+      {
+        email: input.email,
+        plan,
+        compActive: true,
+        compedUntil: until,
+        permanent: until == null,
+        resolved: view.status,
+      },
+      { emailVerified: true, onboardingWritten: true, ageBand, hours: input.hours },
+    );
+
+    res.status(201).json({ user: toPublicUser(created), entitlement: view });
   }),
 );
 

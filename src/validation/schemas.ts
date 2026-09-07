@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_DAILY_HOURS } from "../lib/onboarding";
 
 /**
  * The password rule, defined once.
@@ -603,6 +604,98 @@ export const onboardingSubmitSchema = z.object({
  * mistake — which is exactly what you are trying to tell apart when you go
  * looking six months on.
  */
+
+/**
+ * Provision an account from the console — the same three writes
+ * `scripts/grant-lifetime.ts` chains from a shell, for someone who is not
+ * holding the phone.
+ *
+ * Registration mails a six-digit code to an address the operator cannot read,
+ * and the funnel is fifteen screens that would have to be answered AS them, so
+ * neither door can be used on their behalf. This one writes the account with
+ * the address already verified, the funnel answers already stored, and the
+ * grant already applied.
+ *
+ * Reused rules, never re-stated: `registerSchema.shape.email` normalises the
+ * address exactly as the front door does (trim + lowercase), so a provisioned
+ * account can never differ from a registered one on casing; the password is
+ * held to the same minimum, so an account made here is not reachable by one
+ * the front door would refuse.
+ */
+export const adminCreateUserSchema = z
+  .object({
+    email: registerSchema.shape.email,
+    password: registerSchema.shape.password,
+    /** The name they asked to be called. Mirrored onto the User, like the funnel's. */
+    name: z.string().trim().min(1).max(80).optional(),
+    /**
+     * The DECLARED age. Only the derived band is ever stored (data
+     * minimisation, src/lib/onboarding.ts) — the integer stops at the route.
+     */
+    age: z.number().int("Age must be a whole number"),
+    university: z.string().trim().min(1).max(120).optional(),
+    /** Self-reported screen hours/day, the gauge's range. */
+    hours: z.number().int("Hours must be a whole number").min(0).max(MAX_DAILY_HOURS),
+    /** Granting plans only: this door creates accounts, it does not withdraw. */
+    plan: z.string().trim().min(1),
+    until: dateInput.nullish(),
+    reason: adminReason,
+    /**
+     * The ceremony for a grant with NO END DATE. `POST /users/:id/plan` asks for
+     * the target's id to be typed back; that id does not exist yet here, so the
+     * console asks for this instead — the same idea, which is that a permanent
+     * grant must be stated rather than fallen into.
+     */
+    confirmPermanent: z.boolean().optional(),
+  })
+  .superRefine((value, ctx) => {
+    const plan = value.plan.toLowerCase();
+    if (!GRANTING_PLAN_NAMES.has(plan)) {
+      ctx.addIssue({
+        path: ["plan"],
+        code: z.ZodIssueCode.custom,
+        message: `Grant one of: ${[...GRANTING_PLAN_NAMES].join(", ")}.`,
+      });
+      return;
+    }
+
+    if (plan === PERMANENT_PLAN) {
+      if (value.until == null && value.confirmPermanent !== true) {
+        ctx.addIssue({
+          path: ["confirmPermanent"],
+          code: z.ZodIssueCode.custom,
+          message: "A lifetime grant with no end date must be confirmed.",
+        });
+      }
+      if (value.until != null && value.until.getTime() <= Date.now()) {
+        ctx.addIssue({
+          path: ["until"],
+          code: z.ZodIssueCode.custom,
+          message: "That end date is already in the past.",
+        });
+      }
+      return;
+    }
+
+    // Same rule as adminSetPlanSchema: every other granting plan is time-boxed,
+    // because a permanent grant nobody decided on is what an omitted field
+    // quietly produces.
+    if (value.until == null) {
+      ctx.addIssue({
+        path: ["until"],
+        code: z.ZodIssueCode.custom,
+        message: `A ${value.plan} grant needs an end date.`,
+      });
+      return;
+    }
+    if (value.until.getTime() <= Date.now()) {
+      ctx.addIssue({
+        path: ["until"],
+        code: z.ZodIssueCode.custom,
+        message: "That end date is already in the past.",
+      });
+    }
+  });
 
 export const adminCompSchema = z.object({
   reason: adminReason,

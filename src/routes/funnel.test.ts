@@ -5,7 +5,7 @@ import { createApp } from "../app";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { signAdminToken } from "../lib/admin-jwt";
-import { FUNNEL_ACTIVE_WINDOW_MS, summarise } from "./funnel";
+import { FUNNEL_ACTIVE_WINDOW_MS, attachAccounts, summarise } from "./funnel";
 
 /*
  * The signup-funnel step log.
@@ -265,10 +265,22 @@ test("the console read is admin-gated", async () => {
   assert.equal(res.status, 401);
 });
 
+/** The three reads the account join makes, all empty unless a test says
+ *  otherwise. Without these the route would reach a real database. */
+function stubAccountLookups(
+  t: Ctx,
+  rows: { profiles?: any[]; devices?: any[]; users?: any[] } = {},
+) {
+  stubMethod(t, prisma.onboardingProfile as any, "findMany", async () => rows.profiles ?? []);
+  stubMethod(t, prisma.device as any, "findMany", async () => rows.devices ?? []);
+  stubMethod(t, prisma.user as any, "findMany", async () => rows.users ?? []);
+}
+
 test("the console gets runs, summary and the walk order back", async (t) => {
   stubMethod(t, prisma.funnelRun as any, "findMany", async () => [
     storedRun({ completedAt: new Date("2026-08-28T11:06:00.000Z") }),
   ]);
+  stubAccountLookups(t);
 
   const res = await request(app).get("/api/admin/funnel").set(auth);
 
@@ -280,16 +292,180 @@ test("the console gets runs, summary and the walk order back", async (t) => {
   assert.ok(Array.isArray(res.body.stepOrder));
 });
 
+test("a run whose onboarding was submitted under its own id carries the email", async (t) => {
+  stubMethod(t, prisma.funnelRun as any, "findMany", async () => [storedRun()]);
+  stubAccountLookups(t, {
+    profiles: [{ userId: "u1", clientSubmissionId: RUN_ID, deviceId: "win-abc" }],
+    users: [{ id: "u1", email: "hedi@example.com", createdAt: new Date("2026-08-28T11:03:00.000Z") }],
+  });
+
+  const res = await request(app).get("/api/admin/funnel").set(auth);
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.runs[0].email, "hedi@example.com");
+  assert.equal(res.body.runs[0].userId, "u1");
+  assert.equal(res.body.runs[0].emailMatch, "run");
+});
+
+test("no account behind the walk leaves the email null rather than guessing", async (t) => {
+  stubMethod(t, prisma.funnelRun as any, "findMany", async () => [storedRun()]);
+  stubAccountLookups(t);
+
+  const res = await request(app).get("/api/admin/funnel").set(auth);
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.runs[0].email, null);
+  assert.equal(res.body.runs[0].emailMatch, null);
+});
+
 test("the platform filter and window clamp reach the query", async (t) => {
   const finds = stubMethod(t, prisma.funnelRun as any, "findMany", async () => []);
+  const profiles = stubMethod(t, prisma.onboardingProfile as any, "findMany", async () => []);
+  stubMethod(t, prisma.device as any, "findMany", async () => []);
+  stubMethod(t, prisma.user as any, "findMany", async () => []);
 
   const res = await request(app)
     .get("/api/admin/funnel?platform=macos&days=9999&take=9999")
     .set(auth);
 
   assert.equal(res.status, 200);
+  assert.equal(profiles.length, 0, "an empty page must not scan the onboarding answers");
   const args = finds[0][0];
   assert.equal(args.where.platform, "macos");
   assert.equal(args.take, 500);
   assert.equal(res.body.windowDays, 90);
+});
+
+// --- the account join --------------------------------------------------------
+
+/*
+ * Pure rules, tested without a database. This is where the feature can be
+ * quietly wrong: an email shown against the wrong walk is worse than no email,
+ * because it is one an actual message gets sent to.
+ */
+
+function dtoRun(overrides: Record<string, any> = {}) {
+  return summarise([storedRun(overrides)], NOW).runs[0];
+}
+
+function links(over: Partial<{
+  byRunId: [string, string][];
+  byDeviceId: [string, string[]][];
+  users: { id: string; email: string; createdAt: string }[];
+}> = {}) {
+  return {
+    byRunId: new Map(over.byRunId ?? []),
+    byDeviceId: new Map((over.byDeviceId ?? []).map(([d, ids]) => [d, new Set(ids)])),
+    users: new Map(
+      (over.users ?? []).map((u) => [u.id, { ...u, createdAt: new Date(u.createdAt) }]),
+    ),
+  };
+}
+
+test("the run's own submission id wins over anything else on the machine", () => {
+  const runs = [dtoRun()];
+  attachAccounts(
+    runs,
+    links({
+      byRunId: [[RUN_ID, "mine"]],
+      byDeviceId: [["win-abc", ["mine", "someone-else"]]],
+      users: [
+        { id: "mine", email: "mine@example.com", createdAt: "2026-08-28T11:02:00.000Z" },
+        { id: "someone-else", email: "other@example.com", createdAt: "2026-08-29T09:00:00.000Z" },
+      ],
+    }),
+  );
+
+  assert.equal(runs[0].email, "mine@example.com");
+  assert.equal(runs[0].emailMatch, "run");
+});
+
+test("an account born during the walk is this walk's, even with no submission link", () => {
+  // The onboarding POST never landed; only the registered device ties them.
+  const runs = [dtoRun()];
+  attachAccounts(
+    runs,
+    links({
+      byDeviceId: [["win-abc", ["u1"]]],
+      users: [{ id: "u1", email: "born@example.com", createdAt: "2026-08-28T11:04:00.000Z" }],
+    }),
+  );
+
+  assert.equal(runs[0].email, "born@example.com");
+  assert.equal(runs[0].emailMatch, "run", "created between startedAt and lastSeenAt");
+});
+
+test("an account older than the walk is shown, but flagged as a machine match", () => {
+  const runs = [dtoRun()];
+  attachAccounts(
+    runs,
+    links({
+      byDeviceId: [["win-abc", ["old"]]],
+      users: [{ id: "old", email: "old@example.com", createdAt: "2026-06-01T09:00:00.000Z" }],
+    }),
+  );
+
+  assert.equal(runs[0].email, "old@example.com");
+  assert.equal(
+    runs[0].emailMatch,
+    "device",
+    "a reinstall is not evidence this walk produced that account",
+  );
+});
+
+test("on a reused machine the newest account wins — that is who sits at it now", () => {
+  const runs = [dtoRun()];
+  attachAccounts(
+    runs,
+    links({
+      byDeviceId: [["win-abc", ["first", "second"]]],
+      users: [
+        { id: "first", email: "first@example.com", createdAt: "2026-01-05T09:00:00.000Z" },
+        { id: "second", email: "second@example.com", createdAt: "2026-07-20T09:00:00.000Z" },
+      ],
+    }),
+  );
+
+  assert.equal(runs[0].email, "second@example.com");
+  assert.equal(runs[0].emailMatch, "device");
+});
+
+test("a client clock running slightly fast still counts as born during the walk", () => {
+  // startedAt is the CLIENT's instant; createdAt is the server's. A machine a
+  // few minutes ahead must not lose its own signup to a clock skew.
+  const runs = [dtoRun()];
+  attachAccounts(
+    runs,
+    links({
+      byDeviceId: [["win-abc", ["u1"]]],
+      users: [{ id: "u1", email: "skew@example.com", createdAt: "2026-08-28T10:52:00.000Z" }],
+    }),
+  );
+
+  assert.equal(runs[0].emailMatch, "run");
+});
+
+test("a run with no device id and no submission link keeps a null email", () => {
+  const runs = [dtoRun({ deviceId: null })];
+  attachAccounts(
+    runs,
+    links({
+      byDeviceId: [["win-abc", ["u1"]]],
+      users: [{ id: "u1", email: "nope@example.com", createdAt: "2026-08-28T11:04:00.000Z" }],
+    }),
+  );
+
+  assert.equal(runs[0].email, null);
+  assert.equal(runs[0].userId, null);
+  assert.equal(runs[0].emailMatch, null);
+});
+
+test("a link pointing at a deleted account leaves the run without an email", () => {
+  // The user row is gone but the onboarding answers still name it: resolving to
+  // a dangling id must not crash the console, nor invent an address.
+  const runs = [dtoRun()];
+  attachAccounts(runs, links({ byRunId: [[RUN_ID, "ghost"]] }));
+
+  assert.equal(runs[0].email, null);
+  assert.equal(runs[0].emailMatch, null);
 });

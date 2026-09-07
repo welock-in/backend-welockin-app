@@ -246,6 +246,18 @@ export interface FunnelStepLog {
 
 export type FunnelRunStatus = "completed" | "active" | "abandoned";
 
+/**
+ * How confidently an account was tied to a run.
+ *
+ *  "run"    — this walk produced that account: the onboarding answers carry the
+ *             run's OWN id, or the account was minted while the run was live.
+ *  "device" — same machine, but an account older than the run (a reinstall, a
+ *             second walk on a shared desk). Still worth showing, but it is an
+ *             inference and the console says so rather than passing it off as
+ *             the person who just walked the funnel.
+ */
+export type FunnelEmailMatch = "run" | "device";
+
 export interface FunnelRunDto {
   runId: string;
   platform: string;
@@ -265,6 +277,10 @@ export interface FunnelRunDto {
   /** startedAt → completedAt for a finished run, startedAt → lastSeenAt for
    *  the rest — "how long they have been at it" either way. */
   durationMs: number;
+  /** The account behind the walk, once one exists — null while it does not. */
+  userId: string | null;
+  email: string | null;
+  emailMatch: FunnelEmailMatch | null;
   steps: FunnelStepLog[];
 }
 
@@ -356,6 +372,12 @@ export function summarise(rows: StoredRun[], now: Date = new Date()): Omit<Funne
       lastStep: run.lastStep,
       status,
       durationMs: Math.max(0, end.getTime() - run.startedAt.getTime()),
+      // Left empty here on purpose: `summarise` stays a pure fold over the
+      // stored rows, and the account join is a separate, database-touching
+      // pass (`attachAccounts`) so both halves stay testable on their own.
+      userId: null,
+      email: null,
+      emailMatch: null,
       steps: stepLogs(run.steps),
     };
   });
@@ -424,6 +446,162 @@ export function summarise(rows: StoredRun[], now: Date = new Date()): Omit<Funne
   };
 }
 
+// --- who is behind the walk --------------------------------------------------
+
+/**
+ * The point of this join: the console is where a signup is CHASED, and chasing
+ * needs an address. Without it every promising run costs a trip to the users
+ * page and a guess about which account the machine turned into.
+ *
+ * It is resolved SERVER-SIDE from what is already stored rather than added to
+ * the tracking packet, for two reasons. The desktop clients would each need a
+ * release, and — more to the point — the packet is public and unauthenticated:
+ * an address posted there is an address anyone can post about anyone. Read back
+ * from the account tables, an email is only ever one the backend itself wrote.
+ * It also means the link works on runs already recorded, not just future ones.
+ */
+
+/** How far a client-reported `startedAt` may sit ahead of the server clock and
+ *  still count as "the account was made during this walk". Small: the wider
+ *  this is, the more an unrelated earlier account can pass for this run's. */
+const SIGNUP_CLOCK_SLACK_MS = 15 * 60 * 1000;
+
+/** How long AFTER a run's last packet an account may still be born of it. The
+ *  walk goes quiet the moment the account screen submits, and the row lands a
+ *  moment later. */
+const SIGNUP_TAIL_MS = 30 * 60 * 1000;
+
+type LinkedUser = { id: string; email: string; createdAt: Date };
+
+export interface FunnelAccountLinks {
+  /** runId -> userId. The exact link: the onboarding answers were submitted
+   *  under this very run's id. */
+  byRunId: Map<string, string>;
+  /** deviceId -> every account ever seen on that machine. A set, because a
+   *  reinstall or a shared desk puts several there. */
+  byDeviceId: Map<string, Set<string>>;
+  users: Map<string, LinkedUser>;
+}
+
+/**
+ * Fill in `userId` / `email` / `emailMatch` on runs that have an account behind
+ * them. Pure, and exported for the tests — the confidence rule below is the
+ * only part of this feature that can be quietly wrong.
+ */
+export function attachAccounts(runs: FunnelRunDto[], links: FunnelAccountLinks): void {
+  for (const run of runs) {
+    const set = (user: LinkedUser, match: FunnelEmailMatch) => {
+      run.userId = user.id;
+      run.email = user.email;
+      run.emailMatch = match;
+    };
+
+    // 1. The run's own submission id. Nothing to weigh: these are the same walk.
+    const exact = links.byRunId.get(run.runId);
+    const exactUser = exact ? links.users.get(exact) : undefined;
+    if (exactUser) {
+      set(exactUser, "run");
+      continue;
+    }
+
+    const candidates = (run.deviceId ? [...(links.byDeviceId.get(run.deviceId) ?? [])] : [])
+      .map((id) => links.users.get(id))
+      .filter((u): u is LinkedUser => u !== undefined);
+    if (candidates.length === 0) continue;
+
+    // 2. Born during the walk. `startedAt` is the CLIENT's clock and the other
+    //    two instants are the server's, hence the slack on the lower bound.
+    const from = new Date(run.startedAt).getTime() - SIGNUP_CLOCK_SLACK_MS;
+    const until = new Date(run.lastSeenAt).getTime() + SIGNUP_TAIL_MS;
+    const during = candidates
+      .filter((u) => {
+        const t = u.createdAt.getTime();
+        return t >= from && t <= until;
+      })
+      // Earliest: the account the walk reached the account screen with, not one
+      // made afterwards in a second sitting.
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    if (during.length > 0) {
+      set(during[0], "run");
+      continue;
+    }
+
+    // 3. Same machine, older account. Shown because it is almost always the
+    //    person sitting at it — and flagged, because "almost always" is not
+    //    something an email should be sent on without knowing. The newest
+    //    account wins: on a machine handed over, that is its current owner.
+    const newest = [...candidates].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
+    set(newest, "device");
+  }
+}
+
+/**
+ * Gather the account links for one page of runs. Three reads, none of them
+ * per-run: the console polls this every ten seconds.
+ */
+async function loadAccountLinks(runs: FunnelRunDto[]): Promise<FunnelAccountLinks> {
+  const runIds = new Set(runs.map((r) => r.runId));
+  const deviceIds = [...new Set(runs.map((r) => r.deviceId).filter((d): d is string => Boolean(d)))];
+
+  const byRunId = new Map<string, string>();
+  const byDeviceId = new Map<string, Set<string>>();
+  const users = new Map<string, LinkedUser>();
+  const seenOnDevice = (deviceId: string, userId: string) => {
+    const set = byDeviceId.get(deviceId) ?? new Set<string>();
+    set.add(userId);
+    byDeviceId.set(deviceId, set);
+  };
+  if (runIds.size === 0) return { byRunId, byDeviceId, users };
+
+  // One pass over the onboarding answers serves BOTH links — the same row
+  // carries the submission id and the pre-registration deviceId. Neither column
+  // is indexed (see the model: `clientSubmissionId` is deliberately not, and a
+  // MongoDB index here would have to be created by hand on the live cluster);
+  // this is a small collection behind an admin-only read, so the scan is the
+  // cheaper side of that trade.
+  const profiles = await prisma.onboardingProfile.findMany({
+    where: {
+      OR: [
+        { clientSubmissionId: { in: [...runIds] } },
+        ...(deviceIds.length > 0 ? [{ deviceId: { in: deviceIds } }] : []),
+      ],
+    },
+    select: { userId: true, clientSubmissionId: true, deviceId: true },
+  });
+  for (const p of profiles) {
+    // `clientSubmissionId` is rewritten when the answers are edited, so a row
+    // may match on the device alone — that is exactly why both links exist.
+    if (runIds.has(p.clientSubmissionId)) byRunId.set(p.clientSubmissionId, p.userId);
+    if (p.deviceId) seenOnDevice(p.deviceId, p.userId);
+  }
+
+  // Registered devices catch the walks whose answers never landed: the account
+  // exists, the onboarding POST failed or was abandoned. `deviceId` is indexed.
+  const devices =
+    deviceIds.length === 0
+      ? []
+      : await prisma.device.findMany({
+          where: { deviceId: { in: deviceIds } },
+          select: { userId: true, deviceId: true },
+        });
+  for (const d of devices) {
+    if (d.deviceId) seenOnDevice(d.deviceId, d.userId);
+  }
+
+  const userIds = [
+    ...new Set([...byRunId.values(), ...[...byDeviceId.values()].flatMap((set) => [...set])]),
+  ];
+  if (userIds.length > 0) {
+    const rows = await prisma.user.findMany({
+      where: { id: { in: userIds } },
+      select: { id: true, email: true, createdAt: true },
+    });
+    for (const u of rows) users.set(u.id, u);
+  }
+
+  return { byRunId, byDeviceId, users };
+}
+
 export const adminFunnelRouter = Router();
 
 adminFunnelRouter.get(
@@ -449,6 +627,9 @@ adminFunnelRouter.get(
       take,
     });
 
-    res.json({ ...summarise(rows, now), windowDays: days } satisfies FunnelResponse);
+    const result = summarise(rows, now);
+    attachAccounts(result.runs, await loadAccountLinks(result.runs));
+
+    res.json({ ...result, windowDays: days } satisfies FunnelResponse);
   }),
 );

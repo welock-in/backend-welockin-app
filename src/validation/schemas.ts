@@ -118,6 +118,33 @@ export const focusInviteCreateSchema = z.object({
   fromDeviceId: z.string().trim().min(1).max(128).optional(),
 });
 
+const friendFocusDisplayName = z.string().trim().min(1).max(40).optional();
+
+export const friendFocusCreateSchema = z.object({
+  name: z.string().trim().min(1).max(40).optional(),
+  durationMinutes: z.number().int().min(15).max(180),
+  hardLock: z.boolean(),
+  displayName: friendFocusDisplayName,
+});
+
+const friendFocusCode = z
+  .string()
+  .trim()
+  .toUpperCase()
+  .regex(/^[23456789A-HJ-NP-Z]{8}$/, "Invalid invite code");
+
+export const friendFocusJoinSchema = z.object({
+  code: friendFocusCode,
+  displayName: friendFocusDisplayName,
+  // The confirmation is deliberately tied to the previewed value. Joining a
+  // Hard Lock room is consent to Hard Lock, not an invitation to choose again.
+  acceptedHardLock: z.boolean(),
+});
+
+export const friendFocusReadySchema = z.object({
+  ready: z.boolean(),
+});
+
 export const createBreakSchema = z.object({
   breakLen: z.number().int().positive().max(240), // minutes
   clientBreakId: z.string().trim().min(1).max(64).optional(), // idempotency key

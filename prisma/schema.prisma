@@ -115,6 +115,8 @@ model User {
 
   devices            Device[]
   focusInvites       FocusInvite[]
+  friendFocusRooms   FriendFocusRoom[]   @relation("FriendFocusHost")
+  friendFocusMembers FriendFocusMember[]
   focusEvents        FocusEvent[]
   snapshot           SyncSnapshot?
   authProviders      AuthProvider[]
@@ -264,6 +266,47 @@ model FocusInvite {
   // Idempotent creation: re-posting the same session for the same target must
   // not stack invites.
   @@index([sessionId, toDeviceId])
+}
+
+// A deliberately small social focus room. The server owns the shared clock and
+// difficulty; every member keeps their actual Screen Time selection on-device.
+model FriendFocusRoom {
+  id         String @id @default(auto()) @map("_id") @db.ObjectId
+  inviteCode String @unique
+
+  hostUserId String @db.ObjectId
+  host       User   @relation("FriendFocusHost", fields: [hostUserId], references: [id], onDelete: Cascade)
+
+  name            String?
+  durationMinutes Int
+  hardLock        Boolean
+  status          String    @default("waiting") // "waiting" | "active" | "ended"
+  startsAt        DateTime?
+  endsAt          DateTime?
+  expiresAt       DateTime
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  members FriendFocusMember[]
+
+  @@index([hostUserId, status])
+  @@index([expiresAt])
+}
+
+model FriendFocusMember {
+  id     String          @id @default(auto()) @map("_id") @db.ObjectId
+  roomId String          @db.ObjectId
+  room   FriendFocusRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  userId String @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  displayName String
+  ready       Boolean  @default(false)
+  joinedAt    DateTime @default(now())
+
+  @@unique([roomId, userId])
+  @@index([userId, joinedAt])
 }
 
 model Break {

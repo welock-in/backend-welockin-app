@@ -16,6 +16,7 @@ import { funnelRouter, adminFunnelRouter } from "./routes/funnel";
 import { meRouter } from "./routes/me";
 import { devicesRouter } from "./routes/devices";
 import { focusInvitesRouter } from "./routes/focus-invites";
+import { friendFocusRouter } from "./routes/friend-focus";
 import { syncRouter } from "./routes/sync";
 import { focusEventsRouter } from "./routes/focus-events";
 import { analyticsRouter } from "./routes/analytics";
@@ -128,6 +129,7 @@ export function createApp(): Express {
   app.use("/api/devices", gated, devicesRouter);
   // Cross-device focus: invite the account's other devices to join a session.
   app.use("/api/focus-invites", gated, focusInvitesRouter);
+  app.use("/api/friend-focus", gated, friendFocusRouter);
   app.use("/api/sync", gated, syncRouter);
   app.use("/api/focus-events", gated, focusEventsRouter);
   app.use("/api/analytics", gated, analyticsRouter);

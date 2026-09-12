@@ -36,14 +36,21 @@ function stubMethod(
   return calls;
 }
 
-function member(userId: string, displayName: string, ready = false) {
+function member(
+  userId: string,
+  displayName: string,
+  ready = false,
+  overrides: Record<string, unknown> = {},
+) {
   return {
     id: userId === hostId ? "65f000000000000000000201" : "65f000000000000000000202",
     roomId: "65f000000000000000000101",
     userId,
     displayName,
+    attemptToken: `${userId}-attempt-token`,
     ready,
     joinedAt: new Date(),
+    ...overrides,
   };
 }
 
@@ -290,4 +297,77 @@ test("an active Hard Lock member cannot leave early", async (t) => {
 
   assert.equal(res.status, 409);
   assert.equal(deletes.length, 0);
+});
+
+test("a blocked-app attempt notifies every other active room member, never the actor", async (t) => {
+  const rooms = prisma.friendFocusRoom as unknown as Record<string, any>;
+  const pushTokens = prisma.pushToken as unknown as Record<string, any>;
+  const deliveries = prisma.notificationDelivery as unknown as Record<string, any>;
+  const actorToken = "actor-attempt-token-with-enough-entropy";
+
+  stubMethod(t, rooms, "findUnique", async () =>
+    room({
+      status: "active",
+      startsAt: new Date(Date.now() - 5 * 60_000),
+      endsAt: new Date(Date.now() + 45 * 60_000),
+      members: [
+        member(hostId, "Hedi", true, { attemptToken: actorToken }),
+        member(guestId, "Lina", true, { attemptToken: "guest-attempt-token-with-enough-entropy" }),
+      ],
+    }),
+  );
+  const tokenReads = stubMethod(t, pushTokens, "findMany", async () => [
+    { token: "ExponentPushToken[guest-device]", userId: guestId },
+  ]);
+  stubMethod(t, deliveries, "findMany", async () => []);
+  const deliveryWrites = stubMethod(t, deliveries, "createMany", async () => ({ count: 1 }));
+
+  const originalFetch = global.fetch;
+  const expoRequests: Array<{ url: string; init?: RequestInit }> = [];
+  global.fetch = async (url, init) => {
+    expoRequests.push({ url: String(url), init });
+    return new Response(JSON.stringify({ data: [{ status: "ok", id: "ticket-1" }] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  t.after(() => {
+    global.fetch = originalFetch;
+  });
+
+  const res = await request(app)
+    .post("/api/friend-focus/rooms/65f000000000000000000101/blocked-attempt")
+    .send({ attemptToken: actorToken });
+
+  assert.equal(res.status, 202);
+  assert.deepEqual(tokenReads[0][0].where, { valid: true, userId: { in: [guestId] } });
+  assert.equal(expoRequests.length, 1);
+  const messages = JSON.parse(String(expoRequests[0].init?.body));
+  assert.deepEqual(messages.map((message: { to: string }) => message.to), [
+    "ExponentPushToken[guest-device]",
+  ]);
+  assert.equal(messages[0].body, "Hedi a essayé d’ouvrir une app bloquée.");
+  assert.equal(deliveryWrites[0][0].data[0].userId, guestId);
+  assert.match(deliveryWrites[0][0].data[0].dedupeKey, /^friend-focus:blocked-attempt:/);
+});
+
+test("an invalid blocked-attempt token reveals no room and sends nothing", async (t) => {
+  const rooms = prisma.friendFocusRoom as unknown as Record<string, any>;
+  const pushTokens = prisma.pushToken as unknown as Record<string, any>;
+  stubMethod(t, rooms, "findUnique", async () =>
+    room({
+      status: "active",
+      startsAt: new Date(Date.now() - 5 * 60_000),
+      endsAt: new Date(Date.now() + 45 * 60_000),
+      members: [member(hostId, "Hedi", true, { attemptToken: "real-attempt-token-with-enough-entropy" })],
+    }),
+  );
+  const tokenReads = stubMethod(t, pushTokens, "findMany", async () => []);
+
+  const res = await request(app)
+    .post("/api/friend-focus/rooms/65f000000000000000000101/blocked-attempt")
+    .send({ attemptToken: "wrong-attempt-token-with-enough-entropy" });
+
+  assert.equal(res.status, 404);
+  assert.equal(tokenReads.length, 0);
 });

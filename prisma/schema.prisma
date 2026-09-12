@@ -302,6 +302,9 @@ model FriendFocusMember {
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   displayName String
+  // Opaque capability used only by the iOS Screen Time extensions to report a
+  // blocked-app attempt. It is returned solely to this member, never to peers.
+  attemptToken String?
   ready       Boolean  @default(false)
   joinedAt    DateTime @default(now())
 

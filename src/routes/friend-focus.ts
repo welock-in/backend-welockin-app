@@ -1,4 +1,4 @@
-import { randomInt } from "node:crypto";
+import { randomBytes, randomInt } from "node:crypto";
 import { Router } from "express";
 import type { FriendFocusMember, FriendFocusRoom } from "@prisma/client";
 import { prisma } from "../lib/prisma";
@@ -6,12 +6,15 @@ import { conflict, forbidden, notFound } from "../lib/http-error";
 import { asyncHandler } from "../middleware/async-handler";
 import { requireAuth } from "../middleware/auth";
 import {
+  friendFocusBlockedAttemptSchema,
   friendFocusCreateSchema,
   friendFocusJoinSchema,
   friendFocusReadySchema,
 } from "../validation/schemas";
+import { deliver } from "../services/notifications/deliver";
 
 export const friendFocusRouter = Router();
+export const friendFocusReportRouter = Router();
 
 const CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const ROOM_LIFETIME_MS = 24 * 60 * 60 * 1000;
@@ -19,6 +22,10 @@ const ROOM_CAPACITY = 4;
 
 function inviteCode(): string {
   return Array.from({ length: 8 }, () => CODE_ALPHABET[randomInt(CODE_ALPHABET.length)]).join("");
+}
+
+function attemptToken(): string {
+  return randomBytes(24).toString("base64url");
 }
 
 type RoomWithMembers = FriendFocusRoom & { members: FriendFocusMember[] };
@@ -46,7 +53,28 @@ function toPublicRoom(room: RoomWithMembers, userId: string) {
     me: {
       isHost: room.hostUserId === userId,
       ready: room.members.find((member) => member.userId === userId)?.ready ?? false,
+      attemptToken: room.members.find((member) => member.userId === userId)?.attemptToken ?? null,
     },
+  };
+}
+
+async function ensureMemberAttemptToken(
+  room: RoomWithMembers,
+  userId: string,
+): Promise<RoomWithMembers> {
+  const current = room.members.find((member) => member.userId === userId);
+  if (!current || current.attemptToken) return room;
+
+  const nextToken = attemptToken();
+  await prisma.friendFocusMember.update({
+    where: { roomId_userId: { roomId: room.id, userId } },
+    data: { attemptToken: nextToken },
+  });
+  return {
+    ...room,
+    members: room.members.map((member) =>
+      member.userId === userId ? { ...member, attemptToken: nextToken } : member,
+    ),
   };
 }
 
@@ -58,7 +86,7 @@ async function roomForMember(roomId: string, userId: string): Promise<RoomWithMe
   if (!room || !room.members.some((member) => member.userId === userId)) {
     throw notFound("Room not found");
   }
-  return room;
+  return ensureMemberAttemptToken(room, userId);
 }
 
 function isJoinable(room: RoomWithMembers | null): room is RoomWithMembers {
@@ -85,6 +113,7 @@ friendFocusRouter.post(
           create: {
             userId,
             displayName: input.displayName ?? "Host",
+            attemptToken: attemptToken(),
           },
         },
       },
@@ -223,6 +252,7 @@ friendFocusRouter.post(
           roomId: room.id,
           userId,
           displayName: input.displayName ?? "Friend",
+          attemptToken: attemptToken(),
         },
       });
     }
@@ -232,6 +262,58 @@ friendFocusRouter.post(
       include: { members: { orderBy: { joinedAt: "asc" } } },
     });
     if (!joined) throw notFound("Room not found");
-    res.json({ room: toPublicRoom(joined, userId) });
+    res.json({ room: toPublicRoom(await ensureMemberAttemptToken(joined, userId), userId) });
+  }),
+);
+
+// Public by design: Apple's Screen Time extension cannot read the app's JWT.
+// The high-entropy per-member token is a narrowly scoped capability: it can
+// only report an attempt while this exact room is active.
+friendFocusReportRouter.post(
+  "/rooms/:id/blocked-attempt",
+  asyncHandler(async (req, res) => {
+    if (!/^[0-9a-f]{24}$/i.test(req.params.id)) throw notFound("Room not found");
+    const input = friendFocusBlockedAttemptSchema.parse(req.body);
+    const room = await prisma.friendFocusRoom.findUnique({
+      where: { id: req.params.id },
+      include: { members: true },
+    });
+    const actor = room?.members.find((member) => member.attemptToken === input.attemptToken);
+    if (!room || !actor) throw notFound("Room not found");
+
+    const isActive =
+      room.status === "active" && room.endsAt != null && room.endsAt.getTime() > Date.now();
+    if (!isActive) {
+      res.status(202).json({ accepted: false, notified: 0 });
+      return;
+    }
+
+    const recipientIds = room.members
+      .filter((member) => member.userId !== actor.userId)
+      .map((member) => member.userId);
+    const targets = recipientIds.length
+      ? await prisma.pushToken.findMany({
+          where: { valid: true, userId: { in: recipientIds } },
+          select: { token: true, userId: true },
+        })
+      : [];
+    const minuteBucket = Math.floor(Date.now() / 60_000);
+    const summary = await deliver(
+      targets,
+      {
+        title: "Focus with Friends",
+        body: `${actor.displayName} a essayé d’ouvrir une app bloquée.`,
+        data: {
+          route: "/focus-with-friends/room/[id]",
+          params: { id: room.id },
+        },
+      },
+      {
+        source: "friend-focus:blocked-attempt",
+        dedupeKey: `friend-focus:blocked-attempt:${room.id}:${actor.userId}:${minuteBucket}`,
+      },
+    );
+
+    res.status(202).json({ accepted: true, notified: summary.sent });
   }),
 );

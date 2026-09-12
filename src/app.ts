@@ -16,7 +16,7 @@ import { funnelRouter, adminFunnelRouter } from "./routes/funnel";
 import { meRouter } from "./routes/me";
 import { devicesRouter } from "./routes/devices";
 import { focusInvitesRouter } from "./routes/focus-invites";
-import { friendFocusRouter } from "./routes/friend-focus";
+import { friendFocusReportRouter, friendFocusRouter } from "./routes/friend-focus";
 import { syncRouter } from "./routes/sync";
 import { focusEventsRouter } from "./routes/focus-events";
 import { analyticsRouter } from "./routes/analytics";
@@ -114,6 +114,9 @@ export function createApp(): Express {
   // platform allow-list, hard shape caps and a per-run write ceiling inside
   // the route, not by auth.
   app.use("/api/funnel", funnelRouter);
+  // Screen Time extensions run outside the authenticated React Native process.
+  // This one narrow route authenticates with a per-member room capability.
+  app.use("/api/friend-focus", friendFocusReportRouter);
   // Every router below is authenticated on EVERY route, so the guard can be
   // mounted here rather than threaded through each one. `requireAuth` runs again
   // inside them; that is a signature check with no database read, and paying it

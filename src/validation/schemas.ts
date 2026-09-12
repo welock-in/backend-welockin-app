@@ -145,6 +145,10 @@ export const friendFocusReadySchema = z.object({
   ready: z.boolean(),
 });
 
+export const friendFocusBlockedAttemptSchema = z.object({
+  attemptToken: z.string().trim().min(24).max(128),
+});
+
 export const createBreakSchema = z.object({
   breakLen: z.number().int().positive().max(240), // minutes
   clientBreakId: z.string().trim().min(1).max(64).optional(), // idempotency key

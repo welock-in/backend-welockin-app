@@ -107,6 +107,26 @@ test("the host creates a waiting room with one shared difficulty", async (t) => 
   assert.equal(data.members.create.userId, hostId);
 });
 
+test("a room accepts the same maximum duration exposed by Start Focus", async (t) => {
+  const rooms = (prisma as any).friendFocusRoom as Record<string, any>;
+  const creates = stubMethod(t, rooms, "create", async (args) =>
+    room({
+      durationMinutes: args.data.durationMinutes,
+      expiresAt: args.data.expiresAt,
+    }),
+  );
+
+  const res = await request(app).post("/api/friend-focus/rooms").set(auth).send({
+    durationMinutes: 12 * 60 + 59,
+    hardLock: false,
+    displayName: "Hedi",
+  });
+
+  assert.equal(res.status, 201);
+  assert.equal(res.body.room.durationMinutes, 12 * 60 + 59);
+  assert.equal(creates[0][0].data.durationMinutes, 12 * 60 + 59);
+});
+
 test("preview shows the host-selected mode before the guest consents", async (t) => {
   const rooms = prisma.friendFocusRoom as unknown as Record<string, any>;
   stubMethod(t, rooms, "findUnique", async () => room());
@@ -337,7 +357,7 @@ test("a blocked-app attempt notifies every other active room member, never the a
 
   const res = await request(app)
     .post("/api/friend-focus/rooms/65f000000000000000000101/blocked-attempt")
-    .send({ attemptToken: actorToken });
+    .send({ attemptToken: actorToken, appName: "Instagram" });
 
   assert.equal(res.status, 202);
   assert.deepEqual(tokenReads[0][0].where, { valid: true, userId: { in: [guestId] } });
@@ -346,7 +366,7 @@ test("a blocked-app attempt notifies every other active room member, never the a
   assert.deepEqual(messages.map((message: { to: string }) => message.to), [
     "ExponentPushToken[guest-device]",
   ]);
-  assert.equal(messages[0].body, "Hedi a essayé d’ouvrir une app bloquée.");
+  assert.equal(messages[0].body, "Hedi tried to open Instagram, but it is blocked.");
   assert.equal(deliveryWrites[0][0].data[0].userId, guestId);
   assert.match(deliveryWrites[0][0].data[0].dedupeKey, /^friend-focus:blocked-attempt:/);
 });

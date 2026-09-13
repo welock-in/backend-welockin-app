@@ -302,7 +302,9 @@ friendFocusReportRouter.post(
       targets,
       {
         title: "Focus with Friends",
-        body: `${actor.displayName} a essayé d’ouvrir une app bloquée.`,
+        body: input.appName
+          ? `${actor.displayName} tried to open ${input.appName}, but it is blocked.`
+          : `${actor.displayName} tried to open a blocked app.`,
         data: {
           route: "/focus-with-friends/room/[id]",
           params: { id: room.id },

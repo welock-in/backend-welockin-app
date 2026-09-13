@@ -122,7 +122,7 @@ const friendFocusDisplayName = z.string().trim().min(1).max(40).optional();
 
 export const friendFocusCreateSchema = z.object({
   name: z.string().trim().min(1).max(40).optional(),
-  durationMinutes: z.number().int().min(15).max(180),
+  durationMinutes: z.number().int().min(15).max(12 * 60 + 59),
   hardLock: z.boolean(),
   displayName: friendFocusDisplayName,
 });
@@ -147,6 +147,7 @@ export const friendFocusReadySchema = z.object({
 
 export const friendFocusBlockedAttemptSchema = z.object({
   attemptToken: z.string().trim().min(24).max(128),
+  appName: z.string().trim().min(1).max(80).optional(),
 });
 
 export const createBreakSchema = z.object({

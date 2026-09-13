@@ -138,6 +138,31 @@ test("the first packet of a run creates the record", async (t) => {
   assert.equal(creates[0][0].data.runId, RUN_ID);
 });
 
+test("an iOS onboarding packet is stored for the mobile funnel", async (t) => {
+  const updates = stubMethod(t, prisma.funnelRun as any, "updateMany", async () => ({ count: 1 }));
+
+  const res = await request(app)
+    .post("/api/funnel/track")
+    .send(
+      packet({
+        platform: "ios",
+        deviceId: "ios-abc",
+        deviceName: "Hedi's iPhone",
+        appVersion: "1.1.0",
+        funnelVersion: "ios_v1",
+        steps: [
+          { step: "intro", enteredAt: "2026-08-28T10:00:00.000Z", leftAt: "2026-08-28T10:00:03.000Z", ms: 3000 },
+          { step: "gauge", enteredAt: "2026-08-28T10:00:03.000Z", leftAt: null, ms: null },
+        ],
+      }),
+    );
+
+  assert.equal(res.status, 204);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0][0].data.platform, "ios");
+  assert.equal(updates[0][0].data.lastStep, "gauge");
+});
+
 test("an unknown platform is discarded silently, not refused and not written", async (t) => {
   const updates = stubMethod(t, prisma.funnelRun as any, "updateMany", async () => ({ count: 1 }));
 
@@ -325,13 +350,13 @@ test("the platform filter and window clamp reach the query", async (t) => {
   stubMethod(t, prisma.user as any, "findMany", async () => []);
 
   const res = await request(app)
-    .get("/api/admin/funnel?platform=macos&days=9999&take=9999")
+    .get("/api/admin/funnel?platform=ios&days=9999&take=9999")
     .set(auth);
 
   assert.equal(res.status, 200);
   assert.equal(profiles.length, 0, "an empty page must not scan the onboarding answers");
   const args = finds[0][0];
-  assert.equal(args.where.platform, "macos");
+  assert.equal(args.where.platform, "ios");
   assert.equal(args.take, 500);
   assert.equal(res.body.windowDays, 90);
 });

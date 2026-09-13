@@ -27,12 +27,12 @@ import { consumeRateLimit } from "../lib/rate-limit";
 /** The platforms that may report. Same reasoning as the referral allow-list:
  *  the endpoint is public, so an unknown platform is discarded silently rather
  *  than written or refused. */
-export const FUNNEL_PLATFORMS = ["windows", "macos"] as const;
+export const FUNNEL_PLATFORMS = ["windows", "macos", "ios"] as const;
 const KNOWN_PLATFORMS: ReadonlySet<string> = new Set(FUNNEL_PLATFORMS);
 
 /**
- * Every screen either desktop funnel can visit, in walk order — the union of
- * the two: `verify` is Windows-only, `permissions` macOS-only. This is the
+ * Every screen a desktop or iOS funnel can visit, in walk order. `gauge` and
+ * `paywall` are mobile-only, while `screentime` is desktop-only. This is the
  * console's ordering/labelling table, not a validation gate: step NAMES in a
  * packet are free strings within a length cap, so a client one funnel version
  * ahead logs cleanly instead of erroring, and its unknown steps sort last.
@@ -44,6 +44,7 @@ export const FUNNEL_STEP_ORDER = [
   "profile",
   "university",
   "screentime",
+  "gauge",
   "shock",
   "calc",
   "analysis",
@@ -51,6 +52,7 @@ export const FUNNEL_STEP_ORDER = [
   "commit",
   "account",
   "verify",
+  "paywall",
   "permissions",
 ] as const;
 

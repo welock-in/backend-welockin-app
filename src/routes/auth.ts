@@ -26,6 +26,7 @@ import { deterministicObjectId } from "../lib/deterministic-id";
 import { readDeviceId } from "../lib/device";
 import { claimTrialOnSignup } from "../lib/trial-claim";
 import { findPayingAccountForDevice } from "../lib/precheck";
+import { isDesktopDeviceId } from "../lib/desktop-lifetime";
 
 const isDuplicateKey = (err: unknown) =>
   err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
@@ -84,6 +85,8 @@ authRouter.post(
     }
 
     const passwordHash = await hashPassword(password);
+    const deviceId = readDeviceId(req);
+    const grantDesktopLifetime = env.desktopLifetimeSignupEnabled && isDesktopDeviceId(deviceId);
 
     // NO trial is stamped on the ACCOUNT any more. Registration used to hand out
     // fourteen days, which made a trial exactly as cheap as an email address —
@@ -95,6 +98,9 @@ authRouter.post(
         email,
         passwordHash,
         plan: "trial",
+        // Persist with account creation so there is no intermediate account
+        // whose promised desktop access depends on a second successful write.
+        ...(grantDesktopLifetime ? { desktopLifetimeGrantedAt: new Date() } : {}),
       },
     });
 
@@ -103,12 +109,16 @@ authRouter.post(
     // would mean every account created by a current build resolved `expired` from
     // its first second. Best-effort — a ledger write must never cost someone the
     // account they just made.
-    await claimTrialOnSignup(user.id, readDeviceId(req), {
-      signals: fingerprint.signals,
-      // Only ever passed as an explicit false by a client that LOOKED for its
-      // hardware id and failed — see ClaimOptions. Absent stays absent.
-      ...(fingerprint.signals.length > 0 ? { hardwareBacked: fingerprint.hardwareBacked } : {}),
-    });
+    // Desktop lifetime replaces this signup trial. A TrialClaim also matches
+    // by account id, so minting one would leak the desktop offer onto iOS.
+    if (!grantDesktopLifetime) {
+      await claimTrialOnSignup(user.id, deviceId, {
+        signals: fingerprint.signals,
+        // Only ever passed as an explicit false by a client that LOOKED for its
+        // hardware id and failed — see ClaimOptions. Absent stays absent.
+        ...(fingerprint.signals.length > 0 ? { hardwareBacked: fingerprint.hardwareBacked } : {}),
+      });
+    }
 
     // Send the verification code inline, so the client does not need a second
     // round trip before it can show the code screen. Never throws.

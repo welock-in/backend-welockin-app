@@ -29,7 +29,8 @@ stubNoBillingHolds();
 const app = createApp();
 const USER = "507f1f77bcf86cd799439011";
 const OTHER = "507f1f77bcf86cd799439022";
-const FUTURE = new Date("2026-09-01T00:00:00.000Z");
+// Keep the active fixture in the future as the calendar advances.
+const FUTURE = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 /** The one lifetime product. Never a literal here — the literal is pinned once,
  *  in lib/revenuecat.test.ts, so a typo cannot be copied into a fixture. */
 const RC_LIFETIME = RC_LIFETIME_PRODUCT_IDS[0];

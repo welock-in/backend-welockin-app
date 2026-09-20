@@ -25,7 +25,8 @@ const app = createApp();
 const TOKEN = "rc-webhook-token-test";
 const USER = "507f1f77bcf86cd799439011";
 const OTHER_USER = "507f1f77bcf86cd799439022";
-const FUTURE = "2026-09-01T00:00:00.000Z";
+// Keep the active fixture in the future as the calendar advances.
+const FUTURE = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
 type Ctx = { after: (fn: () => void) => void };
 

@@ -12,6 +12,8 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "prisma generate && tsc",
+    "vercel-build": "npm run build && node scripts/publish-windows-release.mjs",
+    "test:release": "node --test scripts/publish-windows-release.test.mjs",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test src/**/*.test.ts",

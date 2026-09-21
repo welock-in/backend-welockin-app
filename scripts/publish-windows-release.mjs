@@ -1,4 +1,4 @@
-// Explicit, one-release operation in Vercel's build environment. No secrets leave
+// Explicit, pinned-release operation in Vercel's build environment. No secrets leave
 // that environment except through the existing HTTPS admin authentication flow.
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -6,33 +6,41 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const API = "https://app.connect.welock.in";
-const VERSION = "0.3.46";
-const ARTIFACT = "https://pub-9a9e884e54304893952b71510391fcd4.r2.dev/releases/0.3.46/welockin_0.3.46_x64-setup.exe";
-const SOURCE_SHA = "6e67a788d1b7fa13ed67c32e4e3c2b20791473fc";
 // SHA-256 of the manifest's JSON with top-level keys sorted. Whitespace/CRLF
 // changes do not matter; changing any manifest value requires explicit review.
-const MANIFEST_SHA256 = "af6b31e76c80dc33768dafa6f546bdec4b9a347a3b689d736eaa73b81c0f7358";
+const RELEASE_PINS = Object.freeze({
+  "0.3.46": Object.freeze({
+    sourceSha: "6e67a788d1b7fa13ed67c32e4e3c2b20791473fc",
+    manifestSha256: "af6b31e76c80dc33768dafa6f546bdec4b9a347a3b689d736eaa73b81c0f7358",
+  }),
+  "0.3.47": Object.freeze({
+    sourceSha: "afea3e800cfb1fcd09c63faae15dfa8bd3430bc9",
+    manifestSha256: "3c2725d86227d91a3d531e67fdd0457d31821195a1cf96865a60aaf7259e2be6",
+  }),
+});
+const artifactUrl = (version) => `https://pub-9a9e884e54304893952b71510391fcd4.r2.dev/releases/${version}/welockin_${version}_x64-setup.exe`;
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
 class ReleaseError extends Error {}
 const refuse = (code) => { throw new ReleaseError(code); };
 
-export function loadPinnedManifest() {
+export function loadPinnedManifest(version = "0.3.46") {
+  if (typeof version !== "string" || !Object.hasOwn(RELEASE_PINS, version)) refuse("UNSUPPORTED_RELEASE_VERSION");
   let manifest;
   try {
-    manifest = JSON.parse(readFileSync(new URL("./releases/windows-0.3.46.json", import.meta.url), "utf8"));
+    manifest = JSON.parse(readFileSync(new URL(`./releases/windows-${version}.json`, import.meta.url), "utf8"));
   } catch {
     refuse("MANIFEST_UNREADABLE");
   }
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) refuse("MANIFEST_INVALID");
   const canonical = JSON.stringify(Object.fromEntries(Object.keys(manifest).sort().map((key) => [key, manifest[key]])));
-  if (hash(canonical) !== MANIFEST_SHA256) refuse("MANIFEST_CHECKSUM_MISMATCH");
+  if (hash(canonical) !== RELEASE_PINS[version].manifestSha256) refuse("MANIFEST_CHECKSUM_MISMATCH");
   return Object.freeze(manifest);
 }
 
-function validateManifest(m) {
-  if (!m || m.version !== VERSION || m.target !== "windows" || m.arch !== "x86_64" ||
-      m.channel !== "stable" || m.rolloutPercent !== 100 || m.url !== ARTIFACT || m.sourceSha !== SOURCE_SHA ||
+function validateManifest(m, version) {
+  if (!m || m.version !== version || m.target !== "windows" || m.arch !== "x86_64" ||
+      m.channel !== "stable" || m.rolloutPercent !== 100 || m.url !== artifactUrl(version) || m.sourceSha !== RELEASE_PINS[version].sourceSha ||
       !/^[a-f0-9]{64}$/.test(m.sha256) || !/^[a-f0-9]{64}$/.test(m.signatureSha256) ||
       !Number.isSafeInteger(m.sizeBytes) || m.sizeBytes <= 0 ||
       !Number.isSafeInteger(m.signatureSizeBytes) || m.signatureSizeBytes <= 0 ||
@@ -44,11 +52,11 @@ function validateManifest(m) {
 // The supported release has no prerelease tag. Compare numeric components to
 // avoid treating, for example, 0.3.100 as older than 0.3.46. A prerelease of the
 // same numeric version is older; any higher numeric version is newer.
-function newerThanSupported(version) {
+function newerThanSupported(version, supportedVersion) {
   if (typeof version !== "string") refuse("RELEASE_LIST_INVALID_VERSION");
   const match = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/.exec(version);
   if (!match) refuse("RELEASE_LIST_INVALID_VERSION");
-  const expected = [0n, 3n, 46n];
+  const expected = supportedVersion.split(".").map(BigInt);
   for (let index = 0; index < 3; index += 1) {
     const part = BigInt(match[index + 1]);
     if (part !== expected[index]) return part > expected[index];
@@ -59,8 +67,8 @@ function newerThanSupported(version) {
 function inspectRows(rows, manifest, signature) {
   if (!Array.isArray(rows) || rows.some((row) => !row || typeof row !== "object")) refuse("RELEASE_LIST_INVALID");
   const relevant = rows.filter((row) => row.target === manifest.target && row.arch === manifest.arch && row.channel === manifest.channel);
-  if (relevant.some((row) => row.status === "live" && newerThanSupported(row.version))) refuse("NEWER_WINDOWS_RELEASE_IS_LIVE");
-  const matches = relevant.filter((row) => row.version === VERSION);
+  if (relevant.some((row) => row.status === "live" && newerThanSupported(row.version, manifest.version))) refuse("NEWER_WINDOWS_RELEASE_IS_LIVE");
+  const matches = relevant.filter((row) => row.version === manifest.version);
   if (matches.length > 1) refuse("DUPLICATE_RELEASE_ROWS");
   if (matches[0]) validateRow(matches[0], manifest, signature);
   return matches[0];
@@ -84,10 +92,10 @@ export async function publishWindowsRelease({ env = process.env, fetchImpl = glo
   const requested = env.WINDOWS_RELEASE_VERSION;
   // This gate precedes every credential read, manifest read, and network call.
   if (requested === undefined || requested === "") return { status: "disabled" };
-  if (requested !== VERSION) refuse("UNSUPPORTED_RELEASE_VERSION");
+  if (typeof requested !== "string" || !Object.hasOwn(RELEASE_PINS, requested)) refuse("UNSUPPORTED_RELEASE_VERSION");
   if (env.VERCEL_ENV !== "production") refuse("PRODUCTION_BUILD_REQUIRED");
-  manifest ??= loadPinnedManifest();
-  validateManifest(manifest);
+  manifest ??= loadPinnedManifest(requested);
+  validateManifest(manifest, requested);
 
   async function request(url, options, label) {
     let response;
@@ -169,7 +177,7 @@ export async function publishWindowsRelease({ env = process.env, fetchImpl = glo
   const confirmed = inspectRows(await readRows(), manifest, signature);
   validateRow(confirmed, manifest, signature, id);
   if (confirmed.status !== "live") refuse("LIVE_READBACK_FAILED");
-  const result = { status: alreadyLive ? "already-live" : "published", version: VERSION, id };
+  const result = { status: alreadyLive ? "already-live" : "published", version: manifest.version, id };
   log(JSON.stringify({ ...result, target: "windows", arch: "x86_64", rolloutPercent: 100, sha256: manifest.sha256 }));
   return result;
 }

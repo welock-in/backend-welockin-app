@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { publishWindowsRelease } from './publish-windows-release.mjs';
+import { loadPinnedManifest, publishWindowsRelease } from './publish-windows-release.mjs';
 
 const API_BASE = 'https://app.connect.welock.in';
 const ARTIFACT_URL = 'https://pub-9a9e884e54304893952b71510391fcd4.r2.dev/releases/0.3.46/welockin_0.3.46_x64-setup.exe';
@@ -28,6 +28,14 @@ const MANIFEST = Object.freeze({
   notes: 'New desktop accounts receive lifetime access.',
 });
 
+const MANIFEST_047 = Object.freeze({
+  ...MANIFEST,
+  version: '0.3.47',
+  url: 'https://pub-9a9e884e54304893952b71510391fcd4.r2.dev/releases/0.3.47/welockin_0.3.47_x64-setup.exe',
+  sourceSha: 'afea3e800cfb1fcd09c63faae15dfa8bd3430bc9',
+  notes: 'Restore the account name on Home and add detailed Windows Insights.',
+});
+
 const ENV = Object.freeze({
   WINDOWS_RELEASE_VERSION: '0.3.46',
   VERCEL_ENV: 'production',
@@ -35,18 +43,18 @@ const ENV = Object.freeze({
   ADMIN_PASSWORD: PASSWORD,
 });
 
-function release(overrides = {}) {
+function release(overrides = {}, manifest = MANIFEST) {
   return {
     id: RELEASE_ID,
-    version: MANIFEST.version,
-    target: MANIFEST.target,
-    arch: MANIFEST.arch,
-    channel: MANIFEST.channel,
-    url: MANIFEST.url,
+    version: manifest.version,
+    target: manifest.target,
+    arch: manifest.arch,
+    channel: manifest.channel,
+    url: manifest.url,
     signature: SIGNATURE,
-    sha256: MANIFEST.sha256,
-    sizeBytes: MANIFEST.sizeBytes,
-    notes: MANIFEST.notes,
+    sha256: manifest.sha256,
+    sizeBytes: manifest.sizeBytes,
+    notes: manifest.notes,
     status: 'draft',
     rolloutPercent: 0,
     ...overrides,
@@ -63,6 +71,8 @@ function json(value, status = 200) {
 // Every route is simulated locally. Unexpected hosts, routes, redirects or
 // authenticated public downloads fail immediately instead of reaching a network.
 function scenario(options = {}) {
+  const manifest = options.manifest ?? MANIFEST;
+  const env = { ...ENV, WINDOWS_RELEASE_VERSION: manifest.version };
   let rows = structuredClone(options.initialReleases ?? []);
   let listCount = 0;
   let publishCount = 0;
@@ -77,7 +87,7 @@ function scenario(options = {}) {
     assert.equal(init.redirect, 'error', 'every fetch must reject HTTP redirects');
     assert.equal(url.protocol, 'https:');
 
-    if (url.href === ARTIFACT_URL || url.href === `${ARTIFACT_URL}.sig`) {
+    if (url.href === manifest.url || url.href === `${manifest.url}.sig`) {
       assert.equal(method, 'GET');
       assert.equal(headers.has('authorization'), false, 'public artifact requests must not carry the admin token');
       assert.equal(headers.has('cookie'), false);
@@ -95,7 +105,7 @@ function scenario(options = {}) {
       assert.equal(method, 'POST');
       assert.equal(headers.has('authorization'), false);
       assert.deepEqual(body, { username: ENV.ADMIN_USERNAME, password: ENV.ADMIN_PASSWORD });
-      assert.deepEqual(calls.slice(0, 2).map((call) => call.url), [ARTIFACT_URL, `${ARTIFACT_URL}.sig`], 'artifact and signature are checked before authentication');
+      assert.deepEqual(calls.slice(0, 2).map((call) => call.url), [manifest.url, `${manifest.url}.sig`], 'artifact and signature are checked before authentication');
       if (options.loginFailure) return new Response(options.loginFailure.body, { status: options.loginFailure.status });
       return json(options.loginResponse ?? { token: TOKEN });
     }
@@ -120,24 +130,24 @@ function scenario(options = {}) {
         signature: body.signature,
         notes: body.notes,
       }, {
-        version: MANIFEST.version,
-        target: MANIFEST.target,
-        arch: MANIFEST.arch,
-        channel: MANIFEST.channel,
-        url: MANIFEST.url,
-        sha256: MANIFEST.sha256,
-        sizeBytes: MANIFEST.sizeBytes,
+        version: manifest.version,
+        target: manifest.target,
+        arch: manifest.arch,
+        channel: manifest.channel,
+        url: manifest.url,
+        sha256: manifest.sha256,
+        sizeBytes: manifest.sizeBytes,
         signature: SIGNATURE,
-        notes: MANIFEST.notes,
+        notes: manifest.notes,
       });
-      const created = release(options.createOverrides);
+      const created = release(options.createOverrides, manifest);
       rows.push(created);
       return json(created, 201);
     }
     if (pathname === `/api/admin/releases/${RELEASE_ID}/publish` && method === 'POST') {
       publishCount += 1;
       assert.deepEqual(body, { rolloutPercent: 100 });
-      const published = release({ status: 'live', rolloutPercent: 100, ...options.publishOverrides });
+      const published = release({ status: 'live', rolloutPercent: 100, ...options.publishOverrides }, manifest);
       rows = rows.map((row) => row.id === RELEASE_ID ? published : row);
       return json(published);
     }
@@ -147,8 +157,8 @@ function scenario(options = {}) {
     calls,
     logs,
     run: (overrides = {}) => publishWindowsRelease({
-      env: ENV,
-      manifest: MANIFEST,
+      env,
+      manifest,
       fetchImpl,
       log: (...args) => logs.push(args.map(String).join(' ')),
       ...overrides,
@@ -165,6 +175,33 @@ function assertNoSecrets(value) {
   assert.equal(text.includes(TOKEN), false, 'admin token must not appear in output');
   assert.equal(text.includes(PASSWORD), false, 'admin password must not appear in output');
 }
+
+test('the original published manifest remains pinned and unchanged', () => {
+  const manifest = loadPinnedManifest();
+  assert.equal(manifest.version, '0.3.46');
+  assert.equal(manifest.sourceSha, MANIFEST.sourceSha);
+  assert.equal(manifest.url, ARTIFACT_URL);
+  assert.equal(Object.isFrozen(manifest), true);
+  assert.deepEqual(loadPinnedManifest('0.3.46'), manifest);
+});
+
+test('the 0.3.47 manifest is pinned to its source commit and installer', () => {
+  const manifest = loadPinnedManifest('0.3.47');
+  assert.equal(manifest.version, MANIFEST_047.version);
+  assert.equal(manifest.sourceSha, MANIFEST_047.sourceSha);
+  assert.equal(manifest.url, MANIFEST_047.url);
+  assert.equal(manifest.sha256, '85119b9453e77b90ccd9286062033cf8f794176453170a5a0a087a48c1c6f0b9');
+  assert.equal(manifest.sizeBytes, 11631545);
+  assert.equal(manifest.signatureSha256, '8aaff640e8dc487f06a8de71d045606f30af4479000513c5f1e64ba3bfdf1a38');
+  assert.equal(manifest.signatureSizeBytes, 420);
+  assert.equal(Object.isFrozen(manifest), true);
+});
+
+test('unknown manifest versions cannot select files or inherited object properties', () => {
+  for (const version of ['0.3.48', '../0.3.46', 'constructor', '__proto__', { toString: () => '0.3.46' }]) {
+    assert.throws(() => loadPinnedManifest(version), /UNSUPPORTED_RELEASE_VERSION/);
+  }
+});
 
 test('absent release flag performs no reads of credentials or environment and no network calls', async () => {
   const env = new Proxy({}, {
@@ -183,7 +220,7 @@ for (const overrides of [
   { VERCEL_ENV: 'preview' },
   { VERCEL_ENV: 'development' },
   { VERCEL_ENV: undefined },
-  { WINDOWS_RELEASE_VERSION: '0.3.47' },
+  { WINDOWS_RELEASE_VERSION: '0.3.48' },
   { WINDOWS_RELEASE_VERSION: ' 0.3.46 ' },
 ]) {
   test(`invalid activation is rejected before network: ${JSON.stringify(overrides)}`, async () => {
@@ -238,6 +275,56 @@ test('creates the expected draft, publishes only its id at 100 percent, and read
   ]);
   assertNoSecrets(mock.logs.join('\n'));
 });
+
+test('0.3.47 publishes its own artifacts while 0.3.46 remains live', async () => {
+  const mock = scenario({
+    manifest: MANIFEST_047,
+    initialReleases: [release({ id: 'previous-release', status: 'live', rolloutPercent: 100 })],
+  });
+  assert.deepEqual(await mock.run(), { status: 'published', version: '0.3.47', id: RELEASE_ID });
+  assert.deepEqual(mock.calls.slice(0, 2).map((call) => call.url), [MANIFEST_047.url, `${MANIFEST_047.url}.sig`]);
+  assert.deepEqual(mutations(mock.calls).map((call) => call.pathname), ['/api/admin/releases', `/api/admin/releases/${RELEASE_ID}/publish`]);
+  assert.equal(mutations(mock.calls)[0].body.version, '0.3.47');
+  assertNoSecrets(mock.logs.join('\n'));
+});
+
+for (const status of ['draft', 'live']) {
+  test(`0.3.47 resumes its identical ${status} without recreating it`, async () => {
+    const mock = scenario({
+      manifest: MANIFEST_047,
+      initialReleases: [release({ status, rolloutPercent: status === 'live' ? 100 : 0 }, MANIFEST_047)],
+    });
+    assert.deepEqual(await mock.run(), {
+      status: status === 'live' ? 'already-live' : 'published', version: '0.3.47', id: RELEASE_ID,
+    });
+    assert.deepEqual(mutations(mock.calls).map((call) => call.pathname), status === 'live' ? [] : [`/api/admin/releases/${RELEASE_ID}/publish`]);
+  });
+}
+
+for (const [requested, manifest] of [['0.3.47', MANIFEST], ['0.3.46', MANIFEST_047]]) {
+  test(`${requested} cannot publish the other version's manifest`, async () => {
+    const mock = scenario();
+    await assert.rejects(mock.run({ env: { ...ENV, WINDOWS_RELEASE_VERSION: requested }, manifest }), /MANIFEST_INVALID/);
+    assert.equal(mock.calls.length, 0);
+  });
+}
+
+test('0.3.47 cannot use the old source commit even with the new artifact URL', async () => {
+  const mock = scenario({ manifest: MANIFEST_047 });
+  await assert.rejects(mock.run({ manifest: { ...MANIFEST_047, sourceSha: MANIFEST.sourceSha } }), /MANIFEST_INVALID/);
+  assert.equal(mock.calls.length, 0);
+});
+
+for (const [manifest, newerVersion] of [[MANIFEST, '0.3.47'], [MANIFEST_047, '0.3.48']]) {
+  test(`${manifest.version} refuses publication after ${newerVersion} is live`, async () => {
+    const mock = scenario({
+      manifest,
+      initialReleases: [release({ id: 'newer-release', version: newerVersion, status: 'live', rolloutPercent: 100 }, manifest)],
+    });
+    await assert.rejects(mock.run(), /NEWER_WINDOWS_RELEASE_IS_LIVE/);
+    assert.equal(mutations(mock.calls).length, 0);
+  });
+}
 
 test('resumes an identical draft without creating another row', async () => {
   const mock = scenario({ initialReleases: [release()] });

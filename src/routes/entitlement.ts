@@ -11,6 +11,7 @@ import {
 import { loadEligibilityInputs, purchaseEligibilityFrom } from "../lib/eligibility-io";
 import { issueReceipt } from "../lib/entitlement-receipt";
 import { readDeviceId } from "../lib/device";
+import { readClientPlatform, type ClientPlatform } from "../lib/signup-lifetime";
 import { parseFingerprint } from "../lib/fingerprint";
 import { claimTrial, findClaim } from "../lib/trial-claim";
 import { requireAuth } from "../middleware/auth";
@@ -56,7 +57,11 @@ export const entitlementRouter = Router();
  * decision goes through `computeEntitlement` against the live rows. A cache that
  * decides access is a bug that only ever shows up in production.
  */
-export async function resolveAndCache(userId: string, deviceId: string): Promise<EntitlementView> {
+export async function resolveAndCache(
+  userId: string,
+  deviceId: string,
+  platform: ClientPlatform = "unknown",
+): Promise<EntitlementView> {
   const now = new Date();
   const deviceIdHash = deviceId ? ledgerHash(deviceId) : null;
 
@@ -89,7 +94,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     // lib/eligibility-io.ts) — plus the outbox, checkout-hold and lifetime legs
     // the view's purchaseEligibility needs. Which of the rows grants is
     // `subscriptionGrants`'s question, not the query's.
-    loadEligibilityInputs(userId, deviceId),
+    loadEligibilityInputs(userId, deviceId, platform),
   ]);
   const subs = eligibility.subs;
 
@@ -101,8 +106,9 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     (user.compedUntil == null || user.compedUntil.getTime() > now.getTime());
 
   const hasPaidLifetime = purchases.some((p) => !p.isRefunded);
-  const desktopLifetime = eligibility.desktopLifetime === true;
-  const hasLifetime = hasPaidLifetime || desktopLifetime;
+  const complimentaryLifetime = eligibility.complimentaryLifetime ?? null;
+  const hasComplimentaryLifetime = complimentaryLifetime != null;
+  const hasLifetime = hasPaidLifetime || hasComplimentaryLifetime;
 
   const inputs = {
     now,
@@ -127,12 +133,12 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     enforced: env.entitlementEnforced,
   };
   const accountView = computeEntitlement(inputs);
-  const view = desktopLifetime
-    ? computeEntitlement({ ...inputs, hasDesktopLifetime: true, trialEndsAt: null })
+  const view = hasComplimentaryLifetime
+    ? computeEntitlement({ ...inputs, hasComplimentaryLifetime: true, trialEndsAt: null })
     : accountView;
 
-  // The User mirror is shared with mobile and admin. Never persist a desktop
-  // promotion into the global access cache (or grant iOS through /api/me).
+  // The User mirror is shared across platforms and admin. Never persist a
+  // platform-scoped promotion into that global access cache.
   await cacheOnUser(userId, accountView, now);
 
   // The signed half. Everything above is advice a patched client may ignore;
@@ -179,7 +185,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
         : null;
 
   const trialSub = subs.find((sub) => sub.status === "on_trial" && subscriptionGrants(sub, now));
-  const grantingUntil = desktopLifetime
+  const grantingUntil = hasComplimentaryLifetime
     ? null
     : trialSub ? (trialSub.validUntil ?? null) : view.trialEndsAt ? new Date(view.trialEndsAt) : null;
 
@@ -226,7 +232,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   // trial even when it has elapsed, which is precisely the case that must not
   // read as "brand new".
   const everHadAccess =
-    desktopLifetime || purchases.length > 0 || subs.length > 0 || claim != null || user.trialEndsAt != null;
+    hasComplimentaryLifetime || purchases.length > 0 || subs.length > 0 || claim != null || user.trialEndsAt != null;
 
   // ── the provider-aware half — every field additive, see EntitlementView ──
 
@@ -236,7 +242,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   const grantingLifetime = purchases.find((p) => !p.isRefunded) ?? null;
   const billingProvider: BillingProvider =
     (grantingLifetime ? billingProviderFor(grantingLifetime.provider) : null) ??
-    (desktopLifetime ? "NONE" : liveSub ? (billingProviderFor(liveSub.provider) ?? "LEMON_SQUEEZY") : null) ??
+    (hasComplimentaryLifetime ? "NONE" : liveSub ? (billingProviderFor(liveSub.provider) ?? "LEMON_SQUEEZY") : null) ??
     "NONE";
 
   // The live RECURRING row, whether or not it grants — a lifetime owner's
@@ -262,7 +268,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   // of "will not renew". Null when nothing recurring is granting: there is no
   // renewal to have an opinion about.
   const willRenew =
-    liveSub == null || (desktopLifetime && !hasPaidLifetime)
+    liveSub == null || (hasComplimentaryLifetime && !hasPaidLifetime)
       ? null
       : billingProviderFor(liveSub.provider) === "APPLE"
         ? (liveSub.willRenew ?? null)
@@ -271,6 +277,12 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   return {
     ...view,
     plan,
+    complimentaryLifetime: view.isPro ? complimentaryLifetime : null,
+    // A gift alone must never be presented as proof of a successful restore.
+    hasApplePurchaseAccess: user.accessRevoked !== true && (
+      purchases.some((p) => !p.isRefunded && billingProviderFor(p.provider) === "APPLE") ||
+      subs.some((sub) => billingProviderFor(sub.provider) === "APPLE" && subscriptionGrants(sub, now))
+    ),
     validUntil: grantingSub?.validUntil?.toISOString() ?? null,
     billingUrl,
     everHadAccess,
@@ -327,7 +339,7 @@ entitlementRouter.get(
   "/",
   requireAuth,
   asyncHandler(async (req, res) => {
-    res.json(await resolveAndCache(req.user!.id, readDeviceId(req)));
+    res.json(await resolveAndCache(req.user!.id, readDeviceId(req), readClientPlatform(req)));
   }),
 );
 
@@ -380,6 +392,6 @@ entitlementRouter.post(
       });
     }
 
-    res.json(await resolveAndCache(userId, deviceId));
+    res.json(await resolveAndCache(userId, deviceId, readClientPlatform(req)));
   }),
 );

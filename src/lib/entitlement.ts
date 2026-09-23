@@ -5,7 +5,7 @@
  * so the webhook path and the refresh path converge regardless of arrival order
  * (CRDT-like). Precedence (first match wins):
  *
- *   revoked (admin) > lifetime purchase/desktop grant > subscription >
+ *   revoked (admin) > lifetime purchase/scoped signup gift > subscription >
  *   admin comp > active device-trial >
  *   refunded > expired
  *
@@ -147,6 +147,10 @@ export interface EntitlementView {
    * and null the same way.
    */
   plan?: "monthly" | "yearly" | "lifetime" | null;
+  /** A permanent signup gift for this request's platform, never a paid order. */
+  complimentaryLifetime?: "ios" | "desktop" | null;
+  /** Owned, currently granting Apple purchase/subscription, independent of gifts. */
+  hasApplePurchaseAccess?: boolean;
   /**
    * The end of the period the GRANTING subscription has paid for (ISO), or
    * null when nothing time-bounded grants — a lifetime has no end, and a
@@ -235,8 +239,8 @@ export interface EntitlementView {
 
 export interface EntitlementInputs {
   now: Date;
-  /** Permanent signup grant, scoped by the caller to macOS/Windows only. */
-  hasDesktopLifetime?: boolean;
+  /** Permanent signup grant, scoped by the caller to the current platform. */
+  hasComplimentaryLifetime?: boolean;
   hasActivePurchase: boolean; // a non-refunded Purchase exists (the LIFETIME leg)
   hasRefundedPurchase: boolean; // a refunded Purchase exists
   /**
@@ -269,7 +273,7 @@ export function computeEntitlement(input: EntitlementInputs): EntitlementView {
   if (input.accessRevoked) {
     status = "revoked";
     isPro = false;
-  } else if (input.hasActivePurchase || input.hasDesktopLifetime) {
+  } else if (input.hasActivePurchase || input.hasComplimentaryLifetime) {
     status = "active";
     isPro = true;
   } else if (input.hasActiveSubscription) {

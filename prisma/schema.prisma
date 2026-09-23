@@ -49,6 +49,12 @@ model User {
   /// signing into the same account on iOS does not receive this desktop benefit.
   /// Optional for existing MongoDB documents; no backfill is required.
   desktopLifetimeGrantedAt DateTime?
+  /// Optional signup provenance. Only creation writes these fields; existing
+  /// accounts are never enrolled by signing in or verifying an old address.
+  signupPlatform          String? // "ios" | "windows" | "macos"; absent = unknown
+  signupLifetimeOffer     String? // "ios" | "desktop"; reservation, not access
+  /// Permanent iOS/iPadOS access activated after verified signup.
+  iosLifetimeGrantedAt    DateTime?
 
   // --- Entitlement overrides & cache -----------------------------------------
   // ALL OPTIONAL, like every column added after launch: on MongoDB `@default` is
@@ -1293,11 +1299,19 @@ model AuthThrottle {
   @@index([windowStartedAt])
 }
 
+/// The current signup offers. Existing reservations and grants do not depend
+/// on this document after the account has been created.
+model SignupLifetimeSettings {
+  // One document, read for every new signup. Absence means both offers are OFF.
+  id                            String   @id @map("_id")
+  iosSignupLifetimeEnabled      Boolean  @default(false)
+  desktopSignupLifetimeEnabled  Boolean  @default(false)
+  updatedAt                     DateTime @updatedAt
+  updatedBy                     String?
+}
+
 /// Every admin action that changes what someone may do, with a reason.
-///
-/// Comps and revocations are the two ways a human can override the resolver, and
-/// an override nobody can explain later is indistinguishable from a mistake — so
-/// the reason is required at the route and the before/after are kept.
+/// Comps, revocations and signup offer changes retain their before/after state.
 model AdminAuditLog {
   id           String   @id @default(auto()) @map("_id") @db.ObjectId
   actorId      String   @db.ObjectId

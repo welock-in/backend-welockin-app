@@ -76,6 +76,10 @@ function stubMethod(
   return calls;
 }
 
+test.beforeEach((t) => {
+  stubMethod(t, prisma.signupLifetimeSettings as any, "findUnique", async () => null);
+});
+
 /** Pin an env flag for one test and put it back. Flags are read at call time. */
 function setEnv(t: Ctx, patch: Record<string, unknown>) {
   const before: Record<string, unknown> = {};
@@ -206,6 +210,17 @@ function fakeUsers(t: Ctx, seed: Row[]) {
     const row = store.find((r) => r.id === args.where.id);
     if (row) Object.assign(row, args.data);
     return copy(row) ?? {};
+  });
+  stubMethod(t, prisma.user as any, "updateMany", async (args: any) => {
+    updates.push([args]);
+    const row = store.find((r) => r.id === args.where.id &&
+      (!args.where.OR || args.where.OR.some((clause: Row) =>
+        typeof clause.emailVerified === "object" && clause.emailVerified !== null
+          ? clause.emailVerified.isSet === false && !Object.hasOwn(r, "emailVerified")
+          : r.emailVerified === clause.emailVerified)));
+    if (!row) return { count: 0 };
+    Object.assign(row, args.data);
+    return { count: 1 };
   });
 
   const creates = stubMethod(t, prisma.user as any, "create", async (args: any) => {
@@ -510,6 +525,63 @@ test("a correct code sets emailVerified and stamps emailVerifiedAt", async (t) =
   assert.equal(updates[0][0].data.emailVerified, true);
   assert.ok(updates[0][0].data.emailVerifiedAt instanceof Date, "and stamps WHEN");
   assert.ok(store[0].consumedAt, "the code is spent");
+});
+
+for (const [platform, offer, grantField] of [
+  ["ios", "ios", "iosLifetimeGrantedAt"],
+  ["windows", "desktop", "desktopLifetimeGrantedAt"],
+  ["macos", "desktop", "desktopLifetimeGrantedAt"],
+] as const) {
+  test(`first email verification activates the saved ${platform} offer even after the switch is OFF`, async (t) => {
+    const users = fakeUsers(t, [{ id: USER_ID, email: USER_EMAIL, emailVerified: false,
+      signupPlatform: platform, signupLifetimeOffer: offer }]);
+    fakeVerifications(t, [{ userId: USER_ID, email: USER_EMAIL, codeHash: hashCode("123456"), expiresAt: minutesFromNow(10) }]);
+    const settingReads = stubMethod(t, prisma.signupLifetimeSettings as any, "findUnique", async () => {
+      throw new Error("Verification must not read promotion settings");
+    });
+    const res = await request(app).post("/api/auth/verify-email").set(auth).send({ code: "123456" });
+    assert.equal(res.status, 200);
+    const granted = users.store[0][grantField];
+    assert.ok(granted instanceof Date);
+    assert.deepEqual(granted, users.store[0].emailVerifiedAt);
+    assert.equal(settingReads.length, 0);
+    const repeat = await request(app).post("/api/auth/verify-email").set(auth).send({ code: "000000" });
+    assert.equal(repeat.status, 200);
+    assert.equal(repeat.body.alreadyVerified, true);
+    assert.equal(users.updates.length, 1);
+    assert.equal(users.store[0][grantField], granted);
+  });
+}
+
+test("a legacy account or an OFF signup cannot gain a new offer by verifying later", async (t) => {
+  const users = fakeUsers(t, [{ id: USER_ID, email: USER_EMAIL, signupPlatform: "ios", signupLifetimeOffer: null }]);
+  fakeVerifications(t, [{ userId: USER_ID, email: USER_EMAIL, codeHash: hashCode("123456"), expiresAt: minutesFromNow(10) }]);
+  const res = await request(app).post("/api/auth/verify-email").set(auth).set("x-welockin-platform", "ios")
+    .send({ code: "123456", signupLifetimeOffer: "ios" });
+  assert.equal(res.status, 200);
+  assert.equal(users.store[0].iosLifetimeGrantedAt, undefined);
+  assert.equal(users.store[0].desktopLifetimeGrantedAt, undefined);
+});
+
+test("invalid or expired email codes cannot activate a reservation", async (t) => {
+  const users = fakeUsers(t, [{ id: USER_ID, email: USER_EMAIL, signupPlatform: "ios", signupLifetimeOffer: "ios" }]);
+  const codes = fakeVerifications(t, [{ userId: USER_ID, email: USER_EMAIL, codeHash: hashCode("123456"), expiresAt: minutesFromNow(10) }]);
+  assert.equal((await request(app).post("/api/auth/verify-email").set(auth).send({ code: "000000" })).status, 400);
+  codes.store[0].expiresAt = minutesFromNow(-1);
+  assert.equal((await request(app).post("/api/auth/verify-email").set(auth).send({ code: "123456" })).status, 400);
+  assert.equal(users.updates.length, 0);
+  assert.equal(users.store[0].iosLifetimeGrantedAt, undefined);
+});
+
+test("parallel valid verifications cannot replace the first lifetime grant timestamp", async (t) => {
+  const users = fakeUsers(t, [{ id: USER_ID, email: USER_EMAIL, signupPlatform: "ios", signupLifetimeOffer: "ios" }]);
+  fakeVerifications(t, [{ userId: USER_ID, email: USER_EMAIL, codeHash: hashCode("123456"), expiresAt: minutesFromNow(10) }],
+    { gate: barrier(2) });
+  const responses = await Promise.all([1, 2].map(() => request(app).post("/api/auth/verify-email").set(auth).send({ code: "123456" })));
+  assert.ok(responses.every((res) => res.status === 200));
+  assert.equal(responses.filter((res) => res.body.alreadyVerified === false).length, 1);
+  assert.equal(responses.filter((res) => res.body.alreadyVerified === true).length, 1);
+  assert.equal(users.store[0].iosLifetimeGrantedAt, users.updates[0][0].data.iosLifetimeGrantedAt);
 });
 
 /*

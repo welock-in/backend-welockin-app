@@ -4,6 +4,7 @@ import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { HttpError, accountGone } from "../lib/http-error";
 import { readDeviceId } from "../lib/device";
+import { readClientPlatform } from "../lib/signup-lifetime";
 import { clientIp, consumeRateLimit } from "../lib/rate-limit";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
@@ -89,7 +90,7 @@ billingRouter.post(
     // view below honestly says this account holds nothing. `restoreConflict`
     // is the WHY — see restoreConflictFor.
     res.json({
-      ...(await resolveAndCache(userId, readDeviceId(req))),
+      ...(await resolveAndCache(userId, readDeviceId(req), readClientPlatform(req))),
       ...(sync.conflict ? { restoreConflict: await restoreConflictFor(sync.conflict) } : {}),
     });
   }),
@@ -162,7 +163,7 @@ billingRouter.post(
     }
 
     res.json({
-      ...(await resolveAndCache(userId, readDeviceId(req))),
+      ...(await resolveAndCache(userId, readDeviceId(req), readClientPlatform(req))),
       // What was actually pulled through, so the client can say "found your
       // purchase" versus "nothing new — contact support" versus "Apple could
       // not be reached, try again".
@@ -272,6 +273,6 @@ billingRouter.get(
   "/entitlement",
   requireAuth,
   asyncHandler(async (req, res) => {
-    res.json(await resolveAndCache(req.user!.id, readDeviceId(req)));
+    res.json(await resolveAndCache(req.user!.id, readDeviceId(req), readClientPlatform(req)));
   }),
 );

@@ -483,6 +483,7 @@ test("a client clock years out of step is recorded, not obeyed", async (t) => {
  * plan — which makes the paywall decorative. See `signupTrialEnabled`.
  */
 function signupStubs(t: Ctx, newUserId: string) {
+  stubMethod(t, prisma.signupLifetimeSettings as any, "findUnique", async () => null);
   stubMethod(t, prisma.user as any, "findUnique", async () => null); // email is free
   return stubMethod(t, prisma.user as any, "create", async () => ({
     id: newUserId,
@@ -500,9 +501,6 @@ function signupStubs(t: Ctx, newUserId: string) {
  * that keeps that from silently coming back.
  */
 test("without the desktop offer, registering does NOT hand out a free window", async (t) => {
-  const offerBefore = env.desktopLifetimeSignupEnabled;
-  env.desktopLifetimeSignupEnabled = false;
-  t.after(() => { env.desktopLifetimeSignupEnabled = offerBefore; });
   signupStubs(t, userId);
   const store = fakeLedger(t, []);
 
@@ -518,12 +516,9 @@ test("without the desktop offer, registering does NOT hand out a free window", a
 /* The switch back, for a change of mind that must not need a code change. */
 test("SIGNUP_TRIAL_ENABLED brings the cardless window back", async (t) => {
   const before = env.signupTrialEnabled;
-  const offerBefore = env.desktopLifetimeSignupEnabled;
-  env.desktopLifetimeSignupEnabled = false;
   (env as any).signupTrialEnabled = true;
   t.after(() => {
     (env as any).signupTrialEnabled = before;
-    env.desktopLifetimeSignupEnabled = offerBefore;
   });
   signupStubs(t, userId);
   const store = fakeLedger(t, []);

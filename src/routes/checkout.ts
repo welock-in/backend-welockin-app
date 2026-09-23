@@ -24,6 +24,7 @@ import {
 } from "../lib/lemonsqueezy";
 import { clientIp, consumeRateLimit } from "../lib/rate-limit";
 import { readDeviceId, isReliableDeviceId } from "../lib/device";
+import { readClientPlatform } from "../lib/signup-lifetime";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { HttpError, accountGone, badRequest, conflict, notFound } from "../lib/http-error";
@@ -132,7 +133,7 @@ checkoutRouter.post(
     // provider, the device trial leg, the outbox, the checkout hold — the
     // outstanding read is advisory: the LOCK below is what enforces it, this
     // read only makes the refusal match the screen).
-    const io = await loadEligibilityInputs(userId, rawDeviceId);
+    const io = await loadEligibilityInputs(userId, rawDeviceId, readClientPlatform(req));
 
     // BEFORE the eligibility gate: a key that no longer matches its payload is a
     // broken request, not an ineligible account, and conflating the two hands the
@@ -679,6 +680,6 @@ checkoutRouter.post(
 
     // The whole answer, receipt included, so the caller's very next paint can
     // be the unlocked app rather than a second round trip.
-    res.json(await resolveAndCache(userId, readDeviceId(req)));
+    res.json(await resolveAndCache(userId, readDeviceId(req), readClientPlatform(req)));
   }),
 );

@@ -26,7 +26,7 @@ import { deterministicObjectId } from "../lib/deterministic-id";
 import { readDeviceId } from "../lib/device";
 import { claimTrialOnSignup } from "../lib/trial-claim";
 import { findPayingAccountForDevice } from "../lib/precheck";
-import { isDesktopDeviceId } from "../lib/desktop-lifetime";
+import { readClientPlatform, reserveSignupLifetimeOffer, signupLifetimeGrantData } from "../lib/signup-lifetime";
 
 const isDuplicateKey = (err: unknown) =>
   err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
@@ -86,7 +86,8 @@ authRouter.post(
 
     const passwordHash = await hashPassword(password);
     const deviceId = readDeviceId(req);
-    const grantDesktopLifetime = env.desktopLifetimeSignupEnabled && isDesktopDeviceId(deviceId);
+    const platform = readClientPlatform(req);
+    const signupLifetimeOffer = await reserveSignupLifetimeOffer(platform);
 
     // NO trial is stamped on the ACCOUNT any more. Registration used to hand out
     // fourteen days, which made a trial exactly as cheap as an email address —
@@ -98,9 +99,9 @@ authRouter.post(
         email,
         passwordHash,
         plan: "trial",
-        // Persist with account creation so there is no intermediate account
-        // whose promised desktop access depends on a second successful write.
-        ...(grantDesktopLifetime ? { desktopLifetimeGrantedAt: new Date() } : {}),
+        // Reserve the offer with creation; only verified email activates it.
+        signupPlatform: platform === "unknown" ? null : platform,
+        signupLifetimeOffer,
       },
     });
 
@@ -109,9 +110,9 @@ authRouter.post(
     // would mean every account created by a current build resolved `expired` from
     // its first second. Best-effort — a ledger write must never cost someone the
     // account they just made.
-    // Desktop lifetime replaces this signup trial. A TrialClaim also matches
-    // by account id, so minting one would leak the desktop offer onto iOS.
-    if (!grantDesktopLifetime) {
+    // A reserved lifetime replaces this signup trial. A TrialClaim also matches
+    // by account id, so minting one would leak a scoped offer across platforms.
+    if (!signupLifetimeOffer) {
       await claimTrialOnSignup(user.id, deviceId, {
         signals: fingerprint.signals,
         // Only ever passed as an explicit false by a client that LOOKED for its
@@ -233,12 +234,19 @@ authRouter.post(
           });
           user = existing;
         } else {
+          const platform = readClientPlatform(req);
+          const signupLifetimeOffer = await reserveSignupLifetimeOffer(platform);
+          const signup = { signupPlatform: platform === "unknown" ? null : platform, signupLifetimeOffer };
+          const verifiedAt = new Date();
           // Same as /register: no trial is stamped on the account. See the note there.
           user = await prisma.user.create({
             data: {
               email,
               emailVerified: true,
+              emailVerifiedAt: verifiedAt,
               plan: "trial",
+              ...signup,
+              ...signupLifetimeGrantData(signup, verifiedAt),
               authProviders: {
                 create: {
                   id: providerId,
@@ -295,7 +303,7 @@ authRouter.post(
     // claim with no DeviceSignal rows, so the machine is invisible to the
     // fingerprint matcher afterwards — a claim that cannot be matched is a claim
     // that cannot stop the next one.
-    if (created) {
+    if (created && !user.signupLifetimeOffer) {
       const fp = parseFingerprint(req);
       await claimTrialOnSignup(user.id, readDeviceId(req), {
         signals: fp.signals,

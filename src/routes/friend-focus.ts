@@ -1,6 +1,6 @@
 import { randomBytes, randomInt } from "node:crypto";
 import { Router } from "express";
-import type { FriendFocusMember, FriendFocusRoom } from "@prisma/client";
+import type { FriendFocusMember, FriendFocusRoom, Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { conflict, forbidden, notFound } from "../lib/http-error";
 import { asyncHandler } from "../middleware/async-handler";
@@ -29,17 +29,61 @@ function attemptToken(): string {
 }
 
 type RoomWithMembers = FriendFocusRoom & { members: FriendFocusMember[] };
+type RoomDb = Pick<Prisma.TransactionClient, "friendFocusRoom" | "friendFocusMember">;
+class RoomWriteConflict extends Error {}
+
+/** Every membership/state mutation writes the parent room in the same Mongo
+ * transaction. Separate member documents otherwise allow concurrent joins,
+ * ready changes and starts to commit from incompatible snapshots. Retry the
+ * whole read/validate/write operation after a write conflict. */
+async function changeRoom<T>(
+  where: Prisma.FriendFocusRoomWhereUniqueInput,
+  validate: (room: RoomWithMembers) => void,
+  mutate: (tx: RoomDb, room: RoomWithMembers) => Promise<T>,
+): Promise<T> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const room = await tx.friendFocusRoom.findUnique({
+          where, include: { members: { orderBy: { joinedAt: "asc" } } },
+        });
+        if (!room) throw notFound("Room not found");
+        validate(room);
+        // Explicitly advance even inside the same millisecond, so the parent
+        // write cannot collapse to a no-op and admit two stale snapshots.
+        const locked = await tx.friendFocusRoom.updateMany({
+          where: { id: room.id, updatedAt: room.updatedAt },
+          data: { updatedAt: new Date(Math.max(Date.now(), room.updatedAt.getTime() + 1)) },
+        });
+        if (locked.count !== 1) throw new RoomWriteConflict();
+        return mutate(tx, room);
+      }, { maxWait: 5_000, timeout: 10_000 });
+    } catch (error) {
+      const retryable = error instanceof RoomWriteConflict ||
+        (typeof error === "object" && error !== null && "code" in error && error.code === "P2034");
+      if (!retryable) throw error;
+      if (attempt === 4) throw conflict("The room changed. Please try again.");
+      await new Promise((resolve) => setTimeout(resolve, 10 * (attempt + 1)));
+    }
+  }
+  throw conflict("The room changed. Please try again.");
+}
+
+function requireMember(room: RoomWithMembers, userId: string): void {
+  if (!room.members.some((member) => member.userId === userId)) throw notFound("Room not found");
+}
 
 function toPublicRoom(room: RoomWithMembers, userId: string) {
   const naturallyEnded =
     room.status === "active" && room.endsAt != null && room.endsAt.getTime() <= Date.now();
+  const expiredWaiting = room.status === "waiting" && room.expiresAt.getTime() <= Date.now();
   return {
     id: room.id,
     inviteCode: room.inviteCode,
     name: room.name,
     durationMinutes: room.durationMinutes,
     hardLock: room.hardLock,
-    status: naturallyEnded ? "ended" : room.status,
+    status: naturallyEnded || expiredWaiting ? "ended" : room.status,
     startsAt: room.startsAt,
     endsAt: room.endsAt,
     expiresAt: room.expiresAt,
@@ -61,12 +105,13 @@ function toPublicRoom(room: RoomWithMembers, userId: string) {
 async function ensureMemberAttemptToken(
   room: RoomWithMembers,
   userId: string,
+  db: RoomDb = prisma,
 ): Promise<RoomWithMembers> {
   const current = room.members.find((member) => member.userId === userId);
   if (!current || current.attemptToken) return room;
 
   const nextToken = attemptToken();
-  await prisma.friendFocusMember.update({
+  await db.friendFocusMember.update({
     where: { roomId_userId: { roomId: room.id, userId } },
     data: { attemptToken: nextToken },
   });
@@ -78,15 +123,15 @@ async function ensureMemberAttemptToken(
   };
 }
 
-async function roomForMember(roomId: string, userId: string): Promise<RoomWithMembers> {
-  const room = await prisma.friendFocusRoom.findUnique({
+async function roomForMember(roomId: string, userId: string, db: RoomDb = prisma): Promise<RoomWithMembers> {
+  const room = await db.friendFocusRoom.findUnique({
     where: { id: roomId },
     include: { members: { orderBy: { joinedAt: "asc" } } },
   });
   if (!room || !room.members.some((member) => member.userId === userId)) {
     throw notFound("Room not found");
   }
-  return ensureMemberAttemptToken(room, userId);
+  return ensureMemberAttemptToken(room, userId, db);
 }
 
 function isJoinable(room: RoomWithMembers | null): room is RoomWithMembers {
@@ -139,14 +184,17 @@ friendFocusRouter.post(
   asyncHandler(async (req, res) => {
     const input = friendFocusReadySchema.parse(req.body);
     const userId = req.user!.id;
-    const room = await roomForMember(req.params.id, userId);
-    if (room.status !== "waiting") throw conflict("This room has already started");
-
-    await prisma.friendFocusMember.update({
-      where: { roomId_userId: { roomId: room.id, userId } },
-      data: { ready: input.ready },
+    const updated = await changeRoom({ id: req.params.id }, (room) => {
+      requireMember(room, userId);
+      if (!isJoinable(room)) throw conflict("This room has already started or expired");
+    }, async (tx, room) => {
+      if (!isJoinable(room)) throw conflict("This room has already started or expired");
+      await tx.friendFocusMember.update({
+        where: { roomId_userId: { roomId: room.id, userId } },
+        data: { ready: input.ready },
+      });
+      return roomForMember(room.id, userId, tx);
     });
-    const updated = await roomForMember(room.id, userId);
     res.json({ room: toPublicRoom(updated, userId) });
   }),
 );
@@ -156,25 +204,27 @@ friendFocusRouter.post(
   requireAuth,
   asyncHandler(async (req, res) => {
     const userId = req.user!.id;
-    const room = await roomForMember(req.params.id, userId);
-    if (room.hostUserId !== userId) throw forbidden("Only the host can start the room");
-    if (room.status === "active") {
-      res.json({ room: toPublicRoom(room, userId) });
-      return;
-    }
-    if (room.status !== "waiting") throw conflict("This room can no longer start");
-    if (room.members.length < 2) throw conflict("Invite at least one friend first");
-    if (room.members.some((member) => !member.ready)) {
-      throw conflict("Everyone must be ready before the room starts");
-    }
-
-    const startsAt = new Date();
-    const endsAt = new Date(startsAt.getTime() + room.durationMinutes * 60_000);
-    await prisma.friendFocusRoom.updateMany({
-      where: { id: room.id, status: "waiting" },
-      data: { status: "active", startsAt, endsAt },
+    const started = await changeRoom({ id: req.params.id }, (room) => {
+      requireMember(room, userId);
+      if (room.hostUserId !== userId) throw forbidden("Only the host can start the room");
+      if (room.status === "active") return; // idempotent, never restart the timer
+      if (!isJoinable(room)) throw conflict("This room can no longer start");
+      if (room.members.length < 2) throw conflict("Invite at least one friend first");
+      if (room.members.some((member) => !member.ready)) {
+        throw conflict("Everyone must be ready before the room starts");
+      }
+    }, async (tx, room) => {
+      if (room.status === "active") return ensureMemberAttemptToken(room, userId, tx);
+      const startsAt = new Date();
+      // Expiry may pass while the transaction waits for its parent write.
+      if (room.expiresAt.getTime() <= startsAt.getTime()) throw conflict("This room has expired");
+      const endsAt = new Date(startsAt.getTime() + room.durationMinutes * 60_000);
+      await tx.friendFocusRoom.updateMany({
+        where: { id: room.id, status: "waiting" },
+        data: { status: "active", startsAt, endsAt },
+      });
+      return roomForMember(room.id, userId, tx);
     });
-    const started = await roomForMember(room.id, userId);
     res.json({ room: toPublicRoom(started, userId) });
   }),
 );
@@ -184,23 +234,18 @@ friendFocusRouter.post(
   requireAuth,
   asyncHandler(async (req, res) => {
     const userId = req.user!.id;
-    const room = await roomForMember(req.params.id, userId);
-    const isActive =
-      room.status === "active" && room.endsAt != null && room.endsAt.getTime() > Date.now();
-    if (isActive && room.hardLock) {
-      throw conflict("A Hard Lock room cannot be left before the shared timer ends");
-    }
-
-    if (room.hostUserId === userId && room.status === "waiting") {
-      await prisma.friendFocusRoom.update({
-        where: { id: room.id },
-        data: { status: "ended" },
-      });
-    } else {
-      await prisma.friendFocusMember.delete({
-        where: { roomId_userId: { roomId: room.id, userId } },
-      });
-    }
+    await changeRoom({ id: req.params.id }, (room) => {
+      requireMember(room, userId);
+      const isActive = room.status === "active" && room.endsAt != null && room.endsAt.getTime() > Date.now();
+      if (isActive && room.hardLock) throw conflict("A Hard Lock room cannot be left before the shared timer ends");
+    }, async (tx, room) => {
+      // Leaving an expired waiting room remains allowed, so clients can clear it.
+      if (room.hostUserId === userId && room.status === "waiting") {
+        await tx.friendFocusRoom.update({ where: { id: room.id }, data: { status: "ended" } });
+      } else {
+        await tx.friendFocusMember.delete({ where: { roomId_userId: { roomId: room.id, userId } } });
+      }
+    });
     res.json({ left: true });
   }),
 );
@@ -235,34 +280,24 @@ friendFocusRouter.post(
   asyncHandler(async (req, res) => {
     const input = friendFocusJoinSchema.parse(req.body);
     const userId = req.user!.id;
-    const room = await prisma.friendFocusRoom.findUnique({
-      where: { inviteCode: input.code },
-      include: { members: { orderBy: { joinedAt: "asc" } } },
+    const joined = await changeRoom({ inviteCode: input.code }, (room) => {
+      if (!isJoinable(room)) throw notFound("Invitation not found or expired");
+      if (input.acceptedHardLock !== room.hardLock) {
+        throw conflict("The room mode changed. Review the invitation again.");
+      }
+      if (!room.members.some((member) => member.userId === userId) && room.members.length >= ROOM_CAPACITY) {
+        throw conflict("This room is full");
+      }
+    }, async (tx, room) => {
+      if (!isJoinable(room)) throw notFound("Invitation not found or expired");
+      if (!room.members.some((member) => member.userId === userId)) {
+        await tx.friendFocusMember.create({
+          data: { roomId: room.id, userId, displayName: input.displayName ?? "Friend", attemptToken: attemptToken() },
+        });
+      }
+      return roomForMember(room.id, userId, tx);
     });
-    if (!isJoinable(room)) throw notFound("Invitation not found or expired");
-    if (input.acceptedHardLock !== room.hardLock) {
-      throw conflict("The room mode changed. Review the invitation again.");
-    }
-
-    const existing = room.members.find((member) => member.userId === userId);
-    if (!existing) {
-      if (room.members.length >= ROOM_CAPACITY) throw conflict("This room is full");
-      await prisma.friendFocusMember.create({
-        data: {
-          roomId: room.id,
-          userId,
-          displayName: input.displayName ?? "Friend",
-          attemptToken: attemptToken(),
-        },
-      });
-    }
-
-    const joined = await prisma.friendFocusRoom.findUnique({
-      where: { id: room.id },
-      include: { members: { orderBy: { joinedAt: "asc" } } },
-    });
-    if (!joined) throw notFound("Room not found");
-    res.json({ room: toPublicRoom(await ensureMemberAttemptToken(joined, userId), userId) });
+    res.json({ room: toPublicRoom(joined, userId) });
   }),
 );
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { afterEach, beforeEach, test } from "node:test";
 import request from "supertest";
 import { createApp } from "../app";
 import { signToken } from "../lib/jwt";
@@ -8,6 +8,19 @@ import { stubAccountGuard } from "./test-helpers";
 
 const app = createApp();
 stubAccountGuard();
+
+// Unit tests model transaction boundaries; actual isolation and rollback are
+// covered by tests/mongo/friend-focus.mongo.test.ts against a replica set.
+const originalTransaction = prisma.$transaction;
+const originalRoomUpdateMany = prisma.friendFocusRoom.updateMany;
+beforeEach(() => {
+  (prisma as any).$transaction = async (work: any) => work(prisma);
+  (prisma.friendFocusRoom as any).updateMany = async () => ({ count: 1 });
+});
+afterEach(() => {
+  prisma.$transaction = originalTransaction;
+  prisma.friendFocusRoom.updateMany = originalRoomUpdateMany;
+});
 
 const hostId = "507f1f77bcf86cd799439011";
 const guestId = "507f1f77bcf86cd799439012";
@@ -263,7 +276,7 @@ test("the host starts one shared clock only after everyone is ready", async (t) 
   assert.equal(res.status, 200);
   assert.equal(res.body.room.status, "active");
   assert.equal(res.body.room.hardLock, true);
-  const data = updates[0][0].data;
+  const data = updates.find(([args]) => args.data.status === "active")![0].data;
   assert.ok(data.startsAt.getTime() >= before && data.startsAt.getTime() <= after);
   assert.equal(data.endsAt.getTime() - data.startsAt.getTime(), 50 * 60_000);
 });
@@ -317,6 +330,54 @@ test("an active Hard Lock member cannot leave early", async (t) => {
 
   assert.equal(res.status, 409);
   assert.equal(deletes.length, 0);
+});
+
+test("an expired waiting room cannot start, ready or accept a new member", async (t) => {
+  const rooms = prisma.friendFocusRoom as unknown as Record<string, any>;
+  stubMethod(t, rooms, "findUnique", async () => room({
+    expiresAt: new Date(Date.now() - 1_000),
+    members: [member(hostId, "Hedi", true), member(guestId, "Lina", true)],
+  }));
+  const writes = stubMethod(t, rooms, "updateMany", async () => ({ count: 1 }));
+  const started = await request(app).post("/api/friend-focus/rooms/65f000000000000000000101/start").set(auth);
+  const ready = await request(app).post("/api/friend-focus/rooms/65f000000000000000000101/ready").set(guestAuth).send({ ready: false });
+  const joined = await request(app).post("/api/friend-focus/join").set(guestAuth).send({ code: "F7K9M2Q8", acceptedHardLock: true });
+  const polled = await request(app).get("/api/friend-focus/rooms/65f000000000000000000101").set(auth);
+  assert.deepEqual([started.status, ready.status, joined.status], [409, 409, 404]);
+  assert.equal(polled.body.room.status, "ended");
+  assert.equal(writes.length, 0);
+});
+
+test("a write conflict rereads membership before retrying a join", async (t) => {
+  const rooms = prisma.friendFocusRoom as unknown as Record<string, any>;
+  let transactions = 0;
+  stubMethod(t, prisma as any, "$transaction", async (work) => {
+    transactions++;
+    return work(prisma);
+  });
+  stubMethod(t, rooms, "findUnique", async () => room({ members: transactions === 1
+    ? [member(hostId, "Host"), member("507f1f77bcf86cd799439013", "B"), member("507f1f77bcf86cd799439014", "C")]
+    : [member(hostId, "Host"), member("507f1f77bcf86cd799439013", "B"), member("507f1f77bcf86cd799439014", "C"), member("507f1f77bcf86cd799439015", "D")],
+  }));
+  stubMethod(t, rooms, "updateMany", async () => { throw { code: "P2034" }; });
+  const creates = stubMethod(t, prisma.friendFocusMember as any, "create", async () => member(guestId, "Lina"));
+  const response = await request(app).post("/api/friend-focus/join").set(guestAuth).send({ code: "F7K9M2Q8", acceptedHardLock: true });
+  assert.equal(response.status, 409);
+  assert.match(JSON.stringify(response.body), /full/);
+  assert.equal(transactions, 2);
+  assert.equal(creates.length, 0);
+});
+
+test("duplicate start returns the existing shared deadline", async (t) => {
+  const endsAt = new Date(Date.now() + 60_000);
+  const startsAt = new Date(endsAt.getTime() - 50 * 60_000);
+  stubMethod(t, prisma.friendFocusRoom as any, "findUnique", async () => room({ status: "active", startsAt, endsAt,
+    members: [member(hostId, "Host", true), member(guestId, "Guest", true)] }));
+  const writes = stubMethod(t, prisma.friendFocusRoom as any, "updateMany", async () => ({ count: 1 }));
+  const response = await request(app).post("/api/friend-focus/rooms/65f000000000000000000101/start").set(auth);
+  assert.equal(response.status, 200);
+  assert.equal(response.body.room.endsAt, endsAt.toISOString());
+  assert.equal(writes.filter(([args]) => args.data.status === "active").length, 0);
 });
 
 test("a blocked-app attempt notifies every other active room member, never the actor", async (t) => {

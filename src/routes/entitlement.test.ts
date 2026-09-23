@@ -499,7 +499,10 @@ function signupStubs(t: Ctx, newUserId: string) {
  * end of onboarding would admit everyone and gate nothing. This test is the one
  * that keeps that from silently coming back.
  */
-test("registering does NOT hand out a free window — a plan must be chosen", async (t) => {
+test("without the desktop offer, registering does NOT hand out a free window", async (t) => {
+  const offerBefore = env.desktopLifetimeSignupEnabled;
+  env.desktopLifetimeSignupEnabled = false;
+  t.after(() => { env.desktopLifetimeSignupEnabled = offerBefore; });
   signupStubs(t, userId);
   const store = fakeLedger(t, []);
 
@@ -515,9 +518,12 @@ test("registering does NOT hand out a free window — a plan must be chosen", as
 /* The switch back, for a change of mind that must not need a code change. */
 test("SIGNUP_TRIAL_ENABLED brings the cardless window back", async (t) => {
   const before = env.signupTrialEnabled;
+  const offerBefore = env.desktopLifetimeSignupEnabled;
+  env.desktopLifetimeSignupEnabled = false;
   (env as any).signupTrialEnabled = true;
   t.after(() => {
     (env as any).signupTrialEnabled = before;
+    env.desktopLifetimeSignupEnabled = offerBefore;
   });
   signupStubs(t, userId);
   const store = fakeLedger(t, []);

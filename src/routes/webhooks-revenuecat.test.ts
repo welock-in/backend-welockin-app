@@ -12,6 +12,7 @@ import {
   RC_PRODUCT_YEARLY,
   type RcSubscriber,
 } from "../lib/revenuecat";
+import { rcTrialPhase } from "./webhooks-revenuecat";
 
 /*
  * The RevenueCat webhook turns iOS money into access, and its perimeter is an
@@ -25,7 +26,8 @@ const app = createApp();
 const TOKEN = "rc-webhook-token-test";
 const USER = "507f1f77bcf86cd799439011";
 const OTHER_USER = "507f1f77bcf86cd799439022";
-const FUTURE = "2026-09-01T00:00:00.000Z";
+// Keep the active fixture in the future as the calendar advances.
+const FUTURE = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
 type Ctx = { after: (fn: () => void) => void };
 
@@ -903,4 +905,163 @@ test("a SANDBOX lifetime lands on its OWN row — the paid lifetime is untouched
     [...db.purchaseSweep[0][0].where.externalId.notIn].sort(),
     [`${USER}:${lifetime}`, `${USER}:${lifetime}:sandbox`].sort(),
   );
+});
+
+/* ── analytics ────────────────────────────────────────────────────────────
+ *
+ * The same two events the Lemon Squeezy webhook sends, so a funnel can add an
+ * iPhone to a Mac. `stubFetch` above answers a RevenueCat body to every URL,
+ * PostHog's included — which is harmless, the emitter only reads `res.ok` — so
+ * these tests filter the recorded calls by host.
+ *
+ * Every other test in this file runs with no POSTHOG_API_KEY, which is why they
+ * can still count RevenueCat's API traffic exactly.
+ */
+
+const POSTHOG = { posthogApiKey: "phc_test", posthogHost: "https://us.i.posthog.com" };
+
+/** What was sent to PostHog, decoded. */
+function posthogSends(fetches: any[][]): { event: string; properties: any; uuid: string }[] {
+  return fetches
+    .filter((c) => String(c[0]).includes("posthog.com"))
+    .map((c) => JSON.parse(String(c[1]?.body ?? "{}")));
+}
+
+test("rcTrialPhase reads the conversion before the period", () => {
+  // On the RENEWAL that converts a trial, period_type is ALREADY "NORMAL".
+  // Testing the period first misses every conversion, silently and forever.
+  assert.equal(
+    rcTrialPhase({ type: "RENEWAL", periodType: "NORMAL", isTrialConversion: true, cancelReason: null }),
+    "trial_converted",
+  );
+  assert.equal(
+    rcTrialPhase({ type: "INITIAL_PURCHASE", periodType: "TRIAL", isTrialConversion: null, cancelReason: null }),
+    "trial_started",
+  );
+  // The webhook shouts, the subscribers API whispers. Both must work.
+  assert.equal(
+    rcTrialPhase({ type: "INITIAL_PURCHASE", periodType: "trial", isTrialConversion: null, cancelReason: null }),
+    "trial_started",
+  );
+  assert.equal(
+    rcTrialPhase({ type: "CANCELLATION", periodType: "TRIAL", isTrialConversion: null, cancelReason: "UNSUBSCRIBE" }),
+    "trial_cancelled",
+  );
+  // A card that failed is not someone changing their mind. Counting the two
+  // together is how a billing incident comes to look like a product problem.
+  assert.equal(
+    rcTrialPhase({ type: "CANCELLATION", periodType: "TRIAL", isTrialConversion: null, cancelReason: "BILLING_ERROR" }),
+    null,
+  );
+  assert.equal(
+    rcTrialPhase({ type: "RENEWAL", periodType: "NORMAL", isTrialConversion: false, cancelReason: null }),
+    null,
+  );
+});
+
+test("a subscription delivery reports its state with the shared schema", async (t) => {
+  configured(t, POSTHOG);
+  stubDb(t);
+  const fetches = stubFetch(t);
+
+  await deliver(eventBody({ type: "RENEWAL" }));
+
+  const sends = posthogSends(fetches);
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].event, "subscription_state_changed");
+  const p = sends[0].properties;
+  assert.equal(p.provider, "revenuecat");
+  assert.equal(p.store, "app_store");
+  assert.equal(p.product_id, RC_PRODUCT_MONTHLY);
+  assert.equal(p.interval, "monthly");
+  assert.equal(p.status, "active");
+  assert.equal(p.environment, "prod");
+  assert.equal(p.rc_event, "RENEWAL");
+});
+
+test("the environment comes from the re-fetched subscriber, never from the event", async (t) => {
+  // Two tests above already pin this for the ROW. The same rule has to hold on
+  // the way out, or a sandbox-crying event would relabel real revenue.
+  configured(t, POSTHOG);
+  stubDb(t);
+  const fetches = stubFetch(t, () =>
+    subscriber({
+      subscriptions: {
+        [RC_PRODUCT_MONTHLY]: { expires_date: FUTURE, period_type: "normal", is_sandbox: false },
+      },
+    }),
+  );
+
+  await deliver(eventBody({ type: "RENEWAL", environment: "SANDBOX" }));
+
+  const p = posthogSends(fetches)[0].properties;
+  assert.equal(p.environment, "prod", "the event said SANDBOX; the subscriber said otherwise");
+  assert.equal(p.test_mode, false);
+});
+
+test("a lifetime renewal does NOT re-report the purchase", async (t) => {
+  // THE TRAP. The RevenueCat sync upserts the same Purchase row on every
+  // delivery — the key is userId:productId — so "a row was written" is true for
+  // a lifetime owner's every renewal, cancellation and expiration. Gating on the
+  // event type is what stops one purchase being counted a dozen times.
+  const lifetime = RC_LIFETIME_PRODUCT_IDS[0];
+  configured(t, POSTHOG);
+  stubDb(t);
+  const fetches = stubFetch(t, () =>
+    subscriber({
+      subscriptions: {},
+      non_subscriptions: { [lifetime]: [{ id: "tx1", purchase_date: "2026-01-01T00:00:00Z", is_sandbox: false }] },
+      entitlements: { pro: { product_identifier: lifetime } },
+    }),
+  );
+
+  await deliver(eventBody({ type: "RENEWAL", product_id: lifetime }));
+
+  assert.equal(posthogSends(fetches).filter((s) => s.event === "purchase_completed").length, 0);
+});
+
+test("an initial lifetime purchase IS reported, once", async (t) => {
+  const lifetime = RC_LIFETIME_PRODUCT_IDS[0];
+  configured(t, POSTHOG);
+  stubDb(t);
+  const fetches = stubFetch(t, () =>
+    subscriber({
+      subscriptions: {},
+      non_subscriptions: { [lifetime]: [{ id: "tx1", purchase_date: "2026-01-01T00:00:00Z", is_sandbox: false }] },
+      entitlements: { pro: { product_identifier: lifetime } },
+    }),
+  );
+
+  await deliver(eventBody({ type: "NON_RENEWING_PURCHASE", product_id: lifetime, price: 49.99, currency: "EUR" }));
+
+  const sends = posthogSends(fetches).filter((s) => s.event === "purchase_completed");
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].properties.plan, "lifetime");
+  // `price` and `currency` are read through zod's passthrough. The schema is
+  // deliberately NOT extended for them: a declared type that RevenueCat later
+  // contradicts is a 400 on a delivery that worked yesterday.
+  assert.equal(sends[0].properties.revenue_usd, 49.99);
+  assert.equal(sends[0].properties.currency, "EUR");
+});
+
+test("a PostHog outage cannot make RevenueCat redeliver", async (t) => {
+  configured(t, POSTHOG);
+  const db = stubDb(t);
+  const warn = console.error;
+  console.error = () => {};
+  t.after(() => {
+    console.error = warn;
+  });
+  stubMethod(t, globalThis as any, "fetch", async (url: any) => {
+    if (String(url).includes("posthog.com")) throw new Error("posthog down");
+    return new Response(JSON.stringify({ subscriber: subscriber() }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+
+  const res = await deliver(eventBody({ type: "RENEWAL" }));
+
+  assert.equal(res.status, 200);
+  assert.equal(finalStatus(db.eventMark), "processed");
 });

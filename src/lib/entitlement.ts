@@ -5,7 +5,8 @@
  * so the webhook path and the refresh path converge regardless of arrival order
  * (CRDT-like). Precedence (first match wins):
  *
- *   revoked (admin) > active purchase > admin comp > active device-trial >
+ *   revoked (admin) > lifetime purchase/desktop grant > subscription >
+ *   admin comp > active device-trial >
  *   refunded > expired
  *
  * The route layer (src/routes/entitlement.ts) reads the rows, calls this, and
@@ -234,6 +235,8 @@ export interface EntitlementView {
 
 export interface EntitlementInputs {
   now: Date;
+  /** Permanent signup grant, scoped by the caller to macOS/Windows only. */
+  hasDesktopLifetime?: boolean;
   hasActivePurchase: boolean; // a non-refunded Purchase exists (the LIFETIME leg)
   hasRefundedPurchase: boolean; // a refunded Purchase exists
   /**
@@ -266,7 +269,7 @@ export function computeEntitlement(input: EntitlementInputs): EntitlementView {
   if (input.accessRevoked) {
     status = "revoked";
     isPro = false;
-  } else if (input.hasActivePurchase) {
+  } else if (input.hasActivePurchase || input.hasDesktopLifetime) {
     status = "active";
     isPro = true;
   } else if (input.hasActiveSubscription) {

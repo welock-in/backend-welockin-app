@@ -79,6 +79,17 @@ healthRouter.get("/config", requireAdmin, (_req, res) => {
       resend: Boolean(env.resendApiKey),
       verificationEnforced: env.emailVerificationEnforced,
     },
+    analytics: {
+      // The ONLY reliable way to know whether the running deployment can see the
+      // key — setting a variable in Vercel applies to the NEXT deployment, not
+      // this one, which is the trap the note at the top of this file describes.
+      posthog: Boolean(env.posthogApiKey),
+      // And the host, because the region fails SILENTLY: a key issued in one
+      // cloud, sent to the other, is accepted with a 200 and stored nowhere. An
+      // empty PostHog dashboard looks identical to a product nobody uses, so the
+      // host is worth being able to read back rather than assume. Not a secret.
+      posthogHost: env.posthogHost,
+    },
     deviceBindingEnforced: env.deviceBindingEnforced,
   });
 });

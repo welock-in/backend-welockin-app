@@ -7,7 +7,13 @@ import { asyncHandler } from "../middleware/async-handler";
 import { isObjectId } from "../lib/lemonsqueezy";
 import { prisma } from "../lib/prisma";
 import { claimWebhookEvent, markWebhookEvent } from "../lib/webhook-events";
-import { RC_KNOWN_PRODUCT_IDS, RC_PROVIDER, syncUserFromRevenueCat } from "../lib/revenuecat";
+import { capture } from "../lib/posthog";
+import {
+  RC_KNOWN_PRODUCT_IDS,
+  RC_PROVIDER,
+  syncUserFromRevenueCat,
+  type RcSyncResult,
+} from "../lib/revenuecat";
 import { resolveAndCache } from "./entitlement";
 
 export const revenueCatWebhookRouter = Router();
@@ -109,6 +115,170 @@ const rcWebhookSchema = z
   .passthrough();
 
 type RcWebhook = z.infer<typeof rcWebhookSchema>;
+
+/* ── analytics ────────────────────────────────────────────────────────────
+ *
+ * The same two events the Lemon Squeezy webhook sends, with the same property
+ * names, so a funnel can add an iPhone to a Mac without knowing that two
+ * different companies took the money.
+ *
+ * Everything here reads the event through `passthrough`. THE SCHEMA ABOVE IS
+ * NOT TO BE EXTENDED for it: declaring `price: z.number()` would make
+ * `safeParse` fail the day RevenueCat sends a string, which is a 400
+ * INVALID_PAYLOAD on a delivery that worked yesterday, which is a redelivery
+ * loop on the path that records purchases. A field read defensively out of the
+ * bag costs nothing and cannot break a payload.
+ */
+
+/** Read an unknown bag without trusting it. */
+const passthrough = (event: RcWebhook["event"]) => event as unknown as Record<string, unknown>;
+const asNumber = (v: unknown): number | null =>
+  typeof v === "number" && Number.isFinite(v) ? v : null;
+const asString = (v: unknown): string | null =>
+  typeof v === "string" && v.trim() ? v.trim() : null;
+
+/**
+ * Which moment of a free trial this event is, if any.
+ *
+ * NOT event names — `SERVER_EVENTS` is closed and fingerprinted across four
+ * repositories, so adding three names there would turn all four red. This is a
+ * property of `subscription_state_changed`.
+ *
+ * THE ORDER OF THE TESTS IS LOAD-BEARING. `is_trial_conversion` is checked
+ * first because on the RENEWAL that converts a trial, `period_type` has already
+ * become NORMAL — testing the period first misses every conversion, silently
+ * and forever.
+ *
+ * And the case: this webhook says "TRIAL", the subscribers API says "trial",
+ * and the row built from the re-fetch carries the lowercase one. Both are
+ * uppercased before comparing, because a mismatch here does not throw — it just
+ * reports zero trials.
+ */
+export function rcTrialPhase(input: {
+  type: string;
+  periodType: string | null;
+  isTrialConversion: boolean | null;
+  cancelReason: string | null;
+}): "trial_started" | "trial_converted" | "trial_cancelled" | null {
+  const type = input.type.toUpperCase();
+  const period = (input.periodType ?? "").toUpperCase();
+
+  if (input.isTrialConversion === true) return "trial_converted";
+  if (type === "INITIAL_PURCHASE" && period === "TRIAL") return "trial_started";
+  if (type === "CANCELLATION" && period === "TRIAL") {
+    // A card that failed is not someone changing their mind. Counting the two
+    // together is how a billing incident comes to look like a product problem.
+    const reason = (input.cancelReason ?? "UNSUBSCRIBE").toUpperCase();
+    return reason === "BILLING_ERROR" ? null : "trial_cancelled";
+  }
+  if (type === "EXPIRATION" && period === "TRIAL") return "trial_cancelled";
+  return null;
+}
+
+/**
+ * Which event types may report a purchase.
+ *
+ * Gated on the TYPE and not on the row write, and that is the whole subtlety.
+ * The RevenueCat sync upserts the same Purchase row on every delivery — the key
+ * is `userId:productId` — so "a row was written" is true for a lifetime owner's
+ * every renewal, cancellation and expiration. The Lemon Squeezy side has an
+ * `if (!existing)` guard for this; here there is none, and a deterministic uuid
+ * does not save us either, because PostHog's de-duplication window is not
+ * eternal and each of those deliveries carries a different event id anyway.
+ */
+const PURCHASE_EVENT_TYPES = new Set(["INITIAL_PURCHASE", "NON_RENEWING_PURCHASE"]);
+
+/**
+ * Report what this delivery changed, for one account.
+ *
+ * Called from the route and never from lib/revenuecat.ts: `syncUserFromRevenueCat`
+ * is shared with POST /api/billing/revenuecat/refresh, which the client polls
+ * freely — emitting inside the module would turn every poll into a revenue
+ * event. The Lemon Squeezy side emits from its route for the same reason.
+ *
+ * Awaited, and each call individually caught. A throw here would reach the
+ * route's catch, which marks the event failed and answers 500, which is an
+ * instruction to RevenueCat to redeliver.
+ */
+async function emitAnalytics(
+  userId: string,
+  event: RcWebhook["event"],
+  sync: RcSyncResult,
+): Promise<void> {
+  // A conflict granted nothing and revoked the caller's stale rows. Reporting a
+  // purchase here would invent revenue that never existed.
+  if (sync.conflict || !sync.mirrored) return;
+
+  const bag = passthrough(event);
+  const type = event.type.toUpperCase();
+  const when =
+    typeof event.event_timestamp_ms === "number" ? new Date(event.event_timestamp_ms) : new Date();
+  const shared = {
+    provider: RC_PROVIDER,
+    store: "app_store",
+    rc_event: type,
+    // RevenueCat's own USD figure. Absent on most event types, and null is the
+    // honest answer — a zero would read as "free" on every chart.
+    revenue_usd: asNumber(bag.price),
+    amount_native: asNumber(bag.price_in_purchased_currency),
+    currency: asString(bag.currency),
+    // Apple's cut is not in the webhook's `price`.
+    is_gross: true,
+  };
+
+  for (const row of sync.mirrored) {
+    if (row.kind === "subscription") {
+      await capture({
+        event: "subscription_state_changed",
+        distinctId: userId,
+        // One delivery can touch two accounts (a TRANSFER) and one account can
+        // hold two subscriptions. The event id alone would let PostHog collapse
+        // all but one of them.
+        dedupeKey: `rc:sub:${event.id}:${row.externalId}`,
+        timestamp: when,
+        properties: {
+          ...shared,
+          product_id: row.productId,
+          interval: row.interval,
+          status: row.status,
+          will_renew: row.willRenew,
+          valid_until: row.validUntil?.toISOString() ?? null,
+          // The environment of the ROW, from the re-fetched subscriber's own
+          // is_sandbox — never the event's. Two tests upstream pin that an event
+          // crying SANDBOX cannot hide a production purchase.
+          environment: row.environment === "sandbox" ? "sandbox" : "prod",
+          test_mode: row.environment === "sandbox",
+          trial_phase: rcTrialPhase({
+            type,
+            // The row's lowercase value, or the event's uppercase one. Both are
+            // normalised inside.
+            periodType: row.periodType ?? asString(bag.period_type),
+            isTrialConversion: typeof bag.is_trial_conversion === "boolean" ? bag.is_trial_conversion : null,
+            cancelReason: asString(bag.cancel_reason),
+          }),
+        },
+      }).catch((e) => console.error("[revenuecat] posthog subscription_state_changed:", e));
+      continue;
+    }
+
+    // Purchases. Every one of them is a lifetime by construction — the
+    // projection admits nothing else.
+    if (!PURCHASE_EVENT_TYPES.has(type) || row.isRefunded) continue;
+    await capture({
+      event: "purchase_completed",
+      distinctId: userId,
+      dedupeKey: `rc:purchase:${event.id}:${row.externalId}`,
+      timestamp: when,
+      properties: {
+        ...shared,
+        plan: "lifetime",
+        product_id: row.productId,
+        environment: row.environment === "sandbox" ? "sandbox" : "prod",
+        test_mode: row.environment === "sandbox",
+      },
+    }).catch((e) => console.error("[revenuecat] posthog purchase_completed:", e));
+  }
+}
 
 /** Event families that legitimately arrive without a store/product. */
 const STORELESS_TYPES = new Set(["TRANSFER", "TEST"]);
@@ -378,7 +548,8 @@ revenueCatWebhookRouter.post(
       // THE WORK: re-fetch each touched subscriber and mirror the snapshot.
       // The event's own claims are never written — see the header comment.
       for (const userId of known) {
-        await syncUserFromRevenueCat(userId);
+        const sync = await syncUserFromRevenueCat(userId);
+        await emitAnalytics(userId, event, sync);
         // Refresh the denormalized cache so GET /api/me agrees without waiting
         // for the next entitlement read. Best-effort: the rows are already
         // written, and a cache miss must not turn a recorded purchase into a

@@ -1,77 +1,41 @@
 /**
- * Seed the cross-device focus notification. Idempotent — safe to re-run.
- * Needs a live DATABASE_URL.
+ * Retire the data-driven cross-device focus notification. Idempotent — safe to
+ * re-run. Needs a live DATABASE_URL.
  *   npm run notifications:seed
  *
- * This is a bootstrap for the data-driven engine; templates + rules are editable
- * from the admin console afterwards (no code, no re-seed).
+ * HISTORY. This script used to seed the `focus_invited` template + rule that the
+ * rule engine needed before it could push anything — which is exactly how the
+ * feature died in production: the seed was never run there, and the engine
+ * dropped every focus-invite push with nothing but a server-side warning.
+ *
+ * The focus-invite push is now sent directly by POST /focus-invites (modeled on
+ * the admin console's send: resolveAudience + deliver, content in code), so it
+ * needs NO seeded data. What remains here is the cleanup: disable the legacy
+ * rows wherever they exist, so (a) the admin console stops showing wiring that
+ * can no longer fire, and (b) a database that WAS seeded can never produce a
+ * second, rule-driven push for the same invite. Disabled rather than deleted,
+ * so the delivery history stays readable.
  */
 import { prisma } from "../src/lib/prisma";
 
 async function main(): Promise<void> {
-  await prisma.notificationTemplate.upsert({
-    where: { key: "focus_invited" },
-    update: {
-      title: "{{fromDeviceName}} started a focus",
-      body: "{{durationMinutes}} min. Tap to lock this phone too.",
-    },
-    create: {
-      key: "focus_invited",
-      title: "{{fromDeviceName}} started a focus",
-      body: "{{durationMinutes}} min. Tap to lock this phone too.",
-      category: "cross_device",
-      // Deep-links Start Focus, pre-filled from the invite. The phone still
-      // picks WHAT to block: iOS app selections are opaque Screen Time tokens
-      // that no other device can name.
-      data: {
-        type: "cross_device_lock",
-        route: "/start-focus",
-        params: {
-          source: "desktop",
-          sessionId: "{{sessionId}}",
-          min: "{{durationMinutes}}",
-          hard: "{{hardLock}}",
-        },
-      },
-    },
-  });
-
-  const event = "focus.invited";
-  const existing = await prisma.notificationRule.findFirst({
-    where: { event, templateKey: "focus_invited" },
-  });
-  if (!existing) {
-    await prisma.notificationRule.create({
-      data: {
-        name: "Focus invite → notify the chosen devices",
-        event,
-        // No condition: the route already decided who is invited. Filtering
-        // again here could only ever contradict the user's explicit pick.
-        condition: {},
-        templateKey: "focus_invited",
-        // The whole point of the invite flow: notify the devices the user
-        // SELECTED, not everything they own.
-        audience: { mode: "specificDevices" },
-        dedupeKeyTemplate: "focus_invited:{{sessionId}}",
-        enabled: true,
-      },
-    });
-  }
-
-  // Retire the broadcast predecessor. It fires on `session.started` for every
-  // other device on the account, with no way to opt a device out — so leaving it
-  // enabled means TWO pushes for one session, one of them ignoring the user's
-  // selection. Disabled rather than deleted, so the delivery history stays
-  // readable and re-enabling is one click in the admin console.
-  const retired = await prisma.notificationRule.updateMany({
-    where: { templateKey: "pc_locked", enabled: true },
+  // The rule engine no longer receives a "focus.invited" event at all, and the
+  // pc_locked predecessor broadcast to every device with no way to opt out.
+  const rules = await prisma.notificationRule.updateMany({
+    where: { OR: [{ event: "focus.invited" }, { templateKey: "pc_locked" }], enabled: true },
     data: { enabled: false },
   });
 
-  console.log("✔ Seeded focus_invited template + rule (audience: specificDevices).");
-  if (retired.count > 0) {
-    console.log(`✔ Disabled ${retired.count} legacy pc_locked rule(s) — they broadcast to every device.`);
-  }
+  // The template only existed to feed that rule; inactive keeps the admin
+  // console truthful about what can actually send.
+  const templates = await prisma.notificationTemplate.updateMany({
+    where: { key: { in: ["focus_invited", "pc_locked"] }, active: true },
+    data: { active: false },
+  });
+
+  console.log(
+    `✔ Focus-invite push is code-owned (routes/focus-invites.ts) — disabled ${rules.count} legacy rule(s) and ${templates.count} legacy template(s).`,
+  );
 }
 
 main()

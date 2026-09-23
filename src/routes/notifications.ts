@@ -34,6 +34,15 @@ notificationsRouter.post(
       failureCount: 0,
       lastUsedAt: new Date(),
     };
+    async function retirePreviousTokens(registeredAt: Date) {
+      if (!input.deviceId) return;
+      await prisma.pushToken.updateMany({
+        // Overlapping rotations must not each disable the other's newer token.
+        // Equal timestamps are kept rather than risking zero live registrations.
+        where: { userId, deviceId: input.deviceId, tokenType: input.tokenType, token: { not: input.token }, valid: true, updatedAt: { lt: registeredAt } },
+        data: { valid: false, disabledReason: "TokenReplaced" },
+      });
+    }
 
     try {
       const pushToken = await prisma.pushToken.upsert({
@@ -41,17 +50,17 @@ notificationsRouter.post(
         update: data,
         create: { token: input.token, ...data },
       });
+      await retirePreviousTokens(pushToken.updatedAt);
       res.json({ pushToken });
     } catch (err) {
       // Mongo upsert is emulated as find-then-write, so a concurrent first
       // registration of the same token can race us (P2002 on the unique token) —
       // return the winner idempotently instead of a 409.
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-        const existing = await prisma.pushToken.findUnique({ where: { token: input.token } });
-        if (existing) {
-          res.json({ pushToken: existing });
-          return;
-        }
+        const pushToken = await prisma.pushToken.update({ where: { token: input.token }, data });
+        await retirePreviousTokens(pushToken.updatedAt);
+        res.json({ pushToken });
+        return;
       }
       throw err;
     }

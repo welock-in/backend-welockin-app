@@ -31,12 +31,14 @@ async function dispatch(event: string, ctx: NotificationContext): Promise<void> 
     orderBy: { priority: "desc" },
   });
   if (rules.length === 0) {
-    // Rules are DATA (seeded by notifications:seed, editable from the admin
-    // console) — an event firing into a database with no enabled rule for it is
-    // the classic silent way this feature dies in production, indistinguishable
-    // from success without this line. Warn, don't throw: the caller's request
-    // must never break on a notification gap.
-    console.warn(`[notifications] "${event}" fired but no enabled rule matches — was notifications:seed run?`);
+    // Rules are DATA (created from the admin console) — an event firing into a
+    // database with no enabled rule for it is the classic silent way a
+    // data-driven notification dies in production, indistinguishable from
+    // success without this line. Warn, don't throw: the caller's request must
+    // never break on a notification gap. (Do NOT point people at
+    // notifications:seed here: that script now only RETIRES legacy rules —
+    // product-critical pushes like the focus invite are sent in code instead.)
+    console.warn(`[notifications] "${event}" fired but no enabled rule matches — nothing sends until a rule is created in the admin console`);
     return;
   }
 

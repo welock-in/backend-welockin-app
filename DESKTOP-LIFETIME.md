@@ -1,0 +1,55 @@
+# Offre lifetime desktop
+
+Les nouveaux comptes créés par email et mot de passe depuis les applications
+Windows ou macOS reçoivent un accès desktop à vie. Le champ optionnel
+`User.desktopLifetimeGrantedAt` est enregistré dans la même écriture que le compte.
+Les applications actuelles transmettent déjà leur identifiant `win-…` ou `mac-…`.
+Le préfixe identifie le client ; il ne constitue pas une attestation matérielle.
+
+Le droit fonctionne sur les deux plateformes desktop, y compris après une
+réinstallation ou sur un autre ordinateur connecté au même compte. Les comptes
+existants ne sont pas convertis lors d'une connexion. L'inscription Apple mobile
+reste inchangée ; les applications desktop actuelles utilisent email/mot de passe.
+
+## Paiements et mobile
+
+- Aucun achat, abonnement, paiement ou complément administrateur n'est créé.
+- Sur desktop : `status=active`, `isPro=true`, `plan=lifetime`, aucune date de fin
+  d'essai ou d'abonnement pour ce droit, `billingProvider=NONE` sans achat existant.
+- Le même compte sur iOS conserve ses droits habituels. Le droit desktop n'entre
+  jamais dans le cache global `User.isProCached`/`plan`.
+- Les trois offres de paiement sont refusées aux bénéficiaires desktop avec le
+  code existant `LIFETIME_ALREADY_OWNED`. Les intégrations, webhooks et portails
+  de paiement restent en place. Un abonnement déjà présent reste consultable et
+  gérable ; cette offre ne résilie ni ne rembourse un abonnement existant.
+- Le reçu signé reste attaché à l'appareil et conserve le renouvellement hors
+  ligne habituel de 30 jours. Le droit à vie n'expire pas avec ce reçu : une
+  connexion au serveur permet de le renouveler. La révocation administrative
+  reste prioritaire.
+
+## Activer et fermer l'offre
+
+`DESKTOP_LIFETIME_SIGNUP_ENABLED` vaut `true` par défaut dans cette version.
+Le changement devient effectif à la publication du backend contenant ce code.
+Les corrections des textes et raccourcis du profil nécessitent la publication
+des nouvelles applications desktop.
+
+Pour remettre le paiement en place pour les **futurs inscrits**, définir
+`DESKTOP_LIFETIME_SIGNUP_ENABLED=false` dans l'environnement du backend puis le
+redéployer. Les droits à vie déjà accordés restent acquis. Les anciens réglages
+de paiement et d'essai conservent leur rôle ; cette option ne les modifie pas.
+
+Le nouveau champ MongoDB est optionnel et sans index : régénérer Prisma avec
+`npm run prisma:generate` lors de la construction suffit. Aucune migration de
+données, aucun backfill et aucun `prisma db push` ne sont nécessaires.
+
+## Validation locale
+
+Les tests HTTP simulent les écritures Prisma et les prestataires : ils couvrent
+l'inscription desktop/mobile, le réglage de fin d'offre, la non-conversion des
+comptes existants, la persistance du droit, les reçus signés, les achats refusés
+sur desktop, les droits mobiles et la gestion d'un abonnement existant.
+
+Les tests d'interface vérifient les libellés anglais/français et l'absence
+d'incitation à acheter pour le compte lifetime. Ces vérifications ne remplacent
+pas une inscription sur les binaires installés après publication.

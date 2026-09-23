@@ -29,6 +29,7 @@ import { prisma } from "./prisma";
 import { env } from "./env";
 import { ledgerHash } from "./hash";
 import { isReliableDeviceId } from "./device";
+import { hasDesktopLifetime, isDesktopDeviceId } from "./desktop-lifetime";
 import { cancellationStates } from "./billing-tasks";
 import { outstandingAcquisition, type IntentRow } from "./checkout-intent";
 import {
@@ -93,6 +94,8 @@ export type EligibilitySubscription = {
 };
 
 export type EligibilityInputs = {
+  /** A permanent promotional grant, effective only on macOS and Windows. */
+  desktopLifetime?: boolean;
   /** All providers' rows, most recently updated first. */
   subs: EligibilitySubscription[];
   /** The non-refunded lifetime, if one exists — with WHICH store sold it. */
@@ -119,7 +122,7 @@ export async function loadEligibilityInputs(
 ): Promise<EligibilityInputs> {
   const deviceId = isReliableDeviceId(rawDeviceId) ? rawDeviceId : "";
 
-  const [subs, ownedLifetime] = await Promise.all([
+  const [subs, ownedLifetime, desktopAccount] = await Promise.all([
     prisma.subscription.findMany({
       // Test rows stop existing for eligibility the moment their provider's
       // test mode is shut — the same gate every other billing read applies.
@@ -132,6 +135,14 @@ export async function loadEligibilityInputs(
       where: { userId, isRefunded: false, ...hideTestRowsFor(userId, env) },
       select: { id: true, provider: true },
     }),
+    // Existing desktop builds already send win-/mac- device ids. Keep this
+    // separate from Purchase: no payment happened and mobile gets no grant.
+    isDesktopDeviceId(rawDeviceId)
+      ? prisma.user.findUnique({
+          where: { id: userId },
+          select: { desktopLifetimeGrantedAt: true },
+        })
+      : Promise.resolve(null),
   ]);
 
   const [cancellations, deviceClaim, outstanding] = await Promise.all([
@@ -145,7 +156,10 @@ export async function loadEligibilityInputs(
     outstandingAcquisition(userId),
   ]);
 
-  return { subs, ownedLifetime, deviceClaim, cancellations, outstanding };
+  return {
+    subs, ownedLifetime, deviceClaim, cancellations, outstanding,
+    desktopLifetime: hasDesktopLifetime(desktopAccount, rawDeviceId),
+  };
 }
 
 /**
@@ -159,7 +173,7 @@ export function purchaseEligibilityFrom(
   return planEligibility({
     subs: io.subs,
     cancellations: io.cancellations,
-    ownsLifetime: io.ownedLifetime != null,
+    ownsLifetime: io.ownedLifetime != null || io.desktopLifetime === true,
     lifetimeProvider: io.ownedLifetime?.provider ?? null,
     deviceHadTrial: io.deviceClaim != null,
     trialDays: {

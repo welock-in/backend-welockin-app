@@ -5,6 +5,7 @@ import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { deviceSchema } from "../validation/schemas";
 import { readDeviceId, toPublicDevice } from "../lib/device";
+import { silencePushTokens } from "../lib/push-tokens";
 import { resolveAndCache } from "./entitlement";
 import { conflict, notFound } from "../lib/http-error";
 
@@ -196,23 +197,34 @@ devicesRouter.get(
 );
 
 /**
- * Remove a device from the account by its client `deviceId`.
+ * Remove a device from the account by its client `deviceId`. This is also the
+ * "unpair" half of every client's log-out.
  *
  * Any device on the account may be removed, not only the caller — that is what
  * makes a lost or sold machine removable at all, and it is what the code always
  * did despite a comment claiming otherwise. Scoped to the caller's userId, so
  * one account can never reach into another.
+ *
+ * THE PUSH TOKENS GO FIRST, and the order is the whole point. Notifications are
+ * addressed by PushToken, not by Device (services/notifications/audience.ts), so
+ * deleting the row alone left a signed-out — or sold, or lost — phone still
+ * receiving this account's notifications. Silencing before the delete means a
+ * failure leaves a device that is still listed and can simply be removed again;
+ * the reverse order would leave one that is gone from the list and still being
+ * pushed to, with nothing left in the UI to point at it.
  */
 devicesRouter.delete(
   "/:deviceId",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const result = await prisma.device.deleteMany({
-      where: { userId: req.user!.id, deviceId: req.params.deviceId },
-    });
+    const userId = req.user!.id;
+    const { deviceId } = req.params;
+
+    const silenced = await silencePushTokens(userId, [deviceId], "DeviceRemoved");
+    const result = await prisma.device.deleteMany({ where: { userId, deviceId } });
     // Silently reporting `removed: 0` made a typo indistinguishable from a
     // success; the client now gets to tell the user something honest.
     if (result.count === 0) throw notFound("Device not found");
-    res.json({ removed: result.count });
+    res.json({ removed: result.count, silenced });
   }),
 );

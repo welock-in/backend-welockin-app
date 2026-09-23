@@ -22,6 +22,7 @@ export interface PushPayload {
   data?: Record<string, unknown>;
   sound?: string | null; // default "default"; null = silent
   badge?: number;
+  expiration?: number;
 }
 
 export interface PushResult {
@@ -37,6 +38,10 @@ type ExpoTicket =
   | { status: "ok"; id: string }
   | { status: "error"; message: string; details?: { error?: string } };
 
+class ExpoHttpError extends Error {
+  constructor(public status: number) { super(`Expo push HTTP ${status}`); }
+}
+
 async function postChunk(messages: Array<Record<string, unknown>>): Promise<ExpoTicket[]> {
   const res = await fetch(EXPO_PUSH_URL, {
     method: "POST",
@@ -48,9 +53,9 @@ async function postChunk(messages: Array<Record<string, unknown>>): Promise<Expo
     body: JSON.stringify(messages),
     // Bound the call so an awaited dispatch (e.g. on the session heartbeat) can
     // never hang the request if Expo is slow/unreachable.
-    signal: AbortSignal.timeout(10_000),
+    signal: AbortSignal.timeout(4_000),
   });
-  if (!res.ok) throw new Error(`Expo push HTTP ${res.status}`);
+  if (!res.ok) throw new ExpoHttpError(res.status);
   const json = (await res.json()) as { data?: ExpoTicket[] };
   return json.data ?? [];
 }
@@ -78,6 +83,7 @@ export async function sendExpoPush(tokens: string[], payload: PushPayload): Prom
     data: payload.data ?? {},
     ...(payload.sound === null ? {} : { sound: payload.sound ?? "default" }),
     ...(payload.badge !== undefined ? { badge: payload.badge } : {}),
+    ...(payload.expiration !== undefined ? { expiration: payload.expiration } : {}),
   }));
 
   // Order is preserved, so concatenated tickets align 1:1 with `messages` / `validIdx`.
@@ -85,7 +91,21 @@ export async function sendExpoPush(tokens: string[], payload: PushPayload): Prom
   for (let i = 0; i < messages.length; i += CHUNK) {
     const chunk = messages.slice(i, i + CHUNK);
     try {
-      tickets.push(...(await postChunk(chunk)));
+      let returned: ExpoTicket[];
+      try {
+        returned = await postChunk(chunk);
+      } catch (err) {
+        // One bounded retry for transport outages/429/5xx. Never retry a
+        // configuration error, and never hold a session request indefinitely.
+        if (err instanceof ExpoHttpError && err.status !== 429 && err.status < 500) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        returned = await postChunk(chunk);
+      }
+      // Pad WITHIN each chunk; otherwise a short response shifts every later
+      // ticket onto the wrong device during an admin broadcast >100 tokens.
+      for (let k = 0; k < chunk.length; k++) {
+        tickets.push(returned[k] ?? { status: "error", message: "no ticket returned" });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : "send failed";
       for (let k = 0; k < chunk.length; k++) tickets.push({ status: "error", message });
@@ -94,9 +114,18 @@ export async function sendExpoPush(tokens: string[], payload: PushPayload): Prom
 
   validIdx.forEach((origIdx, k) => {
     const t = tickets[k];
-    if (!t) return;
+    if (!t) {
+      // Fewer tickets than messages — a malformed 200 from Expo. The "sent"
+      // this result was initialized with was only ever optimistic, and a
+      // phantom "sent" delivery row would dedupe every retry away (deliver's
+      // dedupe treats "sent" as proof the push went out). No ticket = not sent.
+      out[origIdx] = { token: tokens[origIdx], status: "error", error: "no ticket returned" };
+      return;
+    }
     if (t.status === "ok") {
-      out[origIdx] = { token: tokens[origIdx], status: "sent", ticketId: t.id };
+      out[origIdx] = typeof t.id === "string" && t.id.length > 0
+        ? { token: tokens[origIdx], status: "sent", ticketId: t.id }
+        : { token: tokens[origIdx], status: "error", error: "no ticket id returned" };
     } else {
       out[origIdx] = {
         token: tokens[origIdx],
@@ -108,4 +137,22 @@ export async function sendExpoPush(tokens: string[], payload: PushPayload): Prom
   });
 
   return out;
+}
+
+export type ExpoReceipt = { status: "ok" | "error"; message?: string; details?: { error?: string } };
+
+export async function getExpoReceipts(ids: string[]): Promise<Record<string, ExpoReceipt>> {
+  if (ids.length === 0) return {};
+  const res = await fetch("https://exp.host/--/api/v2/push/getReceipts", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(env.expoAccessToken ? { Authorization: `Bearer ${env.expoAccessToken}` } : {}),
+    },
+    body: JSON.stringify({ ids }),
+    signal: AbortSignal.timeout(4_000),
+  });
+  if (!res.ok) throw new ExpoHttpError(res.status);
+  const json = await res.json() as { data?: Record<string, ExpoReceipt> };
+  return json.data ?? {};
 }

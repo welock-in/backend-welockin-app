@@ -100,11 +100,13 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     user.compActive === true &&
     (user.compedUntil == null || user.compedUntil.getTime() > now.getTime());
 
-  const hasLifetime = purchases.some((p) => !p.isRefunded);
+  const hasPaidLifetime = purchases.some((p) => !p.isRefunded);
+  const desktopLifetime = eligibility.desktopLifetime === true;
+  const hasLifetime = hasPaidLifetime || desktopLifetime;
 
-  const view = computeEntitlement({
+  const inputs = {
     now,
-    hasActivePurchase: hasLifetime,
+    hasActivePurchase: hasPaidLifetime,
     hasActiveSubscription: subs.some((sub) => subscriptionGrants(sub, now)),
     // Only when the granting one is the trial. A customer with a live paid
     // subscription AND an old lapsed trial row must not read as trialing.
@@ -123,9 +125,15 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
     productId: LIFETIME_PRODUCT_ID,
     // Echo-only: the resolver never gates on this, the client does.
     enforced: env.entitlementEnforced,
-  });
+  };
+  const accountView = computeEntitlement(inputs);
+  const view = desktopLifetime
+    ? computeEntitlement({ ...inputs, hasDesktopLifetime: true, trialEndsAt: null })
+    : accountView;
 
-  await cacheOnUser(userId, view, now);
+  // The User mirror is shared with mobile and admin. Never persist a desktop
+  // promotion into the global access cache (or grant iOS through /api/me).
+  await cacheOnUser(userId, accountView, now);
 
   // The signed half. Everything above is advice a patched client may ignore;
   // this is the part it cannot forge, and therefore the only part it may still
@@ -171,7 +179,9 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
         : null;
 
   const trialSub = subs.find((sub) => sub.status === "on_trial" && subscriptionGrants(sub, now));
-  const grantingUntil = trialSub ? (trialSub.validUntil ?? null) : view.trialEndsAt ? new Date(view.trialEndsAt) : null;
+  const grantingUntil = desktopLifetime
+    ? null
+    : trialSub ? (trialSub.validUntil ?? null) : view.trialEndsAt ? new Date(view.trialEndsAt) : null;
 
   // The instant access must actually STOP — which is a different question from
   // the countdown above, and the one the offline lease is clipped to.
@@ -204,7 +214,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
 
   const accessNotAfter = !view.isPro
     ? null
-    : purchases.some((p) => !p.isRefunded)
+    : hasLifetime
       ? null // lifetime — outranks everything and never lapses
       : liveSub
         ? subscriptionBoundary // the paid-up period, trial or paid alike
@@ -216,7 +226,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   // trial even when it has elapsed, which is precisely the case that must not
   // read as "brand new".
   const everHadAccess =
-    purchases.length > 0 || subs.length > 0 || claim != null || user.trialEndsAt != null;
+    desktopLifetime || purchases.length > 0 || subs.length > 0 || claim != null || user.trialEndsAt != null;
 
   // ── the provider-aware half — every field additive, see EntitlementView ──
 
@@ -226,7 +236,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   const grantingLifetime = purchases.find((p) => !p.isRefunded) ?? null;
   const billingProvider: BillingProvider =
     (grantingLifetime ? billingProviderFor(grantingLifetime.provider) : null) ??
-    (liveSub ? (billingProviderFor(liveSub.provider) ?? "LEMON_SQUEEZY") : null) ??
+    (desktopLifetime ? "NONE" : liveSub ? (billingProviderFor(liveSub.provider) ?? "LEMON_SQUEEZY") : null) ??
     "NONE";
 
   // The live RECURRING row, whether or not it grants — a lifetime owner's
@@ -252,7 +262,7 @@ export async function resolveAndCache(userId: string, deviceId: string): Promise
   // of "will not renew". Null when nothing recurring is granting: there is no
   // renewal to have an opinion about.
   const willRenew =
-    liveSub == null
+    liveSub == null || (desktopLifetime && !hasPaidLifetime)
       ? null
       : billingProviderFor(liveSub.provider) === "APPLE"
         ? (liveSub.willRenew ?? null)

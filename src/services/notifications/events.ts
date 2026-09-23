@@ -14,11 +14,15 @@ export interface NotificationContext {
   [key: string]: unknown;
 }
 
-/** Known event names (free-form strings at the boundary — rules match by name). */
+/** Known event names (free-form strings at the boundary — rules match by name).
+ *
+ * NOT here: the focus-invite push. It used to be the event "focus.invited",
+ * but the rule engine only fires when a NotificationRule + NotificationTemplate
+ * were seeded into the database — and a database where the seed never ran drops
+ * the push silently. Whether a phone gets invited is a product guarantee, not
+ * configuration, so routes/focus-invites.ts now sends it directly (the same
+ * resolveAudience + deliver primitives the admin console send uses). */
 export const NotificationEvents = {
   /** A focus session's first heartbeat landed (fires once per session). */
   SESSION_STARTED: "session.started",
-  /** One device invited others to join its focus session. ctx carries
-   *  targetDeviceIds, so a rule can use the "specificDevices" audience. */
-  FOCUS_INVITED: "focus.invited",
 } as const;

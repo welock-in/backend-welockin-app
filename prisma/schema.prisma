@@ -44,6 +44,12 @@ model User {
   /// inside — but a new account never gets one from here.
   trialEndsAt   DateTime?
 
+  /// Permanent macOS/Windows access granted during the free desktop signup offer.
+  /// Separate from purchases, admin comps and the global entitlement cache so
+  /// signing into the same account on iOS does not receive this desktop benefit.
+  /// Optional for existing MongoDB documents; no backfill is required.
+  desktopLifetimeGrantedAt DateTime?
+
   // --- Entitlement overrides & cache -----------------------------------------
   // ALL OPTIONAL, like every column added after launch: on MongoDB `@default` is
   // a create-time default only and `db push` never rewrites existing documents,

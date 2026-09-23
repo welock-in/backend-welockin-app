@@ -185,6 +185,7 @@ test("the list is redacted and flags the calling device", async (t) => {
 
 test("removing an unknown device is a 404, not a silent success", async (t) => {
   stubMethod(t, prisma.device as any, "deleteMany", async () => ({ count: 0 }));
+  stubMethod(t, prisma.pushToken as any, "updateMany", async () => ({ count: 0 }));
 
   const res = await request(app).delete("/api/devices/mac-does-not-exist").set(auth);
 
@@ -193,6 +194,7 @@ test("removing an unknown device is a 404, not a silent success", async (t) => {
 
 test("removing a real device reports what was removed", async (t) => {
   const deletes = stubMethod(t, prisma.device as any, "deleteMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.pushToken as any, "updateMany", async () => ({ count: 0 }));
 
   const res = await request(app).delete(`/api/devices/${DEVICE_ID}`).set(auth);
 
@@ -205,6 +207,40 @@ test("removing a real device reports what was removed", async (t) => {
   // let a filter that dropped :deviceId — wiping every device on the account —
   // pass as a green test.
   assert.equal(where.deviceId, DEVICE_ID);
+});
+
+/*
+ * The bug this pins: notifications are addressed by PushToken and the device
+ * list is Device rows, and nothing joined them. A phone signed out of (or sold,
+ * or removed from another machine) vanished from the list and kept receiving the
+ * account's pushes. Removal has to close both.
+ */
+test("removing a device silences its push tokens, before the row is gone", async (t) => {
+  const order: string[] = [];
+  const silenced = stubMethod(t, prisma.pushToken as any, "updateMany", async () => {
+    order.push("silence");
+    return { count: 2 };
+  });
+  stubMethod(t, prisma.device as any, "deleteMany", async () => {
+    order.push("delete");
+    return { count: 1 };
+  });
+
+  const res = await request(app).delete(`/api/devices/${DEVICE_ID}`).set(auth);
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.silenced, 2);
+  assert.equal(silenced.length, 1, "a removed device must stop being a push target");
+
+  const args = silenced[0][0] as any;
+  assert.equal(args.where.userId, userId, "one account may never silence another's tokens");
+  assert.deepEqual(args.where.deviceId, { in: [DEVICE_ID] }, "only the removed device goes quiet");
+  assert.equal(args.data.valid, false);
+
+  // Order is the contract, not a detail: silencing after the delete would leave a
+  // failed write with a device that is off the list and still being pushed to,
+  // and nothing in the UI left to remove.
+  assert.deepEqual(order, ["silence", "delete"]);
 });
 
 /*

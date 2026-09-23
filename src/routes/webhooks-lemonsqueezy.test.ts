@@ -1441,3 +1441,155 @@ test("a payload that omits trial_ends_at does not clear it", async (t) => {
     "an absent field means 'not mentioned', never 'cleared'",
   );
 });
+
+/* ── analytics ────────────────────────────────────────────────────────────
+ *
+ * Money leaves this file for PostHog, and the failure modes are asymmetric: an
+ * event that never arrives costs a number on a dashboard, an event that arrives
+ * twice makes the revenue figure a lie, and an exception on the way out makes
+ * Lemon Squeezy redeliver a payment. These pin all three.
+ *
+ * `stubPostHog` replaces `globalThis.fetch` outright. Every other test in this
+ * file runs with no POSTHOG_API_KEY — which is exactly why the emitter returns
+ * before it ever reaches fetch, and why those 60 tests still count the API
+ * traffic they expect.
+ */
+
+function stubPostHog(t: Ctx, respond: () => any = () => new Response("1", { status: 200 })) {
+  const calls: { url: string; body: any }[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (url: any, init: any) => {
+    calls.push({ url: String(url), body: JSON.parse(String(init?.body ?? "{}")) });
+    return respond();
+  }) as any;
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  return calls;
+}
+
+function quiet(t: Ctx) {
+  const warn = console.warn;
+  const error = console.error;
+  console.warn = () => {};
+  console.error = () => {};
+  t.after(() => {
+    console.warn = warn;
+    console.error = error;
+  });
+}
+
+const POSTHOG = { posthogApiKey: "phc_test", posthogHost: "https://us.i.posthog.com" };
+
+test("a paid lifetime order emits purchase_completed with both currencies", async (t) => {
+  configured(t, POSTHOG);
+  stubDb(t);
+  const posted = stubPostHog(t);
+
+  await deliver(orderBody());
+
+  assert.equal(posted.length, 1, "one order, one event");
+  const sent = posted[0].body;
+  assert.equal(sent.event, "purchase_completed");
+  assert.equal(sent.distinct_id, USER);
+  assert.equal(sent.properties.plan, "lifetime");
+  assert.equal(sent.properties.provider, "lemonsqueezy");
+  assert.equal(sent.properties.revenue_usd, 19.99);
+  assert.equal(sent.properties.environment, "prod");
+  // The provider's own creation time, not the clock — this is what makes a
+  // redelivery de-duplicate.
+  assert.equal(sent.timestamp, "2026-07-30T10:00:00.000Z");
+});
+
+test("the native currency reaches PostHog, not just the converted figure", async (t) => {
+  // The fixture is a REAL delivery: 19,99 EUR charged, 22.92 USD converted. Until
+  // now only the 22.92 existed anywhere in this backend, so a euro on the desktop
+  // and a dollar on iOS were the same number in the same column.
+  // The captured delivery is a test-mode one, so the store has to be the kind
+  // that accepts those — otherwise it is refused long before any analytics.
+  configured(t, { ...POSTHOG, lemonSqueezyAllowTestMode: true });
+  stubDb(t, { userFind: async () => ({ id: REAL_USER_ID }) });
+  const posted = stubPostHog(t);
+
+  await deliver(REAL_ORDER_CREATED, undefined, SECRET);
+
+  const props = posted[0]?.body?.properties;
+  assert.ok(props, "the real fixture should have produced an event");
+  assert.equal(props.currency, "EUR");
+  assert.equal(props.amount_native, 19.99);
+  assert.equal(props.revenue_usd, 22.92, "the USD figure is unchanged");
+  // And it is marked as what it is, so a test order cannot move a conversion rate.
+  assert.equal(props.test_mode, true);
+  assert.equal(props.environment, "sandbox");
+});
+
+test("a subscription event emits subscription_state_changed, with no amount", async (t) => {
+  configured(t, POSTHOG);
+  stubDb(t, { userFirst: async () => ({ id: USER }) });
+  const posted = stubPostHog(t);
+
+  await deliver(subBody({ meta: { event_name: "subscription_created" }, attributes: { status: "active" } }));
+
+  const sent = posted.find((c) => c.body.event === "subscription_state_changed");
+  assert.ok(sent, "a subscription event must be reported");
+  assert.equal(sent!.body.distinct_id, USER);
+  assert.equal(sent!.body.properties.status, "active");
+  assert.equal(sent!.body.properties.ls_event, "subscription_created");
+  // A Lemon Squeezy subscription payload carries no price anywhere. Sending a
+  // zero would read as "free" on every chart that touches it.
+  assert.ok(!("revenue_usd" in sent!.body.properties));
+  assert.ok(!("amount_native" in sent!.body.properties));
+});
+
+test("no forbidden property ever reaches the wire", async (t) => {
+  // `sub.email`, `sub.updatePaymentUrl` and `sub.customerPortalUrl` sit one
+  // spread away from the payload that gets built. This is the test that notices
+  // if someone ever writes `...sub`.
+  configured(t, POSTHOG);
+  stubDb(t, { userFirst: async () => ({ id: USER }) });
+  const posted = stubPostHog(t);
+
+  await deliver(subBody({ meta: { event_name: "subscription_updated" }, attributes: { status: "active" } }));
+  await deliver(orderBody());
+
+  const banned = ["email", "url", "token", "name", "age", "ip"];
+  for (const { body } of posted) {
+    for (const key of Object.keys(body.properties ?? {})) {
+      const k = key.toLowerCase();
+      assert.ok(
+        !banned.includes(k) && !banned.some((b) => b !== "url" && b !== "name" && k.includes(b)),
+        `${body.event} carried a forbidden property: ${key}`,
+      );
+    }
+  }
+});
+
+test("a PostHog outage cannot make Lemon Squeezy redeliver a payment", async (t) => {
+  // THE ONE THAT MATTERS. A throw here would become a 500, a 500 tells Lemon
+  // Squeezy to redeliver, and the redelivery writes the Purchase row again.
+  // An analytics outage must never be able to move money.
+  quiet(t);
+  configured(t, POSTHOG);
+  const db = stubDb(t);
+  stubPostHog(t, () => {
+    throw new Error("posthog down");
+  });
+
+  const res = await deliver(orderBody());
+
+  assert.equal(res.status, 200);
+  assert.equal(finalStatus(db.eventUpdate) ?? "processed", "processed");
+  assert.equal(db.purchaseUpsert.length, 1, "the licence was still granted");
+});
+
+test("a refused order emits nothing at all", async (t) => {
+  // Nine early exits in this file describe things that did not happen. Only the
+  // "processed" returns carry a payload.
+  configured(t, POSTHOG);
+  stubDb(t);
+  const posted = stubPostHog(t);
+
+  await deliver(orderBody({ attributes: { status: "pending" } }));
+
+  assert.equal(posted.length, 0);
+});

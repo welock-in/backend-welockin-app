@@ -9,7 +9,7 @@ import { errorHandler } from "../middleware/error";
 import { env } from "../lib/env";
 import { prisma } from "../lib/prisma";
 import { hashPassword } from "../lib/password";
-import { hasDesktopLifetime } from "../lib/desktop-lifetime";
+import { Prisma } from "@prisma/client";
 
 const app = express().use(express.json()).use("/api/auth", authRouter).use(errorHandler);
 const USER_ID = "507f1f77bcf86cd799439011";
@@ -51,7 +51,6 @@ function setEnv(t: TestContext, patch: Row): void {
 
 function setup(t: TestContext, enabled = true) {
   setEnv(t, {
-    desktopLifetimeSignupEnabled: enabled,
     // Keep trials ON to prove lifetime signup skips the ledger rather than
     // accidentally relying on its normal production OFF setting.
     signupTrialEnabled: true,
@@ -62,6 +61,10 @@ function setup(t: TestContext, enabled = true) {
   });
   unexpectedDatabaseCalls.length = 0;
   t.after(() => { assert.deepEqual(unexpectedDatabaseCalls, []); });
+
+  const settings = { iosSignupLifetimeEnabled: false, desktopSignupLifetimeEnabled: enabled,
+    updatedAt: new Date(), updatedBy: "test-admin" };
+  const settingsReads = stubMethod(t, prisma.signupLifetimeSettings, "findUnique", async () => settings);
 
   const users: Row[] = [];
   const creates = stubMethod(t, prisma.user, "create", async ({ data }) => {
@@ -90,7 +93,7 @@ function setup(t: TestContext, enabled = true) {
     globalThis.fetch = originalFetch;
     assert.deepEqual(networkAttempts, []);
   });
-  return { users, creates, trialReads, trialCreates, verificationCreates, mails };
+  return { settings, settingsReads, users, creates, trialReads, trialCreates, verificationCreates, mails };
 }
 
 function register(deviceId?: string, body: Row = {}) {
@@ -107,9 +110,8 @@ function assertNoGlobalGrant(data: Row): void {
 }
 
 for (const deviceId of ["win-machine", "win-unidentified", "mac-platform", "mac-fallback"]) {
-  test(`signup offer persists desktop lifetime atomically for ${deviceId}`, async (t) => {
+  test(`signup reserves desktop lifetime without activating it for ${deviceId}`, async (t) => {
     const state = setup(t);
-    const before = Date.now();
     const res = await register(deviceId);
 
     assert.equal(res.status, 201);
@@ -117,10 +119,11 @@ for (const deviceId of ["win-machine", "win-unidentified", "mac-platform", "mac-
     assert.equal(res.body.user.passwordHash, undefined);
     assert.equal(state.creates.length, 1);
     const data = state.creates[0][0].data;
-    assert.ok(data.desktopLifetimeGrantedAt instanceof Date);
-    assert.ok(data.desktopLifetimeGrantedAt.getTime() >= before);
-    assert.ok(data.desktopLifetimeGrantedAt.getTime() <= Date.now());
-    assert.equal(res.body.user.desktopLifetimeGrantedAt, data.desktopLifetimeGrantedAt.toISOString());
+    assert.equal(data.desktopLifetimeGrantedAt, undefined);
+    assert.equal(data.iosLifetimeGrantedAt, undefined);
+    assert.equal(data.signupLifetimeOffer, "desktop");
+    assert.equal(data.signupPlatform, deviceId.startsWith("win-") ? "windows" : "macos");
+    assert.equal(res.body.user.emailVerified, false);
     assertNoGlobalGrant(data);
     assert.equal(state.trialReads.length, 0);
     assert.equal(state.trialCreates.length, 0);
@@ -137,6 +140,7 @@ for (const deviceId of ["win-machine", "mac-platform"]) {
     assert.equal(res.status, 201);
     const data = state.creates[0][0].data;
     assert.equal(Object.hasOwn(data, "desktopLifetimeGrantedAt"), false);
+    assert.equal(data.signupLifetimeOffer, null);
     assertNoGlobalGrant(data);
     assert.equal(state.trialCreates.length, 1);
   });
@@ -150,6 +154,7 @@ for (const deviceId of ["ios-phone", "android-phone", "unknown-device", "win-", 
     assert.equal(res.status, 201);
     const data = state.creates[0][0].data;
     assert.equal(Object.hasOwn(data, "desktopLifetimeGrantedAt"), false);
+    assert.equal(data.signupLifetimeOffer, null);
     assertNoGlobalGrant(data);
     assert.equal(state.trialCreates.length, deviceId ? 1 : 0);
   });
@@ -159,7 +164,8 @@ test("registration honors the existing body fallback and gives the header preced
   const state = setup(t);
   const desktop = await register(undefined, { deviceId: "mac-body" });
   assert.equal(desktop.status, 201);
-  assert.ok(state.creates[0][0].data.desktopLifetimeGrantedAt instanceof Date);
+  assert.equal(state.creates[0][0].data.signupLifetimeOffer, "desktop");
+  assert.equal(state.creates[0][0].data.desktopLifetimeGrantedAt, undefined);
 
   const mobile = await register("ios-phone", { email: "mobile@example.com", deviceId: "win-body" });
   assert.equal(mobile.status, 201);
@@ -179,18 +185,19 @@ test("desktop login cannot upgrade a pre-existing account", async (t) => {
   assert.equal(state.trialCreates.length, 0);
 });
 
-test("turning off the offer preserves grants already issued", async (t) => {
+test("turning off the offer preserves existing reservations and stops only future ones", async (t) => {
   const state = setup(t);
   assert.equal((await register("win-machine")).status, 201);
-  (env as Row).desktopLifetimeSignupEnabled = false;
-
-  assert.equal(hasDesktopLifetime(state.users[0], "mac-other-computer"), true);
-  assert.equal(hasDesktopLifetime(state.users[0], "ios-phone"), false);
+  state.settings.desktopSignupLifetimeEnabled = false;
   const res = await request(app).post("/api/auth/login").set("x-welockin-device-id", "mac-other-computer")
     .send({ email: EMAIL, password: PASSWORD });
   assert.equal(res.status, 200);
-  assert.equal(res.body.user.desktopLifetimeGrantedAt, state.users[0].desktopLifetimeGrantedAt.toISOString());
+  assert.equal(res.body.user.desktopLifetimeGrantedAt, undefined);
+  assert.equal(state.users[0].signupLifetimeOffer, "desktop");
   assert.equal(state.creates.length, 1);
+  assert.equal((await register("mac-new", { email: "new@example.com" })).status, 201);
+  assert.equal(state.users[1].signupLifetimeOffer, null);
+  assert.equal(state.settingsReads.length, 2, "login never reads promotion settings");
 });
 
 test("new mobile Sign in with Apple accounts retain their existing trial behavior", async (t) => {
@@ -215,4 +222,117 @@ test("new mobile Sign in with Apple accounts retain their existing trial behavio
   assert.equal(Object.hasOwn(state.creates[0][0].data, "desktopLifetimeGrantedAt"), false);
   assertNoGlobalGrant(state.creates[0][0].data);
   assert.equal(state.trialCreates.length, 1);
+});
+
+for (const platform of ["ios", "ipados"]) {
+  test(`explicit ${platform} signup reserves only the iOS offer and skips signup trials`, async (t) => {
+    const state = setup(t, false);
+    state.settings.iosSignupLifetimeEnabled = true;
+    const res = await request(app).post("/api/auth/register").set("x-welockin-platform", platform)
+      .set("x-welockin-device-id", "opaque-ios-identity")
+      .send({ email: EMAIL, password: PASSWORD, iosLifetimeGrantedAt: new Date().toISOString() });
+    assert.equal(res.status, 201);
+    assert.equal(state.users[0].signupPlatform, "ios");
+    assert.equal(state.users[0].signupLifetimeOffer, "ios");
+    assert.equal(state.users[0].iosLifetimeGrantedAt, undefined);
+    assert.equal(state.trialCreates.length, 0);
+  });
+}
+
+test("both switches OFF and an absent settings document keep the normal signup trial", async (t) => {
+  const state = setup(t, false);
+  stubMethod(t, prisma.signupLifetimeSettings, "findUnique", async () => null);
+  const res = await request(app).post("/api/auth/register").set("x-welockin-platform", "ios")
+    .set("x-welockin-device-id", "opaque-ios-identity").send({ email: EMAIL, password: PASSWORD });
+  assert.equal(res.status, 201);
+  assert.equal(state.users[0].signupLifetimeOffer, null);
+  assert.equal(state.trialCreates.length, 1);
+});
+
+test("settings failure refuses signup explicitly before an account is created", async (t) => {
+  const state = setup(t);
+  stubMethod(t, prisma.signupLifetimeSettings, "findUnique", async () => { throw new Error("database unavailable"); });
+  const res = await register("win-machine");
+  assert.equal(res.status, 503);
+  assert.equal(res.body.code, "SIGNUP_LIFETIME_SETTINGS_UNAVAILABLE");
+  assert.equal(state.creates.length, 0);
+  assert.equal(state.mails.length, 0);
+});
+
+function appleIdentity(t: TestContext, subject: string, emailVerified = true) {
+  const keys = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const kid = `signup-lifetime-${subject}`;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+    if (String(url) === "https://appleid.apple.com/auth/keys") {
+      return { ok: true, status: 200, json: async () => ({ keys: [{ ...keys.publicKey.export({ format: "jwk" }), kid, use: "sig", alg: "RS256" }] }) };
+    }
+    return originalFetch(url as Parameters<typeof fetch>[0], init);
+  }) as typeof fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  return jwt.sign({ email: EMAIL, email_verified: emailVerified }, keys.privateKey, {
+    algorithm: "RS256", keyid: kid, issuer: "https://appleid.apple.com",
+    audience: env.appleBundleId, subject, expiresIn: "1h",
+  });
+}
+
+test("a new verified Apple signup activates the reserved offer atomically with creation", async (t) => {
+  const state = setup(t);
+  state.settings.iosSignupLifetimeEnabled = true;
+  stubMethod(t, prisma.authProvider, "findUnique", async () => null);
+  const identityToken = appleIdentity(t, "fresh-apple-grant");
+  const res = await request(app).post("/api/auth/apple").set("x-welockin-platform", "ios").send({ identityToken });
+  assert.equal(res.status, 201);
+  const data = state.creates[0][0].data;
+  assert.equal(data.emailVerified, true);
+  assert.equal(data.signupLifetimeOffer, "ios");
+  assert.ok(data.iosLifetimeGrantedAt instanceof Date);
+  assert.deepEqual(data.iosLifetimeGrantedAt, data.emailVerifiedAt);
+  assert.equal(data.desktopLifetimeGrantedAt, undefined);
+  assert.equal(state.trialCreates.length, 0);
+});
+
+for (const alreadyLinked of [true, false]) {
+  test(`Apple ${alreadyLinked ? "login" : "linking"} never enrolls an existing account`, async (t) => {
+    const state = setup(t);
+    state.settings.iosSignupLifetimeEnabled = true;
+    const user = { id: USER_ID, email: EMAIL, emailVerified: true, plan: "expired" };
+    state.users.push(user);
+    stubMethod(t, prisma.authProvider, "findUnique", async () => alreadyLinked ? { user } : null);
+    stubMethod(t, prisma.authProvider, "create", async ({ data }) => data);
+    const identityToken = appleIdentity(t, `existing-apple-${alreadyLinked}`);
+    const res = await request(app).post("/api/auth/apple").set("x-welockin-platform", "ios").send({ identityToken });
+    assert.equal(res.status, 200);
+    assert.equal(state.creates.length, 0);
+    assert.equal(state.settingsReads.length, 0);
+    assert.equal(res.body.user.iosLifetimeGrantedAt, undefined);
+  });
+}
+
+test("Apple creation race returns the existing winner without adding the loser's reserved offer", async (t) => {
+  const state = setup(t);
+  state.settings.iosSignupLifetimeEnabled = true;
+  const winner = { id: USER_ID, email: EMAIL, emailVerified: true, plan: "trial" };
+  stubMethod(t, prisma.authProvider, "findUnique", async () => null);
+  stubMethod(t, prisma.authProvider, "findFirst", async () => ({ user: winner }));
+  stubMethod(t, prisma.user, "create", async () => {
+    throw new Prisma.PrismaClientKnownRequestError("duplicate", { code: "P2002", clientVersion: "test" });
+  });
+  const identityToken = appleIdentity(t, "raced-apple-signup");
+  const res = await request(app).post("/api/auth/apple").set("x-welockin-platform", "ios").send({ identityToken });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.user.iosLifetimeGrantedAt, undefined);
+  assert.equal(res.body.user.signupLifetimeOffer, undefined);
+  assert.equal(state.trialCreates.length, 0);
+});
+
+test("unverified Apple identity cannot create or reserve a lifetime", async (t) => {
+  const state = setup(t);
+  state.settings.iosSignupLifetimeEnabled = true;
+  stubMethod(t, prisma.authProvider, "findUnique", async () => null);
+  const identityToken = appleIdentity(t, "unverified-apple-signup", false);
+  const res = await request(app).post("/api/auth/apple").set("x-welockin-platform", "ios").send({ identityToken });
+  assert.equal(res.status, 400);
+  assert.equal(state.creates.length, 0);
+  assert.equal(state.settingsReads.length, 0);
 });

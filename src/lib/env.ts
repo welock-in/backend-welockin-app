@@ -434,13 +434,6 @@ export const env = {
    */
   entitlementEnforced: (process.env.ENTITLEMENT_ENFORCED ?? "false") === "true",
 
-  /**
-   * Give new macOS/Windows password accounts permanent desktop access.
-   * Turning this off stops future grants only; an existing grant stays valid.
-   * The offer does not change mobile access or any payment-provider settings.
-   */
-  desktopLifetimeSignupEnabled: (process.env.DESKTOP_LIFETIME_SIGNUP_ENABLED ?? "true") === "true",
-
   // --- The trial ledger (one free trial per machine) -------------------------
   /** Server-only HMAC key for `TrialClaim.deviceIdHash`. See resolveTrialPepper. */
   trialLedgerPepper: resolveTrialPepper(),

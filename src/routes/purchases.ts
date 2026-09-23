@@ -18,6 +18,7 @@ import { APP_STORE, isSellableProductId, purchaseEffect } from "../lib/entitleme
 import { InvalidTransaction, verifySignedTransaction } from "../lib/apple-jws";
 import { assertCanWrite } from "../lib/purchase-providers";
 import { resolveAndCache } from "./entitlement";
+import { readClientPlatform } from "../lib/signup-lifetime";
 
 /* ─────────────────────────────────────────────────────────────
    POST /api/purchases — the app hands over a StoreKit 2 signed
@@ -139,7 +140,7 @@ purchasesRouter.post(
 
     // One resolver for every path, so this response and the one the client gets
     // from GET /api/entitlement can never disagree.
-    res.json(await resolveAndCache(userId, deviceId));
+    res.json(await resolveAndCache(userId, deviceId, readClientPlatform(req)));
   }),
 );
 

@@ -6,6 +6,7 @@ import { asyncHandler } from "../middleware/async-handler";
 import { deviceSchema } from "../validation/schemas";
 import { readDeviceId, toPublicDevice } from "../lib/device";
 import { resolveAndCache } from "./entitlement";
+import { readClientPlatform } from "../lib/signup-lifetime";
 import { conflict, notFound } from "../lib/http-error";
 
 export const devicesRouter = Router();
@@ -169,7 +170,7 @@ devicesRouter.post(
     //
     // A client that needs an answer NOW — after a purchase, on boot — calls
     // GET /api/entitlement, which is never throttled.
-    res.json(await resolveAndCache(userId, deviceId));
+    res.json(await resolveAndCache(userId, deviceId, readClientPlatform(req)));
   }),
 );
 

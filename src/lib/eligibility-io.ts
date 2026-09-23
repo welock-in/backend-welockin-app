@@ -29,7 +29,8 @@ import { prisma } from "./prisma";
 import { env } from "./env";
 import { ledgerHash } from "./hash";
 import { isReliableDeviceId } from "./device";
-import { hasDesktopLifetime, isDesktopDeviceId } from "./desktop-lifetime";
+import { isDesktopDeviceId } from "./desktop-lifetime";
+import type { ClientPlatform } from "./signup-lifetime";
 import { cancellationStates } from "./billing-tasks";
 import { outstandingAcquisition, type IntentRow } from "./checkout-intent";
 import {
@@ -94,8 +95,8 @@ export type EligibilitySubscription = {
 };
 
 export type EligibilityInputs = {
-  /** A permanent promotional grant, effective only on macOS and Windows. */
-  desktopLifetime?: boolean;
+  /** An issued signup gift, scoped to the platform making this request. */
+  complimentaryLifetime?: "ios" | "desktop" | null;
   /** All providers' rows, most recently updated first. */
   subs: EligibilitySubscription[];
   /** The non-refunded lifetime, if one exists — with WHICH store sold it. */
@@ -119,10 +120,13 @@ export type EligibilityInputs = {
 export async function loadEligibilityInputs(
   userId: string,
   rawDeviceId: string,
+  platform: ClientPlatform = "unknown",
 ): Promise<EligibilityInputs> {
   const deviceId = isReliableDeviceId(rawDeviceId) ? rawDeviceId : "";
+  const desktopRequest = isDesktopDeviceId(rawDeviceId) ||
+    (deviceId !== "" && (platform === "windows" || platform === "macos"));
 
-  const [subs, ownedLifetime, desktopAccount] = await Promise.all([
+  const [subs, ownedLifetime, giftAccount] = await Promise.all([
     prisma.subscription.findMany({
       // Test rows stop existing for eligibility the moment their provider's
       // test mode is shut — the same gate every other billing read applies.
@@ -135,12 +139,13 @@ export async function loadEligibilityInputs(
       where: { userId, isRefunded: false, ...hideTestRowsFor(userId, env) },
       select: { id: true, provider: true },
     }),
-    // Existing desktop builds already send win-/mac- device ids. Keep this
-    // separate from Purchase: no payment happened and mobile gets no grant.
-    isDesktopDeviceId(rawDeviceId)
+    // Old desktop builds identify themselves through their existing prefix.
+    // Mobile must explicitly identify iOS; an opaque or missing id alone says
+    // nothing about the platform. Never use the account's signup platform here.
+    desktopRequest || (platform === "ios" && deviceId !== "")
       ? prisma.user.findUnique({
           where: { id: userId },
-          select: { desktopLifetimeGrantedAt: true },
+          select: { desktopLifetimeGrantedAt: true, iosLifetimeGrantedAt: true, emailVerified: true },
         })
       : Promise.resolve(null),
   ]);
@@ -158,7 +163,12 @@ export async function loadEligibilityInputs(
 
   return {
     subs, ownedLifetime, deviceClaim, cancellations, outstanding,
-    desktopLifetime: hasDesktopLifetime(desktopAccount, rawDeviceId),
+    complimentaryLifetime: desktopRequest && giftAccount?.desktopLifetimeGrantedAt != null
+      ? "desktop"
+      : !desktopRequest && platform === "ios" &&
+          giftAccount?.emailVerified === true && giftAccount.iosLifetimeGrantedAt != null
+        ? "ios"
+        : null,
   };
 }
 
@@ -173,7 +183,7 @@ export function purchaseEligibilityFrom(
   return planEligibility({
     subs: io.subs,
     cancellations: io.cancellations,
-    ownsLifetime: io.ownedLifetime != null || io.desktopLifetime === true,
+    ownsLifetime: io.ownedLifetime != null || io.complimentaryLifetime != null,
     lifetimeProvider: io.ownedLifetime?.provider ?? null,
     deviceHadTrial: io.deviceClaim != null,
     trialDays: {

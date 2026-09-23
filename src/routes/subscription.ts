@@ -9,6 +9,7 @@ import {
 } from "../lib/subscription";
 import { loadEligibilityInputs, purchaseEligibilityFrom } from "../lib/eligibility-io";
 import { readDeviceId } from "../lib/device";
+import { readClientPlatform } from "../lib/signup-lifetime";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { badRequest, conflict, HttpError, subscriptionPortalRequired } from "../lib/http-error";
@@ -230,7 +231,7 @@ subscriptionRouter.get(
     // real dead end: this screen used to read Lemon Squeezy only, so an Apple
     // subscriber was told monthly was purchasable and then 409'd at checkout,
     // which had been reading both providers all along.
-    const io = await loadEligibilityInputs(userId, readDeviceId(req));
+    const io = await loadEligibilityInputs(userId, readDeviceId(req), readClientPlatform(req));
 
     const now = new Date();
     // The row the settings screen should describe: the GRANTING one first (the

@@ -116,15 +116,16 @@ test("the same granted account remains unpaid on mobile, including the billing a
 
 test("turning the signup offer off preserves previously granted lifetime on both desktops", async (t) => {
   fixture(t);
-  const previous = env.desktopLifetimeSignupEnabled;
-  env.desktopLifetimeSignupEnabled = false;
-  t.after(() => { env.desktopLifetimeSignupEnabled = previous; });
+  const settings = stub(t, prisma.signupLifetimeSettings, "findUnique", async () => {
+    throw new Error("Issued gifts must not depend on the current signup offer");
+  });
   for (const id of ["mac-another-computer", "win-another-computer"]) {
     const res = await request(app).get("/api/entitlement").set(auth).set(device(id));
     assert.equal(res.status, 200);
     assert.equal(res.body.plan, "lifetime");
     assert.equal(res.body.isPro, true);
   }
+  assert.equal(settings.callCount(), 0);
 });
 
 test("an existing account is never granted lifetime merely by signing in on desktop", async (t) => {
@@ -189,4 +190,124 @@ test("an existing recurring subscription stays visible and manageable beside the
   const mobile = await request(app).get("/api/entitlement").set(auth).set(device(MOBILE));
   assert.equal(mobile.body.plan, "monthly");
   assert.equal(mobile.body.billingProvider, "LEMON_SQUEEZY");
+});
+
+const iosGift = {
+  desktopLifetimeGrantedAt: null,
+  iosLifetimeGrantedAt: new Date("2026-09-23T00:00:00Z"),
+};
+const iosContext = (platform = "ios", id = MOBILE) => ({
+  ...device(id), "x-welockin-platform": platform,
+});
+
+test("explicit desktop context and legacy ids resolve the same desktop gift", async (t) => {
+  fixture(t);
+  for (const platform of ["windows", "macos"]) {
+    const res = await request(app).get("/api/entitlement").set(auth).set(iosContext(platform));
+    assert.equal(res.status, 200);
+    assert.equal(res.body.complimentaryLifetime, "desktop");
+    assert.equal(res.body.plan, "lifetime");
+  }
+});
+
+for (const platform of ["ios", "ipados"]) {
+  test(`${platform}: a verified gift opens both entitlement routes without payment or global cache leakage`, async (t) => {
+    const { user, provider } = fixture(t, iosGift);
+    for (const path of ["/api/entitlement", "/api/billing/entitlement"]) {
+      const res = await request(app).get(path).set(auth).set(iosContext(platform));
+      assert.equal(res.status, 200);
+      assert.equal(res.body.plan, "lifetime");
+      assert.equal(res.body.isPro, true);
+      assert.equal(res.body.complimentaryLifetime, "ios");
+      assert.equal(res.body.hasApplePurchaseAccess, false);
+      assert.equal(res.body.billingProvider, "NONE");
+      assert.equal(res.body.validUntil, null);
+      assert.equal(res.body.purchaseEligibility.lifetime.canPurchase, false);
+      const receipt = readReceipt(res.body.receipt);
+      assert.equal(receipt.isPro, true);
+      assert.equal(receipt.deviceId, MOBILE);
+      assert.equal(receipt.trialEndsAt, null);
+    }
+    assert.equal(user.isProCached, false);
+    assert.equal(provider.callCount(), 0);
+  });
+}
+
+test("an iOS gift does not leak to desktop, Android, missing context or a different account", async (t) => {
+  const { user } = fixture(t, { ...iosGift, signupPlatform: "ios" });
+  for (const headers of [device(MOBILE), iosContext("android"), iosContext("unknown"),
+    iosContext("ios", ""), iosContext("ios", "win-fixture"), iosContext("ios", "mac-fixture")]) {
+    const res = await request(app).get("/api/entitlement").set(auth).set(headers);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.isPro, false);
+    assert.equal(res.body.complimentaryLifetime, null);
+    assert.equal(res.body.purchaseEligibility.lifetime.canPurchase, true);
+  }
+  user.iosLifetimeGrantedAt = null;
+  const other = await request(app).get("/api/entitlement").set(auth).set(iosContext());
+  assert.equal(other.body.isPro, false);
+});
+
+test("an unverified account or a reserved offer alone never supplies iOS lifetime", async (t) => {
+  const { user } = fixture(t, { ...iosGift, emailVerified: false });
+  let res = await request(app).get("/api/entitlement").set(auth).set(iosContext());
+  assert.equal(res.body.isPro, false);
+  Object.assign(user, { emailVerified: true, iosLifetimeGrantedAt: null, signupLifetimeOffer: "ios" });
+  res = await request(app).get("/api/entitlement").set(auth).set(iosContext());
+  assert.equal(res.body.isPro, false);
+});
+
+test("iOS gift eligibility also blocks unnecessary checkout and subscription offers", async (t) => {
+  const { provider } = fixture(t, iosGift);
+  const sub = await request(app).get("/api/subscription").set(auth).set(iosContext());
+  assert.equal(sub.status, 200);
+  for (const plan of ["monthly", "yearly", "lifetime"]) {
+    assert.equal(sub.body.purchaseEligibility[plan].canPurchase, false);
+    const res = await request(app).post("/api/checkout").set(auth).set(iosContext()).send({ plan });
+    assert.equal(res.status, 409);
+    assert.equal(res.body.code, "LIFETIME_ALREADY_OWNED");
+  }
+  assert.equal(provider.callCount(), 0);
+});
+
+test("an iOS gift survives a refunded Apple purchase but supplies no restore proof", async (t) => {
+  fixture(t, iosGift);
+  stub(t, prisma.purchase, "findMany", async () => [{ provider: "revenuecat", isRefunded: true }]);
+  const res = await request(app).get("/api/entitlement").set(auth).set(iosContext());
+  assert.equal(res.body.isPro, true);
+  assert.equal(res.body.hasApplePurchaseAccess, false);
+  assert.equal(res.body.complimentaryLifetime, "ios");
+});
+
+test("a real Apple purchase supplies restore proof independently of the gift", async (t) => {
+  const { user } = fixture(t, iosGift);
+  stub(t, prisma.purchase, "findMany", async () => [{ provider: "app_store", isRefunded: false }]);
+  stub(t, prisma.purchase, "findFirst", async () => ({ id: "paid", provider: "app_store" }));
+  let res = await request(app).get("/api/entitlement").set(auth).set(iosContext());
+  assert.equal(res.body.isPro, true);
+  assert.equal(res.body.hasApplePurchaseAccess, true);
+  assert.equal(res.body.billingProvider, "APPLE");
+  user.accessRevoked = true;
+  res = await request(app).get("/api/entitlement").set(auth).set(iosContext());
+  assert.equal(res.body.isPro, false);
+  assert.equal(res.body.hasApplePurchaseAccess, false);
+  assert.equal(res.body.complimentaryLifetime, null);
+  assert.equal(readReceipt(res.body.receipt).isPro, false);
+});
+
+test("an Apple subscription stays manageable and proves paid access beside an iOS gift", async (t) => {
+  fixture(t, iosGift);
+  stub(t, prisma.subscription, "findMany", async () => [{
+    externalId: "apple-sub", provider: "revenuecat", variantId: "app.welockin.pro.monthly",
+    status: "active", interval: "monthly", validUntil: new Date(Date.now() + 86_400_000),
+    trialEndsAt: null, trialCancelledAt: null, pauseMode: null, willRenew: true,
+    providerUpdatedAt: new Date(), createdAt: new Date(), updatedAt: new Date(),
+    customerPortalUrl: "https://apps.apple.com/account/subscriptions", updatePaymentUrl: null,
+  }]);
+  const res = await request(app).get("/api/entitlement").set(auth).set(iosContext());
+  assert.equal(res.body.plan, "lifetime");
+  assert.equal(res.body.validUntil, null);
+  assert.equal(res.body.hasApplePurchaseAccess, true);
+  assert.equal(res.body.manageableSubscription.provider, "APPLE");
+  assert.equal(res.body.manageableSubscription.managementUrl, "https://apps.apple.com/account/subscriptions");
 });

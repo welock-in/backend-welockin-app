@@ -39,6 +39,7 @@ import { addictionProtectionRouter } from "./routes/addiction-protection";
 import { adminProtectionRouter } from "./routes/admin-protection";
 import { adminReleasesRouter } from "./routes/admin-releases";
 import { adminNotificationsRouter } from "./routes/admin-notifications";
+import { adminSignupLifetimeRouter } from "./routes/admin-signup-lifetime";
 import { errorHandler, notFoundHandler } from "./middleware/error";
 import { requireAuth, requireCurrentSession, requireVerifiedAccount } from "./middleware/auth";
 import { requireAdmin } from "./middleware/admin-auth";
@@ -56,6 +57,7 @@ export function createApp(): Express {
         "Content-Type",
         "Authorization",
         "X-WeLockIn-Device-Id",
+        "X-WeLockIn-Platform",
         "X-WeLockIn-Attest",
         // Composite hardware fingerprint (desktop only) — see lib/fingerprint.ts.
         "X-WeLockIn-Fingerprint",
@@ -151,6 +153,7 @@ export function createApp(): Express {
   // below; a JSON API for the separate admin-dashboard app, gated by an env-cred
   // admin JWT rather than User.isAdmin, hence no `gated` here.
   app.use("/api/admin", adminRouter);
+  app.use("/api/admin/signup-lifetime", adminSignupLifetimeRouter);
   // Operator diagnostics: asks Lemon Squeezy what THIS key can actually see
   // (store + variant existence — the test/live graph-swap detector). Behind the
   // admin gate rather than public: each hit fires two AUTHENTICATED outbound LS

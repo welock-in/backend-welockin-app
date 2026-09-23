@@ -92,6 +92,7 @@ function fakeDevices(t: Ctx, rows: Row[]) {
 }
 
 function fakeUsers(t: Ctx, seed: Row[]) {
+  stubMethod(t, prisma.signupLifetimeSettings as any, "findUnique", async () => null);
   const store: Row[] = seed.map((r) => ({
     passwordHash: null,
     emailVerified: true,

@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { asyncHandler } from "../middleware/async-handler";
@@ -14,6 +15,7 @@ import { hashPassword } from "../lib/password";
 import { sendEmailVerificationCode, sendPasswordResetLink } from "../lib/resend";
 import { clientIp, consumeRateLimit } from "../lib/rate-limit";
 import { passwordResetRequestSchema, passwordResetSchema, verifyEmailSchema } from "../validation/schemas";
+import { signupLifetimeGrantData } from "../lib/signup-lifetime";
 
 /**
  * Proving you can read your own inbox, and getting back in when you cannot
@@ -144,7 +146,11 @@ authEmailRouter.post(
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, email: true, emailVerified: true },
+      select: {
+        id: true, email: true, emailVerified: true,
+        signupPlatform: true, signupLifetimeOffer: true,
+        iosLifetimeGrantedAt: true, desktopLifetimeGrantedAt: true,
+      },
     });
     if (!user) throw accountGone();
     if (user.emailVerified === true) {
@@ -173,6 +179,15 @@ authEmailRouter.post(
     const now = new Date();
     const record = latest && !latest.consumedAt && latest.expiresAt > now ? latest : null;
     if (!record) {
+      if (latest?.consumedAt) {
+        // Another valid request may have completed after the initial user read.
+        // Recover that success rather than calling a replay an invalid code.
+        const current = await prisma.user.findUnique({ where: { id: user.id }, select: { email: true, emailVerified: true } });
+        if (current?.emailVerified === true && current.email === user.email) {
+          res.json({ ok: true, alreadyVerified: true, email: user.email });
+          return;
+        }
+      }
       if (!latest) {
         console.warn("[auth] verify refused: this account has no verification row at all");
       } else if (latest.consumedAt) {
@@ -221,18 +236,34 @@ authEmailRouter.post(
     // account's address moved since, this code proves nothing about the new one.
     if (record.email !== user.email) throw verificationCodeInvalid();
 
-    await prisma.$transaction([
-      prisma.emailVerification.update({
-        where: { id: record.id },
-        data: { consumedAt: now },
-      }),
-      prisma.user.update({
-        where: { id: user.id },
-        data: { emailVerified: true, emailVerifiedAt: now },
-      }),
-    ]);
-
-    res.json({ ok: true, alreadyVerified: false, email: user.email });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const [, verification] = await prisma.$transaction([
+          prisma.emailVerification.update({
+            where: { id: record.id },
+            data: { consumedAt: now },
+          }),
+          prisma.user.updateMany({
+            // Only the first verification may activate a reservation or set its
+            // timestamp, including two concurrent requests that read unverified.
+            where: {
+              id: user.id,
+              OR: [
+                { emailVerified: false },
+                { emailVerified: null },
+                { emailVerified: { isSet: false } },
+              ],
+            },
+            data: { emailVerified: true, emailVerifiedAt: now, ...signupLifetimeGrantData(user, now) },
+          }),
+        ]);
+        res.json({ ok: true, alreadyVerified: verification.count === 0, email: user.email });
+        return;
+      } catch (error) {
+        if (attempt < 2 && error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") continue;
+        throw error;
+      }
+    }
   }),
 );
 

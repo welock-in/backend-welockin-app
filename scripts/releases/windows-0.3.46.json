@@ -1,0 +1,14 @@
+{
+  "version": "0.3.46",
+  "target": "windows",
+  "arch": "x86_64",
+  "channel": "stable",
+  "rolloutPercent": 100,
+  "url": "https://pub-9a9e884e54304893952b71510391fcd4.r2.dev/releases/0.3.46/welockin_0.3.46_x64-setup.exe",
+  "sha256": "d82da75adbb66af17b936d8d75b61e602a6d9fd6c5867538d918d3b365976cfe",
+  "sizeBytes": 11633633,
+  "signatureSha256": "b46fc340ec129250e77ca42aa7f224667f75dc6d1222bd7dac7bca2aee281804",
+  "signatureSizeBytes": 420,
+  "sourceSha": "6e67a788d1b7fa13ed67c32e4e3c2b20791473fc",
+  "notes": "New desktop accounts receive lifetime access. Existing subscriptions remain manageable. Windows source commit 6e67a788d1b7fa13ed67c32e4e3c2b20791473fc."
+}

@@ -591,9 +591,42 @@ export function projectSubscriber(userId: string, subscriber: RcSubscriber, now:
  * caller, their stale RC rows were revoked, and `ownerUserId` names who holds
  * the claim so the route can tell the client whose purchase this is.
  */
+/**
+ * A flattened view of what a snapshot mirrored, for the webhook route's
+ * analytics and for nothing else.
+ *
+ * Deliberately narrow and deliberately NOT the plan rows themselves. The route
+ * needs enough to describe a state change to PostHog; handing it the internal
+ * shapes would make every future field of those shapes an analytics decision by
+ * accident. Nothing Apple-identifying is here either — no original transaction
+ * id, no management url — because this is on its way out of the building.
+ */
+export type RcMirroredRow = {
+  kind: "subscription" | "purchase";
+  externalId: string;
+  productId: string;
+  interval: string | null;
+  status: string | null;
+  willRenew: boolean | null;
+  validUntil: Date | null;
+  /** RevenueCat's own casing, "trial" / "normal" / "intro" — LOWERCASE here,
+   *  where the webhook's own field is uppercase. Normalise before comparing. */
+  periodType: string | null;
+  /** "production" | "sandbox", read from the re-fetched subscriber's own
+   *  `is_sandbox` and never from the event: an event crying SANDBOX must not be
+   *  able to hide a production purchase, and two tests already pin that. */
+  environment: string;
+  isRefunded: boolean | null;
+};
+
 export type RcSyncResult = {
   managementUrl: string | null;
   conflict?: { ownerUserId: string };
+  /**
+   * What the snapshot said. Absent on a conflict — nothing was granted there,
+   * and reporting a state change for rows we just revoked would invent revenue.
+   */
+  mirrored?: RcMirroredRow[];
 };
 
 const isDuplicateKey = (err: unknown) =>
@@ -774,7 +807,36 @@ export async function syncUserFromRevenueCat(userId: string): Promise<RcSyncResu
   // right no-op; the sweep is the part that must not fire. Every other
   // unreadable answer never reaches here at all: fetchSubscriber throws, the
   // event parks as `failed`, and the redelivery tries again.
-  if (!authoritative) return { managementUrl: plan.managementUrl };
+  // Built once, from the plan the upserts just wrote. Reading it back out of
+  // Prisma would be a second round trip for facts we already hold.
+  const mirrored: RcMirroredRow[] = [
+    ...plan.subscriptions.map((s) => ({
+      kind: "subscription" as const,
+      externalId: s.externalId,
+      productId: s.data.variantId,
+      interval: s.data.interval,
+      status: s.data.status,
+      willRenew: s.data.willRenew,
+      validUntil: s.data.validUntil,
+      periodType: s.data.periodType,
+      environment: s.data.environment,
+      isRefunded: s.data.refundedAt != null,
+    })),
+    ...plan.purchases.map((p) => ({
+      kind: "purchase" as const,
+      externalId: p.externalId,
+      productId: p.data.productId,
+      interval: null,
+      status: null,
+      willRenew: null,
+      validUntil: null,
+      periodType: null,
+      environment: p.data.environment,
+      isRefunded: p.data.isRefunded,
+    })),
+  ];
+
+  if (!authoritative) return { managementUrl: plan.managementUrl, mirrored };
 
   // The sweep. `notIn` an empty list is the whole point on a transfer-loser:
   // it matches every one of this user's RC rows, which is exactly right when
@@ -817,5 +879,5 @@ export async function syncUserFromRevenueCat(userId: string): Promise<RcSyncResu
   );
   if (lifetimeGrants) await cancelRecurringLsForLifetimeBuyer(userId);
 
-  return { managementUrl: plan.managementUrl };
+  return { managementUrl: plan.managementUrl, mirrored };
 }

@@ -6,6 +6,7 @@ import { asyncHandler } from "../middleware/async-handler";
 import { deterministicObjectId } from "../lib/deterministic-id";
 import { sessionHeartbeatSchema, sessionEndSchema } from "../validation/schemas";
 import { dispatchEvent } from "../services/notifications/dispatcher";
+import { NotificationEvents } from "../services/notifications/events";
 
 export const sessionsRouter = Router();
 
@@ -80,7 +81,7 @@ sessionsRouter.post(
     // throws and the Expo call is time-bounded, so it can't break/hang the heartbeat.
     // Concurrent first-beats are deduped downstream (rule dedupeKey on sessionId).
     if (existing === null) {
-      await dispatchEvent("session.started", {
+      await dispatchEvent(NotificationEvents.SESSION_STARTED, {
         userId,
         deviceId: input.deviceId,
         platform: input.platform,
@@ -107,6 +108,10 @@ sessionsRouter.post(
     const { deviceId, sessionId } = sessionEndSchema.parse(req.body);
     const result = await prisma.liveSession.deleteMany({
       where: { userId: req.user!.id, deviceId, ...(sessionId ? { sessionId } : {}) },
+    });
+    await prisma.focusInvite.updateMany({
+      where: { userId: req.user!.id, fromDeviceId: deviceId, status: "pending", ...(sessionId ? { sessionId } : {}) },
+      data: { status: "cancelled", respondedAt: new Date() },
     });
     res.json({ ended: result.count });
   }),

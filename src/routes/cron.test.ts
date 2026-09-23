@@ -204,3 +204,83 @@ test("the secret is accepted with or without the Bearer prefix", async (t) => {
 
   assert.equal(res.status, 200);
 });
+
+/*
+ * THE ABANDONED-CHECKOUT SWEEP — the one scheduled job that changes nothing.
+ *
+ * It writes no row, sends no mail and moves no money: it reads expired checkout
+ * intents and reports them, because nobody delivers a webhook for a payment that
+ * did not happen. Its guard still has to be the same one, for the same reason —
+ * an open endpoint here is a free way to make the function do work.
+ */
+
+function stubNoAbandonedIntents(t: TestContext) {
+  const ci = prisma.checkoutIntent as any;
+  const before = ci.findMany;
+  const calls: any[] = [];
+  ci.findMany = async (args: any) => {
+    calls.push(args);
+    return [];
+  };
+  t.after(() => {
+    ci.findMany = before;
+  });
+  return calls;
+}
+
+test("checkout-abandoned refuses without the secret configured", async (t) => {
+  quiet(t);
+  setSecret(t, "");
+  stubNoAbandonedIntents(t);
+  const res = await request(app).post("/api/cron/checkout-abandoned");
+  assert.equal(res.status, 503);
+});
+
+test("checkout-abandoned refuses a wrong secret and accepts the right one", async (t) => {
+  setSecret(t, SECRET);
+  stubNoAbandonedIntents(t);
+
+  assert.equal(
+    (await request(app).post("/api/cron/checkout-abandoned").set("authorization", `Bearer nope`)).status,
+    401,
+  );
+
+  const res = await request(app)
+    .post("/api/cron/checkout-abandoned")
+    .set("authorization", `Bearer ${SECRET}`);
+  assert.equal(res.status, 200);
+  // The exact report, not an `ok: true` — a sweep that silently found nothing and
+  // a sweep that silently failed look identical without the numbers.
+  assert.deepEqual(res.body, { candidates: 0, emitted: 0, failed: 0 });
+});
+
+test("both verbs work, and only the authenticated one", async (t) => {
+  setSecret(t, SECRET);
+  stubNoAbandonedIntents(t);
+  assert.equal((await request(app).get("/api/cron/checkout-abandoned")).status, 401);
+  assert.equal(
+    (await request(app).get("/api/cron/checkout-abandoned").set("authorization", SECRET)).status,
+    200,
+  );
+});
+
+test("the sweep looks only at ready intents inside a bounded window", async (t) => {
+  setSecret(t, SECRET);
+  const calls = stubNoAbandonedIntents(t);
+
+  await request(app).post("/api/cron/checkout-abandoned").set("authorization", `Bearer ${SECRET}`);
+
+  const where = calls[0]?.where;
+  assert.equal(where?.state, "ready", "completed and failed intents are not abandonments");
+  // Bounded on BOTH sides. Without the floor, every intent that ever expired
+  // would be re-reported on every run for ever.
+  assert.ok(where?.expiresAt?.lt instanceof Date, "an upper bound: not yet expired is not abandoned");
+  assert.ok(where?.expiresAt?.gte instanceof Date, "a lower bound: old ones are not re-swept");
+  assert.ok(typeof calls[0]?.take === "number" && calls[0].take > 0, "never unbounded");
+
+  // The token and the checkout URL are the two fields that must never be read:
+  // both carry a payable link scoped to the account.
+  const select = calls[0]?.select ?? {};
+  assert.ok(!("token" in select), "the intent token must never be selected");
+  assert.ok(!("checkoutUrl" in select), "the checkout URL must never be selected");
+});

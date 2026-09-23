@@ -13,8 +13,13 @@ import {
 } from "../validation/schemas";
 import { resolveAudience } from "../services/notifications/audience";
 import { deliver } from "../services/notifications/deliver";
+import { checkNotificationReceipts } from "../services/notifications/receipts";
 
 export const adminNotificationsRouter = Router();
+
+adminNotificationsRouter.post("/receipts", requireAdmin, asyncHandler(async (_req, res) => {
+  res.json(await checkNotificationReceipts());
+}));
 
 /**
  * Send an ad-hoc push to an audience. Reuses the shared engine primitives

@@ -5,6 +5,8 @@ import { asyncHandler } from "../middleware/async-handler";
 import { unauthorized, HttpError } from "../lib/http-error";
 import { drainCancels } from "../lib/billing-tasks";
 import { sendTrialReminders } from "../lib/trial-reminders";
+import { sweepAbandonedCheckouts } from "../lib/checkout-abandoned";
+import { checkNotificationReceipts } from "../services/notifications/receipts";
 
 /**
  * Scheduled work.
@@ -28,6 +30,14 @@ import { sendTrialReminders } from "../lib/trial-reminders";
  * the internet can run, which is visible never.
  */
 export const cronRouter = Router();
+
+cronRouter.route("/notification-receipts").get(asyncHandler(async (req, res) => {
+  requireCronSecret(req.header("authorization"));
+  res.json(await checkNotificationReceipts());
+})).post(asyncHandler(async (req, res) => {
+  requireCronSecret(req.header("authorization"));
+  res.json(await checkNotificationReceipts());
+}));
 
 /** Constant-time compare; length may leak, which tells an attacker nothing useful. */
 function safeEqual(a: string, b: string): boolean {
@@ -118,3 +128,30 @@ const runTrialReminders = asyncHandler(async (req, res) => {
 // two verbs cannot drift apart the way two copies would.
 cronRouter.get("/trial-reminders", runTrialReminders);
 cronRouter.post("/trial-reminders", runTrialReminders);
+
+/**
+ * Report the desktop checkouts that were started and never paid.
+ *
+ * The only job here that changes nothing — no row is written, no email is sent,
+ * no money moves. It reads expired checkout intents and tells PostHog they
+ * lapsed, because the absence of a payment is not something anyone delivers a
+ * webhook for. Between `checkout_started` in the app and `checkout_confirmed`
+ * from the Lemon Squeezy webhook is the leakiest stretch of the whole product,
+ * and this is what makes the gap countable instead of merely empty.
+ *
+ * Same guard and same posture as the two above: 200 with a report, never a 500.
+ * Safe to call twice — the event carries a uuid derived from the intent id, so a
+ * repeat run reports the same abandonment rather than a second one.
+ */
+const runCheckoutAbandoned = asyncHandler(async (req, res) => {
+  requireCronSecret(req.header("authorization") ?? undefined);
+  const report = await sweepAbandonedCheckouts();
+  console.info(
+    `[cron] abandoned checkouts: candidates=${report.candidates} ` +
+      `emitted=${report.emitted} failed=${report.failed}`,
+  );
+  res.json(report);
+});
+
+cronRouter.get("/checkout-abandoned", runCheckoutAbandoned);
+cronRouter.post("/checkout-abandoned", runCheckoutAbandoned);

@@ -22,6 +22,7 @@ import {
   subscriptionGrants,
   validUntilFrom,
 } from "../lib/subscription";
+import { capture, type CaptureInput } from "../lib/posthog";
 import { claimWebhookEvent, markWebhookEvent } from "../lib/webhook-events";
 import { ledgerHash } from "../lib/hash";
 import { isReliableDeviceId } from "../lib/device";
@@ -107,6 +108,7 @@ lemonSqueezyWebhookRouter.post(
       try {
         const outcome = await handleSubscription(sub, body);
         await markEvent(sub.eventKey, outcome.status, outcome.reason);
+        await emitAnalytics(outcome);
         res.status(200).json({ ok: true, status: outcome.status });
       } catch (e) {
         await markEvent(sub.eventKey, "failed", e instanceof Error ? e.message : "error");
@@ -141,6 +143,7 @@ lemonSqueezyWebhookRouter.post(
     try {
       const outcome = await handle(order, body);
       await markEvent(order.eventKey, outcome.status, outcome.reason);
+      await emitAnalytics(outcome);
       res.status(200).json({ ok: true, ...(outcome.reason ? { note: outcome.reason } : {}) });
     } catch (err) {
       // Leave the row non-terminal so the redelivery re-runs the work, then let
@@ -151,7 +154,70 @@ lemonSqueezyWebhookRouter.post(
   }),
 );
 
-type Outcome = { status: "processed" | "skipped" | "failed"; reason?: string };
+type Outcome = {
+  status: "processed" | "skipped" | "failed";
+  reason?: string;
+  /**
+   * What to tell PostHog, built HERE and emitted by the route.
+   *
+   * Carried out rather than sent from inside, for two reasons. `recordPaidOrder`
+   * and `mirrorSubscriptionState` are exported and shared with
+   * POST /api/checkout/confirm — an emission inside either would silently
+   * instrument a second route and double-count whenever both paths see the same
+   * order. And the route is the only place that runs after `markEvent`, which is
+   * where an analytics failure is structurally unable to touch the webhook's
+   * status (see the emission site).
+   *
+   * Only the "processed" returns ever fill this. The nine early exits above
+   * describe things that did not happen.
+   */
+  analytics?: CaptureInput[];
+};
+
+/** Lemon Squeezy is a merchant of record, so store and provider coincide here.
+ *  Kept separate anyway: the RevenueCat side sends provider "revenuecat" with
+ *  store "app_store", and a single column has to mean the same thing in both. */
+const ANALYTICS_PROVIDER = "lemonsqueezy";
+
+/** The registry's environment vocabulary. `lemonSqueezyAllowTestMode` lets real
+ *  test-mode orders through on some deployments, so this is read per order and
+ *  never inferred from NODE_ENV. */
+const analyticsEnvironment = (testMode: boolean) => (testMode ? "sandbox" : "prod");
+
+/**
+ * The provider's own time for this delivery, for events that have no parsed
+ * object to take one from.
+ *
+ * Never the clock. PostHog's de-duplication keys on the timestamp and buckets it
+ * by calendar day, and Lemon Squeezy retries with a backoff measured in hours —
+ * so a redelivery routinely lands the following morning. Stamped at emission,
+ * the two copies stop matching and one checkout becomes two.
+ */
+function providerEventTime(body: LemonSqueezyWebhook): Date {
+  const raw = body.data?.attributes?.created_at;
+  const parsed = typeof raw === "string" ? new Date(raw) : null;
+  return parsed && !Number.isNaN(parsed.getTime()) ? parsed : new Date();
+}
+
+/**
+ * Hand the outcome's events to PostHog.
+ *
+ * WHERE THIS IS CALLED FROM IS THE WHOLE SAFETY ARGUMENT: after `markEvent`, and
+ * before the 200. By then the WebhookEvent row is terminal, and `markWebhookEvent`
+ * will not move a terminal row — so even the route's own catch could not mark it
+ * failed on our account. What that catch WOULD still do is rethrow into a 500,
+ * and a 500 is an instruction to redeliver: hence the per-call `.catch` here,
+ * which is the actual guarantee rather than a decoration.
+ *
+ * Awaited, never fire-and-forget. This deploys as one serverless function that
+ * freezes the moment the response flushes; a `void capture(...)` would simply
+ * never leave.
+ */
+async function emitAnalytics(outcome: Outcome): Promise<void> {
+  for (const event of outcome.analytics ?? []) {
+    await capture(event).catch((e) => console.error("[lemonsqueezy] posthog:", e));
+  }
+}
 
 /**
  * Decide what this order means and record it.
@@ -228,7 +294,44 @@ async function handle(order: ParsedOrder, body: LemonSqueezyWebhook): Promise<Ou
     // and the account that held it is gone. Redelivering it changes nothing.
     return { status: "skipped", reason: `order ${order.orderId} was already consumed` };
   }
-  return { status: "processed" };
+  return {
+    status: "processed",
+    analytics: [
+      {
+        event: "purchase_completed",
+        distinctId: userId,
+        // The ORDER, not the event: `order.eventKey` carries a per-event stamp,
+        // so a redelivery of the same purchase would arrive under a new key and
+        // count twice. An order id is the thing that happened once.
+        dedupeKey: `ls:order:${order.orderId}`,
+        // Lemon Squeezy's own creation time. The dedup window PostHog uses is
+        // bucketed by calendar day, and a retry can land the next morning.
+        timestamp: order.purchasedAt,
+        properties: {
+          provider: ANALYTICS_PROVIDER,
+          store: "lemonsqueezy",
+          // Only the lifetime variant ever reaches this line: a subscription's
+          // order_created is refused earlier by isSellableOrder, which routes it
+          // to the subscription events instead.
+          plan: "lifetime",
+          product_id: order.variantId,
+          revenue_usd: order.priceUsd,
+          // What the customer actually paid, in their own currency. Both are
+          // sent because neither alone is comparable: USD lets iOS and desktop
+          // be added up, the native pair is the only truthful figure.
+          amount_native: order.amountNative,
+          currency: order.currency,
+          // Lemon Squeezy is a merchant of record and `total_usd` is what the
+          // buyer was charged, before their fee. Stated rather than implied so
+          // nobody has to guess later which side of the fee this sits on.
+          is_gross: true,
+          test_mode: order.testMode === true,
+          environment: analyticsEnvironment(order.testMode === true),
+          ls_event: order.event,
+        },
+      },
+    ],
+  };
 }
 
 /**
@@ -559,6 +662,40 @@ async function closeCheckoutIntent(
     const intent = await intentByToken(token);
     if (!intent || intent.userId !== userId) return;
     await completeIntent(intent.id);
+
+    // The half of the desktop checkout ratio that lives on this side.
+    //
+    // The app emits `checkout_started` when it mints the link and opens a
+    // browser; this is the only place that knows the money actually arrived.
+    // Between the two is the leakiest stretch of the whole product — the payment
+    // happens outside the app, and nobody has ever measured how many people do
+    // not come back.
+    //
+    // Deliberately NOT sent from the two callers: `closeCheckoutIntent` is the
+    // single point both the order path and the subscription path pass through,
+    // so one call here covers lifetime and subscription without either caller
+    // learning about analytics. It sits inside the existing try/catch, which
+    // already swallows everything for the same reason we do.
+    //
+    // Neither `intent.token` nor `intent.checkoutUrl` may ever become a
+    // property: both carry the intent token, and the emitter's own scrub would
+    // strip them anyway.
+    await capture({
+      event: "checkout_confirmed",
+      distinctId: userId,
+      dedupeKey: `ls:intent:${intent.id}`,
+      // The provider's own creation time, not the clock — a redelivery arriving
+      // the next morning has to reproduce the same dedup quadruple.
+      timestamp: providerEventTime(body),
+      properties: {
+        provider: ANALYTICS_PROVIDER,
+        // The plan the customer actually reserved, rather than one guessed back
+        // from the variant id — the intent knows it first-hand.
+        plan: intent.plan,
+        environment: analyticsEnvironment(body.meta?.test_mode === true),
+        ls_event: body.meta?.event_name ?? null,
+      },
+    }).catch((e) => console.error("[lemonsqueezy] posthog checkout_confirmed:", e));
   } catch (e) {
     // Best-effort: failing to close an intent must never fail a payment
     // webhook. The lock expires on its own, and the row stays visible.
@@ -655,7 +792,47 @@ async function handleSubscription(
     // email. Terminal: an ended account is not a customer.
     return { status: "skipped", reason: `subscription ${sub.subscriptionId} was already consumed` };
   }
-  return { status: "processed" };
+  return {
+    status: "processed",
+    analytics: [
+      {
+        event: "subscription_state_changed",
+        distinctId: userId,
+        // Here the EVENT key is right, unlike the order above: each of the
+        // eleven subscription events is a distinct state change worth counting,
+        // and eventKey already ends in a per-event stamp that a redelivery
+        // reproduces exactly.
+        dedupeKey: `ls:sub:${sub.eventKey}`,
+        // Lemon Squeezy's own `updated_at`. Falling back to the trial or renewal
+        // date would be a different fact; falling back to now would defeat the
+        // deduplication, so the last resort is the event's own reception.
+        timestamp: sub.updatedAt ?? new Date(),
+        properties: {
+          provider: ANALYTICS_PROVIDER,
+          store: "lemonsqueezy",
+          product_id: sub.variantId,
+          // Lemon Squeezy's own vocabulary, verbatim: active, on_trial, paused,
+          // past_due, unpaid, cancelled, expired. Not remapped, because the day
+          // they add a state a remapping would quietly file it as something else.
+          status: sub.status,
+          // NO AMOUNT, and that is not an oversight. A Lemon Squeezy
+          // subscription payload carries no price anywhere — not in the webhook,
+          // not in the Subscription row, and there is no variant-to-price table
+          // in this repo. Sending a zero would be worse than sending nothing.
+          // The first payment's money is on the order_created above; MRR needs a
+          // price table that does not exist yet.
+          on_trial: sub.trialEndsAt != null,
+          // The end of a paid period and the end of everything are different
+          // facts, and the desktop paywall already treats them differently.
+          renews_at: sub.renewsAt?.toISOString() ?? null,
+          ends_at: sub.endsAt?.toISOString() ?? null,
+          test_mode: sub.testMode === true,
+          environment: analyticsEnvironment(sub.testMode === true),
+          ls_event: sub.event,
+        },
+      },
+    ],
+  };
 }
 
 /**

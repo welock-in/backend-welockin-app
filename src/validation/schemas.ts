@@ -113,7 +113,9 @@ export const focusInviteCreateSchema = z.object({
   // another into an effectively permanent block.
   durationSeconds: z.number().int().min(60).max(24 * 60 * 60),
   hardLock: z.boolean().optional(),
-  targetDeviceIds: z.array(z.string().trim().min(1).max(128)).min(1).max(10),
+  targetDeviceIds: z.array(z.string().trim().min(1).max(128)).min(1).max(50),
+  // Stable across client retries, so an offline retry never extends a session.
+  endsAt: z.string().datetime({ offset: true }).optional(),
   // Fallback when the X-WeLockIn-Device-Id header is absent.
   fromDeviceId: z.string().trim().min(1).max(128).optional(),
 });

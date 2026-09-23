@@ -101,6 +101,13 @@ export type LemonSqueezyWebhook = {
       refunded_at?: string | null;
       total_usd?: number;
       refunded_amount_usd?: number;
+      // The customer's OWN currency and amount. Lemon Squeezy converts to USD
+      // for `total_usd` and until now that converted figure was the only one
+      // kept — so a 19,99 € order was recorded as 22.92 and the euro was gone.
+      // Typed `number | string` because these are new readings and toCents
+      // already handles both; the existing `total_usd?: number` is untouched.
+      currency?: string;
+      total?: number | string;
       created_at?: string;
       test_mode?: boolean;
       store_id?: number;
@@ -149,6 +156,17 @@ export type ParsedOrder = {
   refundedAmountUsd: number | null;
   purchasedAt: Date;
   priceUsd: number | null;
+  /**
+   * The currency the customer actually paid in, uppercased ("EUR").
+   *
+   * Read only for analytics, and deliberately not used by any billing decision:
+   * `priceUsd` remains the single figure the licence logic looks at. Without
+   * this, a euro on the desktop and a dollar on iOS were the same number in the
+   * same column, and no revenue comparison between the two was possible.
+   */
+  currency: string | null;
+  /** `total` in that currency, in units rather than cents — 19.99, not 1999. */
+  amountNative: number | null;
   storeId: string | null;
   variantId: string | null;
   testMode: boolean;
@@ -370,6 +388,12 @@ export function parseOrderEvent(body: LemonSqueezyWebhook): ParsedOrder | null {
     purchasedAt: parseDate(attrs.created_at) ?? new Date(),
     // Lemon Squeezy reports money in cents — sometimes as strings; see toCents.
     priceUsd: toCents(attrs.total_usd) != null ? toCents(attrs.total_usd)! / 100 : null,
+    // Analytics only — see the note on the fields. Same cents-to-units and
+    // same string tolerance as priceUsd above; never a formatted string like
+    // "€19.99", which is a rendering and not a number.
+    currency:
+      typeof attrs.currency === "string" && attrs.currency.trim() ? attrs.currency.trim().toUpperCase() : null,
+    amountNative: toCents(attrs.total) != null ? toCents(attrs.total)! / 100 : null,
     storeId: attrs.store_id != null ? String(attrs.store_id) : null,
     variantId: attrs.first_order_item?.variant_id != null ? String(attrs.first_order_item.variant_id) : null,
     // `data.attributes.test_mode` is the field the official example payloads

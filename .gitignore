@@ -10,3 +10,10 @@ dist
 *.log
 .DS_Store
 Thumbs.db
+
+# Pulled env files. `vercel env pull` writes REAL production secrets into
+# .env.prod-pull, which matched none of the rules above — untracked, but not
+# ignored, so one `git add -A` away from being committed. `.env` alone was
+# never enough. The example file stays tracked: it holds names, not values.
+.env.*
+!.env.example

@@ -244,6 +244,28 @@ export const env = {
   // Optional Expo access token (recommended for enhanced security + higher rate
   // limits). Sends still work without it via the open Expo Push API.
   expoAccessToken: process.env.EXPO_ACCESS_TOKEN ?? "",
+
+  // --- PostHog (server-side product analytics) ---
+  // Project key (`phc_…`). Emission is DISABLED — silent no-op, warned once per
+  // lambda — while empty, the same posture as RESEND_API_KEY. There is
+  // deliberately no POSTHOG_ENABLED flag: the literal-"true" switches in this
+  // file all guard money, access or a rollout that can lock someone out, and a
+  // second switch that could disagree with the first is the thing
+  // purchase-providers.ts refuses to add. The reversible kill switch lives in
+  // the data (see lib/posthog-events.ts, AnalyticsConfig), not in the env.
+  posthogApiKey: process.env.POSTHOG_API_KEY ?? "",
+  // Ingestion host. THE REGION IS LOAD-BEARING and fails silently: a key issued
+  // in one cloud, sent to the other, is accepted with a 200 and stored nowhere —
+  // which looks exactly like a product nobody uses. US because that is where the
+  // landing site's project already lives (landing PostHogProvider.tsx), and one
+  // project across all four surfaces is what makes a site-to-install-to-purchase
+  // funnel joinable at all.
+  //
+  // Trailing slashes stripped for the same reason as resolvePublicSiteUrl: the
+  // emitter concatenates a path, and a host pasted from a dashboard with its
+  // slash would mint `//i/v0/e/`.
+  posthogHost: (process.env.POSTHOG_HOST ?? "https://us.i.posthog.com").replace(/\/+$/, ""),
+
   // Lemon Squeezy — the DESKTOP purchase path (macOS + Windows, shipped outside
   // the App Store, so no store IAP is imposed and none is possible). iOS goes
   // through the App Store via RevenueCat because Apple requires it there. Both

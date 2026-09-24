@@ -129,6 +129,7 @@ model User {
   focusInvites       FocusInvite[]
   friendFocusRooms   FriendFocusRoom[]   @relation("FriendFocusHost")
   friendFocusMembers FriendFocusMember[]
+  friendFocusEvents  FriendFocusEvent[]
   focusEvents        FocusEvent[]
   snapshot           SyncSnapshot?
   authProviders      AuthProvider[]
@@ -299,7 +300,12 @@ model FriendFocusRoom {
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
+  // Optional for existing rooms. Allocated under the parent-room transaction;
+  // unlike timestamps, a committed sequence can never appear behind a cursor.
+  eventSequence Int?
+
   members FriendFocusMember[]
+  events  FriendFocusEvent[]
 
   @@index([hostUserId, status])
   @@index([expiresAt])
@@ -319,9 +325,34 @@ model FriendFocusMember {
   attemptToken String?
   ready       Boolean  @default(false)
   joinedAt    DateTime @default(now())
+  lastAttemptAt DateTime?
 
   @@unique([roomId, userId])
   @@index([userId, joinedAt])
+}
+
+// Durable room alerts, independent of mobile push registrations. A suppressed
+// request has no sequence but still reserves its request key, so retrying it
+// after the cooldown cannot turn it into a different outcome. The targeted
+// migration gives expiresAt a TTL index; never run db push against production.
+model FriendFocusEvent {
+  id               String @id @default(auto()) @map("_id") @db.ObjectId
+  requestKey       String @unique
+  roomId           String @db.ObjectId
+  room             FriendFocusRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  actorUserId      String @db.ObjectId
+  actor            User @relation(fields: [actorUserId], references: [id], onDelete: Cascade)
+  actorDisplayName String
+  kind             String // "app" | "website"; no app name, URL or blocklist
+  sequence         Int?
+  createdAt        DateTime @default(now())
+  expiresAt        DateTime
+  pushClaimedAt    DateTime?
+  pushCompletedAt  DateTime?
+
+  @@index([roomId, sequence])
+  @@index([actorUserId])
+  @@index([expiresAt])
 }
 
 model Break {

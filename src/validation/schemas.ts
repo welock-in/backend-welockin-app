@@ -152,6 +152,15 @@ export const friendFocusBlockedAttemptSchema = z.object({
   appName: z.string().trim().min(1).max(80).optional(),
 });
 
+export const friendFocusAttemptSchema = z.object({
+  kind: z.enum(["app", "website"]),
+  eventId: z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/),
+});
+
+export const friendFocusEventsQuerySchema = z.object({
+  after: z.string().min(1).max(256).regex(/^[A-Za-z0-9_-]+$/).optional(),
+});
+
 export const createBreakSchema = z.object({
   breakLen: z.number().int().positive().max(240), // minutes
   clientBreakId: z.string().trim().min(1).max(64).optional(), // idempotency key

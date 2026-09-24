@@ -1,12 +1,14 @@
-import { randomBytes, randomInt } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 import { Router } from "express";
-import type { FriendFocusMember, FriendFocusRoom, Prisma } from "@prisma/client";
+import type { FriendFocusEvent, FriendFocusMember, FriendFocusRoom, Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
-import { conflict, forbidden, notFound } from "../lib/http-error";
+import { badRequest, conflict, forbidden, notFound } from "../lib/http-error";
 import { asyncHandler } from "../middleware/async-handler";
 import { requireAuth } from "../middleware/auth";
 import {
   friendFocusBlockedAttemptSchema,
+  friendFocusAttemptSchema,
+  friendFocusEventsQuerySchema,
   friendFocusCreateSchema,
   friendFocusJoinSchema,
   friendFocusReadySchema,
@@ -29,7 +31,7 @@ function attemptToken(): string {
 }
 
 type RoomWithMembers = FriendFocusRoom & { members: FriendFocusMember[] };
-type RoomDb = Pick<Prisma.TransactionClient, "friendFocusRoom" | "friendFocusMember">;
+type RoomDb = Pick<Prisma.TransactionClient, "friendFocusRoom" | "friendFocusMember" | "friendFocusEvent">;
 class RoomWriteConflict extends Error {}
 
 /** Every membership/state mutation writes the parent room in the same Mongo
@@ -301,56 +303,173 @@ friendFocusRouter.post(
   }),
 );
 
+const ATTEMPT_COOLDOWN_MS = 60_000;
+const EVENT_RETENTION_MS = 24 * 60 * 60_000;
+const EVENT_PAGE_SIZE = 100;
+
+function activeRoom(room: RoomWithMembers): boolean {
+  return room.status === "active" && room.endsAt != null && room.endsAt.getTime() > Date.now();
+}
+
+function alertDisplayName(name: string): string {
+  const plain = name.replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/\s+/gu, " ").trim();
+  return Array.from(plain).slice(0, 40).join("") || "Friend";
+}
+
+/** The room write serializes request claims, cooldown and sequence allocation
+ * with starts/departures. Persist before any outbound push, including when no
+ * member has a mobile token. Never persist app names or browsing information. */
+async function recordAttempt(
+  roomId: string,
+  identify: (room: RoomWithMembers) => FriendFocusMember | undefined,
+  input: { kind: "app" | "website"; requestId: string },
+): Promise<FriendFocusEvent | null> {
+  if (!/^[0-9a-f]{24}$/i.test(roomId)) throw notFound("Room not found");
+  return changeRoom({ id: roomId }, (room) => {
+    if (!identify(room)) throw notFound("Room not found");
+  }, async (tx, room) => {
+    const actor = identify(room)!;
+    if (!activeRoom(room)) return null;
+    const requestKey = createHash("sha256")
+      .update(JSON.stringify([room.id, actor.userId, input.requestId])).digest("hex");
+    const previous = await tx.friendFocusEvent.findUnique({ where: { requestKey } });
+    const now = new Date();
+    if (room.endsAt!.getTime() <= now.getTime()) return null;
+    if (previous) return previous;
+    const suppressed = actor.lastAttemptAt != null &&
+      now.getTime() - actor.lastAttemptAt.getTime() < ATTEMPT_COOLDOWN_MS;
+    const sequence = suppressed ? null : (room.eventSequence ?? 0) + 1;
+    const event = await tx.friendFocusEvent.create({
+      data: {
+        requestKey, roomId: room.id, actorUserId: actor.userId,
+        actorDisplayName: alertDisplayName(actor.displayName), kind: input.kind, sequence,
+        createdAt: now,
+        expiresAt: new Date(room.endsAt!.getTime() + EVENT_RETENTION_MS),
+      },
+    });
+    if (sequence != null) {
+      await tx.friendFocusRoom.update({ where: { id: room.id }, data: { eventSequence: sequence } });
+      await tx.friendFocusMember.update({ where: { id: actor.id }, data: { lastAttemptAt: now } });
+    }
+    return event;
+  });
+}
+
+/** A durable claim prevents simultaneous retries from both sending the push.
+ * Expo remains an accelerator: even an unavailable provider cannot erase the
+ * committed event or make its desktop poll fail. Only a completed failure
+ * releases the claim. A crashed send stays reserved rather than allowing a
+ * slow sender and an expired-lease retry to overlap. */
+async function pushAttempt(event: FriendFocusEvent, appName?: string): Promise<number> {
+  if (event.sequence == null) return 0;
+  const claimedAt = new Date();
+  const claim = await prisma.friendFocusEvent.updateMany({
+    where: {
+      id: event.id,
+      AND: [
+        { OR: [{ pushCompletedAt: null }, { pushCompletedAt: { isSet: false } }] },
+        { OR: [{ pushClaimedAt: null }, { pushClaimedAt: { isSet: false } }] },
+      ],
+    },
+    data: { pushClaimedAt: claimedAt },
+  });
+  if (claim.count === 0) return 0;
+  let dispatchStarted = false;
+  try {
+    const room = await prisma.friendFocusRoom.findUnique({ where: { id: event.roomId }, include: { members: true } });
+    if (!room || !activeRoom(room) || !room.members.some((member) => member.userId === event.actorUserId)) {
+      await prisma.friendFocusEvent.updateMany({ where: { id: event.id, pushClaimedAt: claimedAt }, data: { pushCompletedAt: new Date() } });
+      return 0;
+    }
+    const recipientIds = room.members.filter((member) => member.userId !== event.actorUserId).map((member) => member.userId);
+    const targets = recipientIds.length ? await prisma.pushToken.findMany({
+      where: { valid: true, userId: { in: recipientIds } }, select: { token: true, userId: true },
+    }) : [];
+    dispatchStarted = true;
+    const summary = await deliver(targets, {
+      title: "Focus with Friends",
+      body: appName
+        ? `${alertDisplayName(event.actorDisplayName)} tried to open ${appName}, but it is blocked.`
+        : `${alertDisplayName(event.actorDisplayName)} tried to open a blocked ${event.kind === "website" ? "website" : "app"}.`,
+      data: { route: "/focus-with-friends/room/[id]", params: { id: room.id } },
+      expiration: Math.floor(room.endsAt!.getTime() / 1_000),
+    }, { source: "friend-focus:blocked-attempt", dedupeKey: `friend-focus:blocked-attempt:${event.id}` });
+    await prisma.friendFocusEvent.updateMany({
+      where: { id: event.id, pushClaimedAt: claimedAt },
+      data: summary.failed > 0 ? { pushClaimedAt: null } : { pushCompletedAt: new Date() },
+    });
+    return summary.sent;
+  } catch {
+    // Do not include the capability, token or app name in diagnostics.
+    console.warn("[friend-focus] push unavailable; room event remains available for polling");
+    // Once dispatch began, a database failure can mean Expo accepted the push
+    // but its audit/ack write failed. Keep that ambiguous claim reserved so a
+    // request retry cannot send it twice. Failures before dispatch are safe.
+    if (!dispatchStarted) {
+      await prisma.friendFocusEvent.updateMany({ where: { id: event.id, pushClaimedAt: claimedAt }, data: { pushClaimedAt: null } }).catch(() => undefined);
+    }
+    return 0;
+  }
+}
+
+function eventCursor(roomId: string, sequence: number): string {
+  return Buffer.from(JSON.stringify({ v: 1, r: roomId, s: sequence })).toString("base64url");
+}
+
+function readEventCursor(raw: string, roomId: string, highWater: number): number {
+  try {
+    const bytes = Buffer.from(raw, "base64url");
+    if (bytes.toString("base64url") !== raw) throw new Error();
+    const cursor = JSON.parse(bytes.toString("utf8"));
+    if (cursor.v !== 1 || cursor.r !== roomId || !Number.isSafeInteger(cursor.s) || cursor.s < 0 || cursor.s > highWater) throw new Error();
+    return cursor.s;
+  } catch { throw badRequest("Invalid room events cursor"); }
+}
+
+friendFocusRouter.get("/rooms/:id/events", requireAuth, asyncHandler(async (req, res) => {
+  if (!/^[0-9a-f]{24}$/i.test(req.params.id)) throw notFound("Room not found");
+  const input = friendFocusEventsQuerySchema.parse(req.query);
+  const room = await prisma.friendFocusRoom.findUnique({ where: { id: req.params.id }, include: { members: true } });
+  const member = room?.members.find((entry) => entry.userId === req.user!.id);
+  if (!room || !member) throw notFound("Room not found");
+  const highWater = room.eventSequence ?? 0;
+  // Bootstrap consumes the current history without creating old notifications.
+  if (!input.after) {
+    res.json({ events: [], nextCursor: eventCursor(room.id, highWater), hasMore: false });
+    return;
+  }
+  const after = readEventCursor(input.after, room.id, highWater);
+  const rows = await prisma.friendFocusEvent.findMany({
+    where: { roomId: room.id, actorUserId: { not: req.user!.id },
+      sequence: { gt: after, lte: highWater }, createdAt: { gte: member.joinedAt }, expiresAt: { gt: new Date() } },
+    orderBy: { sequence: "asc" }, take: EVENT_PAGE_SIZE + 1,
+  });
+  const hasMore = rows.length > EVENT_PAGE_SIZE;
+  const page = rows.slice(0, EVENT_PAGE_SIZE);
+  res.json({
+    events: page.map((event) => ({ id: event.id, kind: event.kind, actorDisplayName: alertDisplayName(event.actorDisplayName), createdAt: event.createdAt })),
+    nextCursor: eventCursor(room.id, hasMore ? page[page.length - 1].sequence! : highWater), hasMore,
+  });
+}));
+
+friendFocusRouter.post("/rooms/:id/attempts", requireAuth, asyncHandler(async (req, res) => {
+  const input = friendFocusAttemptSchema.parse(req.body);
+  const event = await recordAttempt(req.params.id, (room) => room.members.find((member) => member.userId === req.user!.id), {
+    kind: input.kind, requestId: `client:${input.eventId}`,
+  });
+  res.status(202).json({ accepted: event?.sequence != null, notified: event ? await pushAttempt(event) : 0 });
+}));
+
 // Public by design: Apple's Screen Time extension cannot read the app's JWT.
 // The high-entropy per-member token is a narrowly scoped capability: it can
 // only report an attempt while this exact room is active.
 friendFocusReportRouter.post(
   "/rooms/:id/blocked-attempt",
   asyncHandler(async (req, res) => {
-    if (!/^[0-9a-f]{24}$/i.test(req.params.id)) throw notFound("Room not found");
     const input = friendFocusBlockedAttemptSchema.parse(req.body);
-    const room = await prisma.friendFocusRoom.findUnique({
-      where: { id: req.params.id },
-      include: { members: true },
+    const event = await recordAttempt(req.params.id, (room) => room.members.find((member) => member.attemptToken === input.attemptToken), {
+      kind: "app", requestId: `legacy:${Math.floor(Date.now() / ATTEMPT_COOLDOWN_MS)}`,
     });
-    const actor = room?.members.find((member) => member.attemptToken === input.attemptToken);
-    if (!room || !actor) throw notFound("Room not found");
-
-    const isActive =
-      room.status === "active" && room.endsAt != null && room.endsAt.getTime() > Date.now();
-    if (!isActive) {
-      res.status(202).json({ accepted: false, notified: 0 });
-      return;
-    }
-
-    const recipientIds = room.members
-      .filter((member) => member.userId !== actor.userId)
-      .map((member) => member.userId);
-    const targets = recipientIds.length
-      ? await prisma.pushToken.findMany({
-          where: { valid: true, userId: { in: recipientIds } },
-          select: { token: true, userId: true },
-        })
-      : [];
-    const minuteBucket = Math.floor(Date.now() / 60_000);
-    const summary = await deliver(
-      targets,
-      {
-        title: "Focus with Friends",
-        body: input.appName
-          ? `${actor.displayName} tried to open ${input.appName}, but it is blocked.`
-          : `${actor.displayName} tried to open a blocked app.`,
-        data: {
-          route: "/focus-with-friends/room/[id]",
-          params: { id: room.id },
-        },
-      },
-      {
-        source: "friend-focus:blocked-attempt",
-        dedupeKey: `friend-focus:blocked-attempt:${room.id}:${actor.userId}:${minuteBucket}`,
-      },
-    );
-
-    res.status(202).json({ accepted: true, notified: summary.sent });
+    res.status(202).json({ accepted: event?.sequence != null, notified: event ? await pushAttempt(event, input.appName) : 0 });
   }),
 );

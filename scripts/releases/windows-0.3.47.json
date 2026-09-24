@@ -1,0 +1,14 @@
+{
+  "version": "0.3.47",
+  "target": "windows",
+  "arch": "x86_64",
+  "channel": "stable",
+  "rolloutPercent": 100,
+  "url": "https://pub-9a9e884e54304893952b71510391fcd4.r2.dev/releases/0.3.47/welockin_0.3.47_x64-setup.exe",
+  "sha256": "85119b9453e77b90ccd9286062033cf8f794176453170a5a0a087a48c1c6f0b9",
+  "sizeBytes": 11631545,
+  "signatureSha256": "8aaff640e8dc487f06a8de71d045606f30af4479000513c5f1e64ba3bfdf1a38",
+  "signatureSizeBytes": 420,
+  "sourceSha": "afea3e800cfb1fcd09c63faae15dfa8bd3430bc9",
+  "notes": "Restore the signed-in account name on Home, including cached/offline names and onboarding fallback. Add detailed live sessions, breaks, progress, recorded blocking activity, weekly metrics and session history to Windows Insights. Windows source commit afea3e800cfb1fcd09c63faae15dfa8bd3430bc9."
+}

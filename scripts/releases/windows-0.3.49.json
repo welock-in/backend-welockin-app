@@ -1,0 +1,15 @@
+{
+  "version": "0.3.49",
+  "target": "windows",
+  "arch": "x86_64",
+  "channel": "stable",
+  "rolloutPercent": 100,
+  "url": "https://pub-9a9e884e54304893952b71510391fcd4.r2.dev/releases/0.3.49/welockin_0.3.49_x64-setup.exe",
+  "sourceSha": "8656b34e30e0ab5057e60e5c0504b603d89f8fed",
+  "sha256": "229e8552c2ba73b503ca748c6a6f3c0aa282262d82378ee759eec8b5be6194b7",
+  "sizeBytes": 11815556,
+  "signatureSha256": "bcf87414ee896f11432a772177b3934f4325453bc633e4b4c93c93dfb7ad5617",
+  "signatureSizeBytes": 420,
+  "notes": "Refine Focus with friends with the mobile-inspired launcher, aligned to Start Focus. Add a wider study room card with the shared spiral background, cleaner controls and responsive layout. Preserve the existing shared-session behavior and cross-platform compatibility. Windows source commit 8656b34e30e0ab5057e60e5c0504b603d89f8fed.",
+  "backendSourceSha": "dcb2c4658c71eb24b31c62c784b1a41707773fb4"
+}

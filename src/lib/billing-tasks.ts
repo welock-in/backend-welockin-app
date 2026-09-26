@@ -326,17 +326,10 @@ export function isRetryableRaceError(e: unknown): boolean {
   return /TransientTransactionError|WriteConflict|UnknownTransactionCommitResult/.test(msg);
 }
 
-/**
- * How many times a collision may be replayed before we stop believing it is one.
- *
- * Bounded, and small. Two operators colliding resolves on the first replay,
- * because the replay reads the winner's row and takes the no-insert path. A
- * third identical failure is evidence of something that is not a race, and
- * looping on it would turn a broken deploy into a busy loop against the
- * database — the failure mode that takes the whole service down instead of one
- * request.
- */
-const MAX_RACE_REPLAYS = 2;
+/** A competing transaction may still be committing when a conflict is raised.
+ * Leave bounded time for it to finish; immediate retries can exhaust every
+ * attempt before the winner commits. Only recognised races are replayed. */
+const MAX_RACE_REPLAYS = 4;
 
 /**
  * How far each of these subscriptions' cancellations has got.
@@ -393,6 +386,7 @@ export async function queueCancelAndRevokeTrial(input: {
       // a transaction on a failed write, so anything after an internal catch
       // would run in a dead session and silently commit nothing.
       if (attempt >= MAX_RACE_REPLAYS || !isRetryableRaceError(e)) throw e;
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(200, 25 * 2 ** attempt)));
     }
   }
 }

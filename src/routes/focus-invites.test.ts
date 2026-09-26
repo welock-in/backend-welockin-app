@@ -5,7 +5,7 @@ import { createApp } from "../app";
 import { stubAccountGuard } from "./test-helpers";
 import { signToken } from "../lib/jwt";
 import { prisma } from "../lib/prisma";
-import { resolveAudience } from "../services/notifications/audience";
+import { resolveAudience, resolveDeviceAudiences } from "../services/notifications/audience";
 import { deterministicObjectId } from "../lib/deterministic-id";
 import { Prisma } from "@prisma/client";
 
@@ -73,7 +73,7 @@ test("a device id that is not on the account is never invited", async (t) => {
   // onto a stranger's machine.
   stubMethod(t, prisma.device as any, "findMany", async () => []);
   const creates = stubMethod(t, prisma.focusInvite as any, "create", async () => inviteRow());
-  stubMethod(t, prisma.focusInvite as any, "findFirst", async () => null);
+  stubMethod(t, prisma.focusInvite as any, "findMany", async () => []);
 
   const res = await request(app)
     .post("/api/focus-invites")
@@ -88,7 +88,7 @@ test("a device id that is not on the account is never invited", async (t) => {
 test("the origin device never invites itself", async (t) => {
   stubMethod(t, prisma.device as any, "findMany", async () => [{ deviceId: MAC }]);
   const creates = stubMethod(t, prisma.focusInvite as any, "create", async () => inviteRow());
-  stubMethod(t, prisma.focusInvite as any, "findFirst", async () => null);
+  stubMethod(t, prisma.focusInvite as any, "findMany", async () => []);
 
   const res = await request(app)
     .post("/api/focus-invites")
@@ -102,7 +102,7 @@ test("the origin device never invites itself", async (t) => {
 test("re-posting the same session keeps its deadline instead of stacking or extending it", async (t) => {
   stubMethod(t, prisma.device as any, "findMany", async () => [{ deviceId: PHONE }]);
   stubMethod(t, prisma.device as any, "findFirst", async () => ({ name: "MacBook Pro de Hedi" }));
-  stubMethod(t, prisma.focusInvite as any, "findFirst", async () => inviteRow());
+  stubMethod(t, prisma.focusInvite as any, "findMany", async () => [inviteRow()]);
   stubMethod(t, prisma.pushToken as any, "findMany", async () => []);
   const updates = stubMethod(t, prisma.focusInvite as any, "update", async () => inviteRow());
   const creates = stubMethod(t, prisma.focusInvite as any, "create", async () => inviteRow());
@@ -125,10 +125,10 @@ test("inviting a phone pushes it the pre-filled join screen — no seeded data n
   // COMPLETE data surface of a send — note there is no rule or template read.
   stubMethod(t, prisma.device as any, "findMany", async () => [{ deviceId: PHONE }]);
   stubMethod(t, prisma.device as any, "findFirst", async () => ({ name: "MacBook Pro de Hedi" }));
-  stubMethod(t, prisma.focusInvite as any, "findFirst", async () => null);
+  stubMethod(t, prisma.focusInvite as any, "findMany", async () => []);
   stubMethod(t, prisma.focusInvite as any, "create", async () => inviteRow());
   const audienceReads = stubMethod(t, prisma.pushToken as any, "findMany", async () => [
-    { token: "ExponentPushToken[iphone]", userId },
+    { token: "ExponentPushToken[iphone]", userId, deviceId: PHONE },
   ]);
   stubMethod(t, prisma.notificationDelivery as any, "findMany", async () => []);
   const written = stubMethod(t, prisma.notificationDelivery as any, "createMany", async () => ({ count: 1 }));
@@ -178,7 +178,7 @@ test("a target with no push token gets its invite row and nothing else", async (
   // A desktop, or a phone whose token was silenced: polling is its transport.
   stubMethod(t, prisma.device as any, "findMany", async () => [{ deviceId: PHONE }]);
   stubMethod(t, prisma.device as any, "findFirst", async () => ({ name: "MacBook Pro de Hedi" }));
-  stubMethod(t, prisma.focusInvite as any, "findFirst", async () => null);
+  stubMethod(t, prisma.focusInvite as any, "findMany", async () => []);
   const creates = stubMethod(t, prisma.focusInvite as any, "create", async () => inviteRow());
   stubMethod(t, prisma.pushToken as any, "findMany", async () => []);
   const pushes = stubMethod(t, globalThis as any, "fetch", async () => {
@@ -199,7 +199,7 @@ test("a target with no push token gets its invite row and nothing else", async (
 test("a push failure never fails the invite — polling still finds the row", async (t) => {
   stubMethod(t, prisma.device as any, "findMany", async () => [{ deviceId: PHONE }]);
   stubMethod(t, prisma.device as any, "findFirst", async () => ({ name: "MacBook Pro de Hedi" }));
-  stubMethod(t, prisma.focusInvite as any, "findFirst", async () => null);
+  stubMethod(t, prisma.focusInvite as any, "findMany", async () => []);
   stubMethod(t, prisma.focusInvite as any, "create", async () => inviteRow());
   stubMethod(t, prisma.pushToken as any, "findMany", async () => {
     throw new Error("push infrastructure down");
@@ -310,7 +310,7 @@ test("all 13 selected devices are invited and unavailable ids are explicit", asy
   const ids = Array.from({ length: 13 }, (_, n) => `windows-device-${n}`);
   stubMethod(t, prisma.device as any, "findMany", async () => ids.map(deviceId => ({ deviceId, platform: "windows" })));
   stubMethod(t, prisma.device as any, "findFirst", async () => ({ name: "Origin" }));
-  stubMethod(t, prisma.focusInvite as any, "findFirst", async () => null);
+  stubMethod(t, prisma.focusInvite as any, "findMany", async () => []);
   const writes = stubMethod(t, prisma.focusInvite as any, "create", async ({ data }) => inviteRow(data));
   stubMethod(t, prisma.pushToken as any, "findMany", async () => []);
   const res = await request(app).post("/api/focus-invites")
@@ -326,7 +326,7 @@ test("all 13 selected devices are invited and unavailable ids are explicit", asy
 test("iPad without token reports push unavailable while keeping its invitation", async (t) => {
   stubMethod(t, prisma.device as any, "findMany", async () => [{ deviceId: PHONE, platform: "ipados" }]);
   stubMethod(t, prisma.device as any, "findFirst", async () => ({ name: "Origin" }));
-  stubMethod(t, prisma.focusInvite as any, "findFirst", async () => null);
+  stubMethod(t, prisma.focusInvite as any, "findMany", async () => []);
   stubMethod(t, prisma.focusInvite as any, "create", async ({ data }) => inviteRow(data));
   stubMethod(t, prisma.pushToken as any, "findMany", async () => []);
   const endsAt = new Date(Date.now() + 90_000).toISOString();
@@ -356,7 +356,7 @@ test("concurrent creation collision returns the winner without extending its dea
   const deadline = new Date(Date.now() + 120_000);
   stubMethod(t, prisma.device as any, "findMany", async () => [{ deviceId: PHONE, platform: "ios" }]);
   stubMethod(t, prisma.device as any, "findFirst", async () => ({ name: "Origin" }));
-  stubMethod(t, prisma.focusInvite as any, "findFirst", async () => null);
+  stubMethod(t, prisma.focusInvite as any, "findMany", async () => []);
   stubMethod(t, prisma.focusInvite as any, "create", async () => { throw new Prisma.PrismaClientKnownRequestError("duplicate", { code: "P2002", clientVersion: "5.22" }); });
   const read = stubMethod(t, prisma.focusInvite as any, "findUnique", async () => inviteRow({ endsAt: deadline }));
   stubMethod(t, prisma.pushToken as any, "findMany", async () => []);
@@ -381,4 +381,154 @@ test("a cancelled invite cannot be accepted even before its original deadline", 
   const res = await request(app).post("/api/focus-invites/65f000000000000000000011/accept")
     .set({ ...auth, "x-welockin-device-id": PHONE });
   assert.equal(res.status, 400);
+});
+
+test("creation and push concurrency stay bounded, with every row persisted before any push", { timeout: 5000 }, async (t) => {
+  const ids = Array.from({ length: 14 }, (_, index) => `ios-selected-${index}`);
+  stubMethod(t, prisma.device as any, "findMany", async () => ids.map(deviceId => ({ deviceId, platform: "ios" })));
+  stubMethod(t, prisma.device as any, "findFirst", async () => ({ name: "Source" }));
+  const existingReads = stubMethod(t, prisma.focusInvite as any, "findMany", async () => []);
+  let writesActive = 0, peakWrites = 0, written = 0;
+  let releaseWrites!: () => void;
+  const writeBarrier = new Promise<void>(resolve => { releaseWrites = resolve; });
+  t.after(() => releaseWrites());
+  stubMethod(t, prisma.focusInvite as any, "create", async ({ data }) => {
+    peakWrites = Math.max(peakWrites, ++writesActive);
+    if (writesActive === 6) releaseWrites();
+    await writeBarrier;
+    writesActive--;
+    written++;
+    return inviteRow(data);
+  });
+  const audienceReads = stubMethod(t, prisma.pushToken as any, "findMany", async () => {
+    assert.equal(written, ids.length, "all rows exist before resolving the push audience");
+    return ids.map((deviceId, index) => ({ deviceId, userId, token: `ExponentPushToken[target${index}]` }));
+  });
+  stubMethod(t, prisma.notificationDelivery as any, "findMany", async () => []);
+  stubMethod(t, prisma.notificationDelivery as any, "createMany", async () => ({ count: 1 }));
+  let pushesActive = 0, peakPushes = 0;
+  let releasePushes!: () => void;
+  const pushBarrier = new Promise<void>(resolve => { releasePushes = resolve; });
+  t.after(() => releasePushes());
+  const pushes = stubMethod(t, globalThis as any, "fetch", async (_url, options) => {
+    assert.equal(written, ids.length, "Expo must never precede persistence");
+    peakPushes = Math.max(peakPushes, ++pushesActive);
+    if (pushesActive === 6) releasePushes();
+    await pushBarrier;
+    pushesActive--;
+    const [{ to }] = JSON.parse(options.body);
+    return { ok: true, status: 200, json: async () => ({ data: [{ status: "ok", id: `ticket-${to}` }] }) };
+  });
+  const res = await request(app).post("/api/focus-invites")
+    .set({ ...auth, "x-welockin-device-id": MAC }).send({ ...body, targetDeviceIds: ids });
+  assert.equal(res.status, 201);
+  assert.equal(res.body.invited, 14);
+  assert.equal(existingReads.length, 1, "one existing-invitation lookup, not one per device");
+  assert.deepEqual(existingReads[0][0].where, { userId, fromDeviceId: MAC, sessionId: body.sessionId, toDeviceId: { in: ids } });
+  assert.equal(audienceReads.length, 1, "one selected-token lookup, not one per device");
+  assert.equal(peakWrites, 6);
+  assert.equal(peakPushes, 6);
+  assert.equal(pushes.length, 14);
+  assert.ok(res.body.delivery.every((row: any) => row.status === "push_accepted"));
+});
+
+test("a failed creation drains started writes, allocates no more devices, and never reaches push", { timeout: 5000 }, async (t) => {
+  const ids = Array.from({ length: 14 }, (_, index) => `ios-selected-${index}`);
+  stubMethod(t, prisma.device as any, "findMany", async () => ids.map(deviceId => ({ deviceId, platform: "ios" })));
+  stubMethod(t, prisma.device as any, "findFirst", async () => ({ name: "Source" }));
+  stubMethod(t, prisma.focusInvite as any, "findMany", async () => []);
+  let releaseWrites!: () => void;
+  const pendingWrites = new Promise<void>(resolve => { releaseWrites = resolve; });
+  let firstWaveStarted!: () => void;
+  const started = new Promise<void>(resolve => { firstWaveStarted = resolve; });
+  t.after(() => releaseWrites());
+  let calls = 0, completed = 0;
+  stubMethod(t, prisma.focusInvite as any, "create", async ({ data }) => {
+    const position = calls++;
+    if (calls === 6) firstWaveStarted();
+    if (position === 0) throw new Error("database write failed");
+    await pendingWrites;
+    completed++;
+    return inviteRow(data);
+  });
+  const audiences = stubMethod(t, prisma.pushToken as any, "findMany", async () => []);
+  const pushes = stubMethod(t, globalThis as any, "fetch", async () => { throw new Error("unexpected push"); });
+  let responseArrived = false;
+  const response = request(app).post("/api/focus-invites")
+    .set({ ...auth, "x-welockin-device-id": MAC }).send({ ...body, targetDeviceIds: ids })
+    .then(result => { responseArrived = true; return result; });
+  await started;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(responseArrived, false, "the response waits for already-started writes");
+  assert.equal(calls, 6);
+  releaseWrites();
+  const res = await response;
+  assert.equal(res.status, 500);
+  assert.equal(calls, 6, "no devices beyond the first wave are allocated after failure");
+  assert.equal(completed, 5, "all writes already in flight settle before the response");
+  assert.equal(audiences.length, 0);
+  assert.equal(pushes.length, 0);
+});
+
+test("an audience lookup failure does not falsely report native desktop delivery as failed", async (t) => {
+  stubMethod(t, prisma.device as any, "findMany", async () => [
+    { deviceId: PHONE, platform: "ios" }, { deviceId: "windows-selected", platform: "windows" },
+  ]);
+  stubMethod(t, prisma.device as any, "findFirst", async () => ({ name: "Source" }));
+  stubMethod(t, prisma.focusInvite as any, "findMany", async () => []);
+  stubMethod(t, prisma.focusInvite as any, "create", async ({ data }) => inviteRow(data));
+  stubMethod(t, prisma.pushToken as any, "findMany", async () => { throw new Error("audience database unavailable"); });
+  const res = await request(app).post("/api/focus-invites")
+    .set({ ...auth, "x-welockin-device-id": MAC }).send({ ...body, targetDeviceIds: [PHONE, "windows-selected"] });
+  assert.equal(res.status, 201);
+  assert.deepEqual(res.body.delivery, [
+    { deviceId: PHONE, status: "push_failed" }, { deviceId: "windows-selected", status: "polling" },
+  ]);
+});
+
+test("bulk audience never mixes devices or accounts, and an empty selection queries nobody", async (t) => {
+  const reads = stubMethod(t, prisma.pushToken as any, "findMany", async () => [
+    { deviceId: PHONE, userId, token: "ExponentPushToken[selected]" },
+    { deviceId: PHONE, userId: "other-user", token: "ExponentPushToken[other-account]" },
+    { deviceId: "not-selected", userId, token: "ExponentPushToken[not-selected]" },
+    { deviceId: null, userId, token: "ExponentPushToken[unattributed]" },
+  ]);
+  assert.equal((await resolveDeviceAudiences(userId, [])).size, 0);
+  assert.equal(reads.length, 0);
+  const audiences = await resolveDeviceAudiences(userId, [PHONE, PHONE]);
+  assert.deepEqual(reads[0][0].where, { valid: true, userId, deviceId: { in: [PHONE] } });
+  assert.deepEqual([...audiences], [[PHONE, [{ token: "ExponentPushToken[selected]", userId }]]]);
+});
+
+test("fourteen persisted invitations retain nine missing-push warnings without failing healthy targets", async (t) => {
+  const phones = Array.from({ length: 12 }, (_, index) => `ios-selected-${index}`);
+  const macs = ["mac-selected-1", "mac-selected-2"];
+  const ids = [...phones, ...macs];
+  stubMethod(t, prisma.device as any, "findMany", async () => [
+    ...phones.map(deviceId => ({ deviceId, platform: "ios" })),
+    ...macs.map(deviceId => ({ deviceId, platform: "macos" })),
+  ]);
+  stubMethod(t, prisma.device as any, "findFirst", async () => ({ name: "Source" }));
+  stubMethod(t, prisma.focusInvite as any, "findMany", async () => []);
+  const writes = stubMethod(t, prisma.focusInvite as any, "create", async ({ data }) => inviteRow(data));
+  const audienceReads = stubMethod(t, prisma.pushToken as any, "findMany", async () => phones.slice(0, 3)
+    .map((deviceId, index) => ({ deviceId, userId, token: `ExponentPushToken[active${index}]` })));
+  stubMethod(t, prisma.notificationDelivery as any, "findMany", async () => []);
+  stubMethod(t, prisma.notificationDelivery as any, "createMany", async () => ({ count: 1 }));
+  const pushes = stubMethod(t, globalThis as any, "fetch", async () => ({
+    ok: true, status: 200, json: async () => ({ data: [{ status: "ok", id: "accepted-ticket" }] }),
+  }));
+  const res = await request(app).post("/api/focus-invites")
+    .set({ ...auth, "x-welockin-device-id": MAC }).send({ ...body, targetDeviceIds: ids });
+  assert.equal(res.status, 201);
+  assert.equal(res.body.invited, 14);
+  assert.equal(writes.length, 14);
+  assert.equal(audienceReads.length, 1);
+  assert.equal(pushes.length, 3);
+  const count = (status: string) => res.body.delivery.filter((row: any) => row.status === status).length;
+  assert.equal(count("push_accepted"), 3);
+  assert.equal(count("push_unavailable"), 9);
+  assert.equal(count("polling"), 2);
+  assert.equal(count("push_failed"), 0);
+  assert.equal(count("unavailable"), 0);
 });

@@ -6,7 +6,7 @@ import { asyncHandler } from "../middleware/async-handler";
 import { focusInviteCreateSchema } from "../validation/schemas";
 import { readDeviceId } from "../lib/device";
 import { badRequest, notFound } from "../lib/http-error";
-import { resolveAudience } from "../services/notifications/audience";
+import { resolveDeviceAudiences, type TokenTarget } from "../services/notifications/audience";
 import { deliver } from "../services/notifications/deliver";
 import { deterministicObjectId } from "../lib/deterministic-id";
 
@@ -30,6 +30,32 @@ export const focusInvitesRouter = Router();
 
 /** An invite is worthless once the origin session has ended. */
 const isLive = (endsAt: Date) => endsAt.getTime() > Date.now();
+
+const INVITE_CONCURRENCY = 6;
+
+/** Fill available slots immediately; one slow operation does not hold the next
+ * whole wave. Results preserve selected-device order. */
+async function mapConcurrent<T, R>(items: T[], work: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  let failed = false;
+  let failure: unknown;
+  await Promise.all(Array.from({ length: Math.min(INVITE_CONCURRENCY, items.length) }, async () => {
+    while (!failed && next < items.length) {
+      const index = next++;
+      try {
+        results[index] = await work(items[index]);
+      } catch (error) {
+        if (!failed) failure = error;
+        failed = true;
+      }
+    }
+  }));
+  // Drain already-started writes before responding. Never leave workers
+  // creating additional invitations after a failed request has returned.
+  if (failed) throw failure;
+  return results;
+}
 
 function toPublicInvite(i: {
   id: string;
@@ -101,6 +127,7 @@ focusInvitesRouter.post(
       where: { userId, deviceId: fromDeviceId },
       select: { name: true },
     });
+    const selectedAt = Date.now();
 
     // Minutes rounded UP, never zero: rounding down would unlock the phone
     // before the device that started the session, and the join screen treats
@@ -131,11 +158,17 @@ focusInvitesRouter.post(
       },
     });
 
-    const invites = [];
-    for (const toDeviceId of targetIds) {
-      const existing = await prisma.focusInvite.findFirst({
-        where: { userId, fromDeviceId, sessionId: input.sessionId, toDeviceId },
-      });
+    // One lookup for all selected destinations, rather than a round trip per
+    // device. Keep legacy rows and their immutable deadlines/statuses.
+    const existingRows = await prisma.focusInvite.findMany({
+      where: { userId, fromDeviceId, sessionId: input.sessionId, toDeviceId: { in: targetIds } },
+    });
+    const existingByDevice = new Map<string, (typeof existingRows)[number]>();
+    for (const existing of existingRows) {
+      if (!existingByDevice.has(existing.toDeviceId)) existingByDevice.set(existing.toDeviceId, existing);
+    }
+    const lookedUpAt = Date.now();
+    const invites = await mapConcurrent(targetIds, async (toDeviceId) => {
       const data = {
         fromDeviceId,
         fromDeviceName: origin?.name ?? null,
@@ -146,7 +179,7 @@ focusInvitesRouter.post(
       // Keep legacy rows, and use the primary key to serialize concurrent new
       // creates without requiring an index migration. A retry is immutable.
       const id = deterministicObjectId("focus-invite", userId, fromDeviceId, input.sessionId, toDeviceId);
-      let invite = existing;
+      let invite = existingByDevice.get(toDeviceId);
       if (!invite) {
         try {
           invite = await prisma.focusInvite.create({
@@ -154,19 +187,21 @@ focusInvitesRouter.post(
           });
         } catch (err) {
           if (!(err instanceof Prisma.PrismaClientKnownRequestError) || err.code !== "P2002") throw err;
-          invite = await prisma.focusInvite.findUnique({ where: { id } });
+          invite = await prisma.focusInvite.findUnique({ where: { id } }) ?? undefined;
           if (!invite) throw err;
         }
       }
-      invites.push(invite);
-    }
+      return invite;
+    });
+    const persistedAt = Date.now();
+    console.info(`[focus-invites] session=${input.sessionId} phase=persisted invited=${invites.length} elapsedMs=${persistedAt - now}`);
 
     // The push accelerator, strictly AFTER every row exists: the rows are the
     // source of truth each device polls, so they must never be hostage to
     // Expo's latency — several targets × a slow Expo could hit the serverless
     // timeout, and a row that was never written can't be found by polling.
     //
-    // Sent the way the admin console's test send works (resolveAudience +
+    // Sent the way the admin console's test send works (selected audience +
     // deliver, content in code), NOT through the data-driven rule engine: the
     // engine only fires if a NotificationRule and NotificationTemplate were
     // seeded into this database, and one where the seed never ran drops the
@@ -175,19 +210,33 @@ focusInvitesRouter.post(
     //
     // Best-effort: a push failure never fails the invite (the target finds
     // the row by polling anyway), and never blocks the other targets' pushes.
-    // Bounded parallelism: a slow phone must not hold up every following target.
-    for (let offset = 0; offset < invites.length; offset += 6) {
-      await Promise.all(invites.slice(offset, offset + 6).map(async (invite) => {
+    // Resolve all live destinations in one database read, after every invitation
+    // exists. A lookup failure remains an explicit delivery failure, not no-token.
+    let audiences = new Map<string, TokenTarget[]>();
+    let audienceFailed = false;
+    try {
+      audiences = await resolveDeviceAudiences(userId, invites
+        .filter((invite) => invite.status === "pending" && isLive(invite.endsAt))
+        .map((invite) => invite.toDeviceId));
+    } catch (err) {
+      audienceFailed = true;
+      console.error(`[focus-invites] session=${input.sessionId} audience lookup failed:`, err);
+    }
+    const audienceAt = Date.now();
+    await mapConcurrent(invites, async (invite) => {
         const toDeviceId = invite.toDeviceId;
         if (invite.status !== "pending" || !isLive(invite.endsAt)) {
           delivery.push({ deviceId: toDeviceId, status: "already_handled" });
           return;
         }
         try {
-          const tokens = await resolveAudience(
-            { mode: "specificDevices" },
-            { userId, targetDeviceIds: [toDeviceId] },
-          );
+          if (audienceFailed) {
+            const platform = platformByDevice.get(toDeviceId);
+            delivery.push({ deviceId: toDeviceId,
+              status: platform === "windows" || platform === "macos" ? "polling" : "push_failed" });
+            return;
+          }
+          const tokens = audiences.get(toDeviceId) ?? [];
           if (tokens.length === 0) {
             // Desktops land here by design — they have no push transport. A
             // PHONE here is the "invitable but mute" trap (registered on this
@@ -217,10 +266,17 @@ focusInvitesRouter.post(
           console.error(`[focus-invites] push to device ${toDeviceId} failed:`, err);
           delivery.push({ deviceId: toDeviceId, status: "push_failed" });
         }
-      }));
-    }
+    });
 
-    console.info(`[focus-invites] session=${input.sessionId} result=${JSON.stringify(delivery)}`);
+    const finishedAt = Date.now();
+    console.info(`[focus-invites] session=${input.sessionId} result=${JSON.stringify(delivery)} timingMs=${JSON.stringify({
+      selection: selectedAt - now,
+      existing: lookedUpAt - selectedAt,
+      persistence: persistedAt - lookedUpAt,
+      audience: audienceAt - persistedAt,
+      push: finishedAt - audienceAt,
+      total: finishedAt - now,
+    })}`);
     res.status(201).json({ invites: invites.map(toPublicInvite), invited: invites.length, delivery });
   }),
 );

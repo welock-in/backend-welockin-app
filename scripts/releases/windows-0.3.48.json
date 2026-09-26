@@ -1,0 +1,15 @@
+{
+  "version": "0.3.48",
+  "target": "windows",
+  "arch": "x86_64",
+  "channel": "stable",
+  "rolloutPercent": 100,
+  "url": "https://pub-9a9e884e54304893952b71510391fcd4.r2.dev/releases/0.3.48/welockin_0.3.48_x64-setup.exe",
+  "sourceSha": "aacef762fe9ba680c89bb3b4aa57137208f5b300",
+  "sha256": "0da6bc829df0fd2788c795360cec074d420b3610ee0c3a29998882eff243c951",
+  "sizeBytes": 11811409,
+  "signatureSha256": "223552f1356880711dd156ba5ca3260820b6fed5a9bf7de889f80c8aa7905b70",
+  "signatureSizeBytes": 420,
+  "notes": "Add iOS-compatible study rooms with server deadlines and native Windows session enforcement. Improve cross-device focus invitations with a five-second native receiver, 50 selected destinations, preset-specific device choices, explicit delivery failures and cancellation when the source session ends. Preserve the released account greeting, Insights and lifetime support. Windows source commit aacef762fe9ba680c89bb3b4aa57137208f5b300.",
+  "backendSourceSha": "dcb2c4658c71eb24b31c62c784b1a41707773fb4"
+}

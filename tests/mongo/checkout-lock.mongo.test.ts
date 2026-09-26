@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { test, before, after } from "node:test";
+import { test, before, beforeEach, after } from "node:test";
 import request from "supertest";
 import { startMongo, stopMongo, runId } from "./harness";
 
@@ -25,7 +25,8 @@ let app: any;
 let signToken: (p: { sub: string; email: string }) => string;
 
 const DAY = 24 * 60 * 60 * 1000;
-const NOW = new Date("2026-08-11T12:00:00.000Z");
+let NOW = new Date();
+beforeEach(() => { NOW = new Date(); });
 const at = (days: number) => new Date(NOW.getTime() + days * DAY);
 
 const STORE = "364783";

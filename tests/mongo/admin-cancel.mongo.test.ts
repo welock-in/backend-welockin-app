@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { test, before, after } from "node:test";
+import { test, before, beforeEach, after } from "node:test";
 import request from "supertest";
 import { startMongo, stopMongo, runId } from "./harness";
 
@@ -21,11 +21,11 @@ import { startMongo, stopMongo, runId } from "./harness";
  * hands the app a client pointed at the disposable replica set. A static import
  * at the top of the file would construct it first, against nothing.
  *
- * DETERMINISM. `FROZEN_NOW` is not installed as a fake global `Date` here: the
+ * DETERMINISM. A fake global `Date` is not installed here: the
  * MongoDB driver times its own heartbeats and server selection off `Date.now()`,
  * and freezing it underneath the driver stalls the connection pool. Instead
- * every fixture date is derived from that constant, which removes the wall-clock
- * flakiness without lying to the driver about what time it is.
+ * each scenario captures the current time once. Fixture windows use margins
+ * around that reference because the HTTP handlers and driver read real time.
  */
 
 let prisma: any;
@@ -38,8 +38,8 @@ let drainCancels: any;
 let MAX_ATTEMPTS: number;
 
 const DAY = 24 * 60 * 60 * 1000;
-/** See `src/lib/test-clock.ts` — the same instant, derived not installed. */
-const NOW = new Date("2026-08-11T12:00:00.000Z");
+let NOW = new Date();
+beforeEach(() => { NOW = new Date(); });
 const at = (days: number) => new Date(NOW.getTime() + days * DAY);
 
 const WEBHOOK_SECRET = "whsec-mongo-test";

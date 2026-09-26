@@ -60,7 +60,7 @@ test('an ordinary build performs no credential reads or network requests', async
 
 for (const overrides of [
   { WINDOWS_RELEASE_VERSION: '0.3.48' },
-  { WINDOWS_RELEASE_VERSION: '0.3.51' },
+  { WINDOWS_RELEASE_VERSION: '0.3.52' },
   { WINDOWS_RELEASE_VERSION: ` ${RELEASE_VERSION} ` },
   { VERCEL_ENV: 'preview' },
   { VERCEL_ENV: undefined },
@@ -94,7 +94,7 @@ test('verifies production health and commit without reading signup or entitlemen
   assert.equal(mock.logs.join('\n').includes('entitlement'), false);
 });
 
-test('the actual pinned 0.3.50 manifest selects the expected production backend', async () => {
+test('the actual pinned 0.3.51 manifest selects the expected production backend', async () => {
   const mock = scenario();
   assert.deepEqual(await mock.run({ manifest: undefined }), { status: 'verified', commit: EXPECTED_BACKEND_SOURCE_SHA.slice(0, 7) });
   assert.equal(mock.calls.length, 4);

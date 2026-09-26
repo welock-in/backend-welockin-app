@@ -29,3 +29,7 @@ Archived branch tips before consolidation:
 The older branches' lifetime documentation is superseded by the current backend
 documentation and payment safeguards. Consolidation does not restore old routes
 or change purchase ownership, subscriptions, or entitlement behavior.
+
+## Windows 0.3.51
+
+The reviewed installer source is `dc64a1906b8ba3ad2dc014d875ab2a87e1d4a6c6`, with backend preflight pinned to `2c35cbc31132a5f19b83e67bd9d798a9d4885339`. The immutable manifest `windows-0.3.51.json` keeps rollout at zero: direct manual installation only, after all focus sessions end. It includes the session picker and quiet notification changes. Historical manifests and their source pins remain unchanged.

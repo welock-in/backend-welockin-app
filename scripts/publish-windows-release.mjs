@@ -6,8 +6,8 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const API = "https://app.connect.welock.in";
-export const RELEASE_VERSION = "0.3.50";
-export const EXPECTED_BACKEND_SOURCE_SHA = "64b8470f02b971b8cdf8ce56781d3b1702e465af";
+export const RELEASE_VERSION = "0.3.51";
+export const EXPECTED_BACKEND_SOURCE_SHA = "2c35cbc31132a5f19b83e67bd9d798a9d4885339";
 // SHA-256 of the manifest's JSON with top-level keys sorted. Whitespace/CRLF
 // changes do not matter; changing any manifest value requires explicit review.
 const RELEASE_PINS = Object.freeze({
@@ -31,9 +31,15 @@ const RELEASE_PINS = Object.freeze({
   }),
   "0.3.50": Object.freeze({
     sourceSha: "cbb467117a651ac446c6cc350bb58db190080390",
-    backendSourceSha: EXPECTED_BACKEND_SOURCE_SHA,
+    backendSourceSha: "64b8470f02b971b8cdf8ce56781d3b1702e465af",
     rolloutPercent: 0,
     manifestSha256: "db7cae4e47db770fbb9df7deffa8baffc6cbc12c0fe3da6ccc64b9452deb9897",
+  }),
+  "0.3.51": Object.freeze({
+    sourceSha: "dc64a1906b8ba3ad2dc014d875ab2a87e1d4a6c6",
+    backendSourceSha: EXPECTED_BACKEND_SOURCE_SHA,
+    rolloutPercent: 0,
+    manifestSha256: "9e74c86c532cd5c712cfea90517cdd8f99c59514603be57ff880b120bf71df6f",
   }),
 });
 const artifactUrl = (version) => `https://pub-9a9e884e54304893952b71510391fcd4.r2.dev/releases/${version}/welockin_${version}_x64-setup.exe`;

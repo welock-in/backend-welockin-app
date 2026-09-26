@@ -11,6 +11,28 @@ export interface TokenTarget {
   userId: string | null;
 }
 
+/** Fetch a selected-device audience once, keeping each token tied to its exact
+ * destination. An empty selection never broadens to the whole account. */
+export async function resolveDeviceAudiences(
+  userId: string,
+  deviceIds: string[],
+): Promise<Map<string, TokenTarget[]>> {
+  const selected = new Set(deviceIds);
+  const byDevice = new Map<string, TokenTarget[]>();
+  if (selected.size === 0) return byDevice;
+  const rows = await prisma.pushToken.findMany({
+    where: { valid: true, userId, deviceId: { in: [...selected] } },
+    select: { token: true, userId: true, deviceId: true },
+  });
+  for (const row of rows) {
+    if (!row.deviceId || !selected.has(row.deviceId) || row.userId !== userId) continue;
+    const targets = byDevice.get(row.deviceId) ?? [];
+    targets.push({ token: row.token, userId: row.userId });
+    byDevice.set(row.deviceId, targets);
+  }
+  return byDevice;
+}
+
 /**
  * Resolve an audience to the valid push tokens to send to.
  *   self                  → the acting user's own devices

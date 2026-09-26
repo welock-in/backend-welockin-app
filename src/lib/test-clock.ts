@@ -50,9 +50,10 @@ type ClockCtx = {
  * DO NOT use this in `tests/mongo/`. Those talk to a real replica set, and the
  * MongoDB driver times its own heartbeats and server selection off `Date.now()`;
  * freezing it underneath the driver stalls the connection pool. Those tests get
- * determinism a different way — every fixture date is derived from `FROZEN_NOW`
- * rather than from the wall clock, which removes the flakiness without lying to
- * the driver about what time it is.
+ * stable windows a different way: capture real time once per scenario and
+ * derive fixture dates with explicit margins around it. A fixed past fixture
+ * does NOT freeze the HTTP handlers and will eventually expire. Exact boundary
+ * tests belong in unit tests with an injected/frozen business clock.
  */
 export function freezeClock(t: ClockCtx, at: Date = FROZEN_NOW): Date {
   t.mock.timers.enable({ apis: ["Date"], now: at.getTime() });

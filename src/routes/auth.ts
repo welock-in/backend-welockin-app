@@ -60,6 +60,9 @@ authRouter.post(
       const owner = await findBlockingClaimOwner(fingerprint.signals);
       if (owner) throw deviceAlreadyClaimed();
     }
+    const deviceId = readDeviceId(req);
+    const platform = readClientPlatform(req);
+    const signupLifetimeOffer = await reserveSignupLifetimeOffer(platform);
 
     // The paying-device gate (S1/N4) — defence in depth behind the client's
     // precheck interstitial: a patched client skips the interstitial, not this.
@@ -70,10 +73,11 @@ authRouter.post(
     // blocks, and neither does the SAME address: the paying owner
     // re-registering their own email is stopped by the duplicate-email 409
     // above, which says "sign in" — the right advice — rather than this
-    // refusal.
-    if (env.signupPayingDeviceBlock) {
+    // refusal. A reserved iOS gift needs no Apple purchase, so it waives only
+    // this paying-device refusal. The same snapshot is persisted below.
+    if (env.signupPayingDeviceBlock && signupLifetimeOffer !== "ios") {
       const precheck = await findPayingAccountForDevice({
-        deviceId: readDeviceId(req),
+        deviceId,
         signals: fingerprint.signals,
         blockingProviders: ["APPLE"],
         env,
@@ -85,9 +89,6 @@ authRouter.post(
     }
 
     const passwordHash = await hashPassword(password);
-    const deviceId = readDeviceId(req);
-    const platform = readClientPlatform(req);
-    const signupLifetimeOffer = await reserveSignupLifetimeOffer(platform);
 
     // NO trial is stamped on the ACCOUNT any more. Registration used to hand out
     // fourteen days, which made a trial exactly as cheap as an email address —
@@ -188,6 +189,8 @@ authRouter.post(
 
       const providerId = deterministicObjectId("auth-provider", "apple", identity.sub);
       const existing = await prisma.user.findUnique({ where: { email } });
+      const platform = readClientPlatform(req);
+      const signupLifetimeOffer = existing ? null : await reserveSignupLifetimeOffer(platform);
 
       // The paying-device gate (S1/N4), on the CREATED branch only. Linking
       // Apple to an existing account, or any later re-login, must never be
@@ -199,8 +202,9 @@ authRouter.post(
       // refusal means "an Apple-billed purchase is bound to this phone", which
       // a web-billed login here never establishes. The email comparison is
       // belt-and-braces: a paying account with this very address would have
-      // been found by the `existing` lookup above.
-      if (!existing && env.signupPayingDeviceBlock) {
+      // been found by the `existing` lookup above. As in /register, an iOS
+      // gift waives this refusal without borrowing the other account's purchase.
+      if (!existing && env.signupPayingDeviceBlock && signupLifetimeOffer !== "ios") {
         const precheck = await findPayingAccountForDevice({
           deviceId: readDeviceId(req),
           signals: parseFingerprint(req).signals,
@@ -215,8 +219,8 @@ authRouter.post(
 
       try {
         if (existing) {
-          // Password signup does not currently verify email ownership. Linking
-          // Apple to such an account would enable account pre-hijacking: an
+          // Password signup remains unverified until the email code succeeds.
+          // Linking Apple before that would enable account pre-hijacking: an
           // attacker could pre-register the victim's address and retain password
           // access after the victim signs in with Apple.
           if (!canAutoLinkAppleAccount(existing)) {
@@ -234,8 +238,6 @@ authRouter.post(
           });
           user = existing;
         } else {
-          const platform = readClientPlatform(req);
-          const signupLifetimeOffer = await reserveSignupLifetimeOffer(platform);
           const signup = { signupPlatform: platform === "unknown" ? null : platform, signupLifetimeOffer };
           const verifiedAt = new Date();
           // Same as /register: no trial is stamped on the account. See the note there.

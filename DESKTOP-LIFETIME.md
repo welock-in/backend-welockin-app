@@ -26,6 +26,20 @@ leur comportement. Aucun essai existant n’est effacé.
 
 ## Portée et paiements
 
+`POST /api/auth/precheck` expose au premier niveau `signupLifetimeOffer`
+(`ios`, `desktop` ou null). Cette lecture informe le parcours d'inscription ;
+elle ne réserve rien. Une offre iOS permet au nouvel inscrit de passer le
+blocage « cet Apple ID paie déjà », puisque son accès sera offert après
+vérification. Les faits `payingAccount.blocksSignup` et `appleTxOrphaned`
+restent inchangés pour les parcours d'achat et de restauration.
+
+Le backend relit le réglage une seule fois avant le contrôle Apple de création
+(`/register` ou nouveau compte `/apple`) et enregistre ce même résultat avec le
+compte. Seule une réservation `ios` contourne ce contrôle Apple ; les doublons
+d'email et les autres contrôles restent actifs. Une offre desktop ne le
+contourne pas, et aucun achat Apple n'est transféré. Une erreur de lecture du
+réglage reste une erreur réessayable, sans offrir ni autoriser implicitement.
+
 - L’origine d’inscription décide du cadeau réservé. La plateforme de la requête
   courante décide si ce cadeau s’applique. Les clients iOS transmettent
   `X-WeLockIn-Platform: ios` ou `ipados` ; les identifiants desktop `win-…`/`mac-…`

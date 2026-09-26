@@ -58,7 +58,7 @@ export async function readSignupLifetimeSettings(): Promise<SignupLifetimeSettin
   }
 }
 
-/** Called only on account creation, before saving the reservation with the user. */
+/** Read-only offer lookup: precheck previews it; only account creation persists a reservation. */
 export async function reserveSignupLifetimeOffer(platform: ClientPlatform): Promise<SignupLifetimeOffer | null> {
   const settings = await readSignupLifetimeSettings();
   if (platform === "ios" && settings.iosSignupLifetimeEnabled) return "ios";

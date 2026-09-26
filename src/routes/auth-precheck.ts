@@ -13,6 +13,7 @@ import { verifyToken } from "../lib/jwt";
 import { clientIp, consumeRateLimit } from "../lib/rate-limit";
 import { asyncHandler } from "../middleware/async-handler";
 import { precheckSchema } from "../validation/schemas";
+import { readClientPlatform, reserveSignupLifetimeOffer } from "../lib/signup-lifetime";
 
 /**
  * `POST /api/auth/precheck` — "does this phone already have a paying account?"
@@ -34,11 +35,13 @@ import { precheckSchema } from "../validation/schemas";
  * The response describes the device in the caller's hand, masked, and nothing
  * else.
  *
- * `payingAccount.blocksSignup` says which of the two S1/N4 stories the client
- * should tell: true — an APPLE-billed purchase is bound to this phone, show the
- * blocking interstitial (the signup gates would 409 the same signup) — or
+ * `payingAccount.blocksSignup` describes the Apple binding, independently of
+ * today's signup offer: true — an APPLE-billed purchase is bound to this phone — or
  * false, the paying account is web-billed (Lemon Squeezy), worth mentioning
  * ("plan started on PC") but never a reason to refuse a signup on this phone.
+ * The top-level `signupLifetimeOffer` lets a NEW iOS signup continue under an
+ * iOS gift without clearing binding facts needed by paid checkout or restore.
+ * It is informational here; /register and fresh /apple re-read it at creation.
  *
  * THE APPLE-TRANSACTION LEG (V1). The body may carry StoreKit's
  * `appleOriginalTransactionId`, and the AppleTxOwner registry — which,
@@ -62,11 +65,10 @@ import { precheckSchema } from "../validation/schemas";
  * ids are opaque, the endpoint is rate-limited like every precheck call, and
  * the answer is masked exactly like the device leg's.
  *
- * ENFORCEMENT NOTE: the server-side signup gates (SIGNUP_PAYING_DEVICE_BLOCK
- * in routes/auth.ts) are deliberately UNCHANGED — a register/apple call
- * carries no StoreKit context, so the client-side interstitial built on this
- * response is the enforcement for the Apple-transaction leg. The gates keep
- * covering the device leg server-side.
+ * ENFORCEMENT NOTE: /register and fresh /apple waive only the paying-device
+ * gate when they reserve an iOS gift. They carry no StoreKit context, so the
+ * precheck's client-side interstitial still handles the transaction leg when
+ * there is no iOS offer. Neither flow changes ownership of an Apple purchase.
  */
 export const authPrecheckRouter = Router();
 
@@ -86,6 +88,7 @@ authPrecheckRouter.post(
     if (isReliableDeviceId(rawDeviceId)) {
       await consumeRateLimit(`precheck:device:${ledgerHash(rawDeviceId)}`, 30, 15 * 60 * 1000);
     }
+    const signupLifetimeOffer = await reserveSignupLifetimeOffer(readClientPlatform(req));
 
     // OPTIONAL auth — the same verification `requireAuth` performs, minus the
     // refusal. Only a VALID token names a caller; anything else is anonymous,
@@ -105,9 +108,8 @@ authPrecheckRouter.post(
       deviceId: rawDeviceId,
       idfv,
       signals: fingerprint.signals,
-      // The SAME computation as the signup gates in routes/auth.ts, so
-      // `blocksSignup` below predicts exactly what a register attempt would
-      // meet: only an Apple-billed binding blocks a signup on this phone.
+      // Keep the Apple binding verdict intact even when an iOS gift permits
+      // signup. Paid paywalls and restore still need these ownership facts.
       blockingProviders: ["APPLE"],
       env,
     });
@@ -123,6 +125,7 @@ authPrecheckRouter.post(
     const paying = appleTx.kind === "owner" ? appleTx.account : result.payingAccount;
     const blocking = appleTx.kind === "owner" ? true : result.blocking;
     res.json({
+      signupLifetimeOffer,
       device: {
         known: result.deviceKnown,
         payingAccount: paying
@@ -133,12 +136,8 @@ authPrecheckRouter.post(
               maskedEmail: maskEmail(paying.email),
               billingProvider: paying.billingProvider,
               loginMethods: paying.loginMethods,
-              // Should the client refuse a NEW account over this binding?
-              // True for an Apple-billed device candidate (the signup gates
-              // would 409 the same signup) and ALWAYS true for an
-              // Apple-transaction owner — the receipt is the evidence. False
-              // means informational only: mention the plan, never show the
-              // blocking interstitial.
+              // Apple binding fact; the separate signup offer may waive the
+              // signup interstitial, never purchase/restore ownership checks.
               blocksSignup: blocking,
               // False for every anonymous caller — "is it mine?" is exactly
               // the question an unauthenticated stranger must not get answered
@@ -148,7 +147,7 @@ authPrecheckRouter.post(
           : null,
         // Wire-additive, and only ever present as `true`: the Apple ID behind
         // the supplied transaction id paid for an account that no longer
-        // exists. The client blocks signup on it — see the header.
+        // exists. Keep this fact even when an iOS signup offer is available.
         ...(appleTx.kind === "orphaned" ? { appleTxOrphaned: true } : {}),
       },
       serverTime: new Date().toISOString(),

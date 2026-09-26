@@ -77,6 +77,11 @@ function setEnv(t: Ctx, patch: Record<string, unknown>) {
 
 const daysFromNow = (n: number) => new Date(Date.now() + n * 24 * 60 * 60 * 1000);
 
+test.beforeEach((t) => {
+  // Precheck now reads the current signup offer even if there is no user row.
+  stubMethod(t, prisma.signupLifetimeSettings as any, "findUnique", async () => null);
+});
+
 /* ── the fakes ────────────────────────────────────────────────────────────── */
 
 /** Device rows, honouring the deviceId filter, the recency order and `take`. */
@@ -92,7 +97,6 @@ function fakeDevices(t: Ctx, rows: Row[]) {
 }
 
 function fakeUsers(t: Ctx, seed: Row[]) {
-  stubMethod(t, prisma.signupLifetimeSettings as any, "findUnique", async () => null);
   const store: Row[] = seed.map((r) => ({
     passwordHash: null,
     emailVerified: true,
@@ -778,3 +782,175 @@ test("/apple: re-login is NEVER blocked, even on a paying device with the flag o
   assert.ok(res.body.token);
   assert.equal(res.body.user.email, "b@example.com");
 });
+
+/* The signup offer permits an independent free account; Apple ownership stays put. */
+function signupOffer(t: Ctx, ios: boolean, desktop = false) {
+  return stubMethod(t, prisma.signupLifetimeSettings as any, "findUnique", async () => ({
+    iosSignupLifetimeEnabled: ios, desktopSignupLifetimeEnabled: desktop,
+    updatedAt: new Date(), updatedBy: "test-admin",
+  }));
+}
+function verificationMailOnly(t: Ctx) {
+  setEnv(t, { resendApiKey: "" });
+  stubMethod(t, prisma.emailVerification as any, "updateMany", async () => ({ count: 0 }));
+  stubMethod(t, prisma.emailVerification as any, "create", async ({ data }: Row) => ({ id: "ev-gift", ...data }));
+}
+function forbidPaymentMutations(t: Ctx) {
+  const mutations: string[] = [];
+  for (const [name, model] of [["purchase", prisma.purchase], ["subscription", prisma.subscription], ["appleTxOwner", prisma.appleTxOwner]] as const) {
+    for (const method of ["create", "update", "updateMany", "upsert"]) {
+      stubMethod(t, model as any, method, async () => { mutations.push(`${name}.${method}`); throw new Error("A signup gift cannot mutate payments"); });
+    }
+  }
+  t.after(() => { assert.deepEqual(mutations, []); });
+}
+
+for (const scenario of [
+  { name: "iOS ON", platform: "ios", ios: true, desktop: false, offer: "ios", status: 201 },
+  { name: "iOS OFF", platform: "ios", ios: false, desktop: false, offer: null, status: 409 },
+  { name: "desktop ON", platform: "windows", ios: true, desktop: true, offer: "desktop", status: 409 },
+  { name: "Android", platform: "android", ios: true, desktop: true, offer: null, status: 409 },
+  { name: "unknown client", platform: undefined, ios: true, desktop: true, offer: null, status: 409 },
+]) {
+  test(`${scenario.name}: precheck reports the offer separately and registration keeps Apple ownership facts`, async (t) => {
+    setEnv(t, { signupPayingDeviceBlock: true });
+    const users = payingOwnerWorld(t);
+    const settings = signupOffer(t, scenario.ios, scenario.desktop);
+    fakeAppleTxOwners(t, [{ originalTransactionId: APPLE_TX, userId: OWNER_ID }]);
+    forbidPaymentMutations(t);
+    verificationMailOnly(t);
+    const headers = { ...deviceHeader, ...(scenario.platform ? { "x-welockin-platform": scenario.platform } : {}) };
+    const pre = await request(app).post("/api/auth/precheck").set(headers).send({ appleOriginalTransactionId: APPLE_TX });
+    assert.equal(pre.status, 200);
+    assert.equal(pre.body.signupLifetimeOffer, scenario.offer);
+    assert.equal(pre.body.device.payingAccount.blocksSignup, true);
+    assert.equal(pre.body.device.payingAccount.billingProvider, "APPLE");
+    assert.equal(pre.body.device.payingAccount.maskedEmail, maskEmail(OWNER_EMAIL));
+    assert.equal(users.creates.length, 0, "precheck is read-only");
+    const registered = await request(app).post("/api/auth/register").set(headers)
+      .send({ email: "gift-newcomer@example.com", password: "hunter2hunter2" });
+    assert.equal(registered.status, scenario.status, JSON.stringify(registered.body));
+    assert.equal(settings.length, 2, "precheck reads once, creation snapshots once");
+    if (scenario.status === 201) {
+      assert.equal(users.creates.length, 1);
+      assert.equal(registered.body.user.signupLifetimeOffer, "ios");
+      assert.equal(registered.body.user.emailVerified, false);
+      assert.equal(registered.body.user.iosLifetimeGrantedAt, undefined);
+      assert.notEqual(registered.body.user.id, OWNER_ID);
+    } else {
+      assert.equal(registered.body.code, "DEVICE_LINKED_TO_PAYING_ACCOUNT");
+      assert.equal(users.creates.length, 0);
+    }
+    assert.equal(users.store[0].id, OWNER_ID);
+    assert.equal(users.store[0].email, OWNER_EMAIL);
+  });
+}
+
+for (const previewEnabled of [true, false]) {
+  test(`registration rechecks the iOS offer after precheck (${previewEnabled ? "ON to OFF" : "OFF to ON"})`, async (t) => {
+    setEnv(t, { signupPayingDeviceBlock: true });
+    const users = payingOwnerWorld(t);
+    let enabled = previewEnabled;
+    const settings = stubMethod(t, prisma.signupLifetimeSettings as any, "findUnique", async () => ({
+      iosSignupLifetimeEnabled: enabled, desktopSignupLifetimeEnabled: false,
+      updatedAt: new Date(), updatedBy: "test-admin",
+    }));
+    fakeAppleTxOwners(t, [{ originalTransactionId: APPLE_TX, userId: OWNER_ID }]);
+    forbidPaymentMutations(t);
+    verificationMailOnly(t);
+    const headers = { ...deviceHeader, "x-welockin-platform": "ios" };
+    const pre = await request(app).post("/api/auth/precheck").set(headers)
+      .send({ appleOriginalTransactionId: APPLE_TX });
+    assert.equal(pre.status, 200);
+    assert.equal(pre.body.signupLifetimeOffer, previewEnabled ? "ios" : null);
+    assert.equal(pre.body.device.payingAccount.blocksSignup, true);
+    assert.equal(users.creates.length, 0, "preview does not reserve an offer");
+
+    enabled = !previewEnabled;
+    const registered = await request(app).post("/api/auth/register").set(headers)
+      .send({ email: "gift-after-toggle@example.com", password: "hunter2hunter2" });
+    assert.equal(settings.length, 2, "creation takes its own single settings snapshot");
+    assert.equal(registered.status, enabled ? 201 : 409, JSON.stringify(registered.body));
+    if (enabled) {
+      assert.equal(users.creates.length, 1);
+      assert.equal(registered.body.user.signupLifetimeOffer, "ios");
+      assert.equal(registered.body.user.emailVerified, false);
+      assert.equal(registered.body.user.iosLifetimeGrantedAt, undefined);
+    } else {
+      assert.equal(registered.body.code, "DEVICE_LINKED_TO_PAYING_ACCOUNT");
+      assert.equal(users.creates.length, 0);
+      assert.equal(users.store.length, 1, "no account or offer is reserved after OFF");
+    }
+    assert.equal(users.store[0].id, OWNER_ID);
+    assert.equal(users.store[0].email, OWNER_EMAIL);
+  });
+}
+
+test("an orphaned Apple transaction stays reported while an iOS signup offer is available", async (t) => {
+  fakeUsers(t, []);
+  fakeDevices(t, []);
+  signupOffer(t, true);
+  fakeAppleTxOwners(t, [{ originalTransactionId: APPLE_TX, userId: OWNER_ID }]);
+  const res = await request(app).post("/api/auth/precheck").set(deviceHeader).set("x-welockin-platform", "ios")
+    .send({ appleOriginalTransactionId: APPLE_TX });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.signupLifetimeOffer, "ios");
+  assert.equal(res.body.device.appleTxOrphaned, true);
+  assert.equal(res.body.device.payingAccount, null);
+});
+
+test("an iOS offer does not let duplicate emails pass or accept a client-supplied offer", async (t) => {
+  setEnv(t, { signupPayingDeviceBlock: true });
+  const users = payingOwnerWorld(t);
+  const settings = signupOffer(t, true);
+  const duplicate = await request(app).post("/api/auth/register").set(deviceHeader).set("x-welockin-platform", "ios")
+    .send({ email: OWNER_EMAIL, password: "hunter2hunter2" });
+  assert.equal(duplicate.status, 409);
+  assert.match(duplicate.body.error, /already exists/);
+  assert.equal(settings.length, 0);
+  assert.equal(users.creates.length, 0);
+  signupOffer(t, false);
+  const forged = await request(app).post("/api/auth/register").set(deviceHeader).set("x-welockin-platform", "ios")
+    .send({ email: "forged@example.com", password: "hunter2hunter2", signupLifetimeOffer: "ios" });
+  assert.equal(forged.status, 409);
+  assert.equal(forged.body.code, "DEVICE_LINKED_TO_PAYING_ACCOUNT");
+  assert.equal(users.creates.length, 0);
+});
+
+test("unavailable settings never advertise an offer or bypass the protected signup", async (t) => {
+  setEnv(t, { signupPayingDeviceBlock: true });
+  const users = payingOwnerWorld(t);
+  stubMethod(t, prisma.signupLifetimeSettings as any, "findUnique", async () => { throw new Error("offline"); });
+  for (const path of ["/api/auth/precheck", "/api/auth/register"]) {
+    const res = await request(app).post(path).set(deviceHeader).set("x-welockin-platform", "ios")
+      .send({ email: "new@example.com", password: "hunter2hunter2" });
+    assert.equal(res.status, 503);
+    assert.equal(res.body.code, "SIGNUP_LIFETIME_SETTINGS_UNAVAILABLE");
+    assert.equal(res.body.signupLifetimeOffer, undefined);
+  }
+  assert.equal(users.creates.length, 0);
+});
+
+for (const [platform, expectedStatus] of [["ios", 201], ["windows", 409], ["android", 409]] as const) {
+  test(`/apple: only an iOS reserved gift bypasses the paying-device blocker (${platform})`, async (t) => {
+    setEnv(t, { signupPayingDeviceBlock: true });
+    stubAppleJwks(t);
+    const users = payingOwnerWorld(t);
+    const settings = signupOffer(t, true, true);
+    stubMethod(t, prisma.authProvider as any, "findUnique", async () => null);
+    forbidPaymentMutations(t);
+    const res = await request(app).post("/api/auth/apple").set(deviceHeader).set("x-welockin-platform", platform)
+      .send({ identityToken: appleIdentityToken(`apple-gift-${platform}`, "gift-fresh@example.com") });
+    assert.equal(res.status, expectedStatus, JSON.stringify(res.body));
+    assert.equal(settings.length, 1);
+    if (expectedStatus === 201) {
+      assert.equal(users.creates.length, 1);
+      assert.equal(res.body.user.signupLifetimeOffer, "ios");
+      assert.equal(res.body.user.emailVerified, true);
+      assert.ok(users.creates[0][0].data.iosLifetimeGrantedAt instanceof Date);
+    } else {
+      assert.equal(res.body.code, "DEVICE_LINKED_TO_PAYING_ACCOUNT");
+      assert.equal(users.creates.length, 0);
+    }
+  });
+}

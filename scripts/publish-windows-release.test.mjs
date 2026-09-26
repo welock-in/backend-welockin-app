@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { loadPinnedManifest, publishWindowsRelease } from './publish-windows-release.mjs';
+import { EXPECTED_BACKEND_SOURCE_SHA, loadPinnedManifest, publishWindowsRelease } from './publish-windows-release.mjs';
 
 const API_BASE = 'https://app.connect.welock.in';
 const ARTIFACT_URL = 'https://pub-9a9e884e54304893952b71510391fcd4.r2.dev/releases/0.3.46/welockin_0.3.46_x64-setup.exe';
@@ -52,6 +52,16 @@ const MANIFEST_049 = Object.freeze({
   sourceSha: '8656b34e30e0ab5057e60e5c0504b603d89f8fed',
   backendSourceSha: 'dcb2c4658c71eb24b31c62c784b1a41707773fb4',
   notes: 'Refine Focus with friends with the mobile-inspired launcher, aligned to Start Focus. Add a wider study room card with the shared spiral background, cleaner controls and responsive layout. Preserve the existing shared-session behavior and cross-platform compatibility. Windows source commit 8656b34e30e0ab5057e60e5c0504b603d89f8fed.',
+});
+
+const MANIFEST_050 = Object.freeze({
+  ...MANIFEST,
+  version: '0.3.50',
+  rolloutPercent: 0,
+  url: 'https://pub-9a9e884e54304893952b71510391fcd4.r2.dev/releases/0.3.50/welockin_0.3.50_x64-setup.exe',
+  sourceSha: 'cbb467117a651ac446c6cc350bb58db190080390',
+  backendSourceSha: EXPECTED_BACKEND_SOURCE_SHA,
+  notes: 'Manual installation only: finish every focus session before running this installer. Improve account switching and email verification recovery, persist focus history sync, protect update handoff, and bind Study Room departures to the exact membership. Automatic updates remain disabled for the transition from 0.3.49.',
 });
 
 const ENV = Object.freeze({
@@ -164,8 +174,8 @@ function scenario(options = {}) {
     }
     if (pathname === `/api/admin/releases/${RELEASE_ID}/publish` && method === 'POST') {
       publishCount += 1;
-      assert.deepEqual(body, { rolloutPercent: 100 });
-      const published = release({ status: 'live', rolloutPercent: 100, ...options.publishOverrides }, manifest);
+      assert.deepEqual(body, { rolloutPercent: manifest.rolloutPercent });
+      const published = release({ status: 'live', rolloutPercent: manifest.rolloutPercent, ...options.publishOverrides }, manifest);
       rows = rows.map((row) => row.id === RELEASE_ID ? published : row);
       return json(published);
     }
@@ -229,7 +239,7 @@ test('the 0.3.48 manifest pins the signed installer and integrated Windows/backe
 });
 
 test('unknown manifest versions cannot select files or inherited object properties', () => {
-  for (const version of ['0.3.50', '../0.3.46', 'constructor', '__proto__', { toString: () => '0.3.46' }]) {
+  for (const version of ['0.3.51', '../0.3.46', 'constructor', '__proto__', { toString: () => '0.3.46' }]) {
     assert.throws(() => loadPinnedManifest(version), /UNSUPPORTED_RELEASE_VERSION/);
   }
 });
@@ -246,6 +256,95 @@ test('0.3.49 pins the final installer, raw UI-uploaded signature and reviewed so
   assert.equal(manifest.signatureSha256, 'bcf87414ee896f11432a772177b3934f4325453bc633e4b4c93c93dfb7ad5617');
   assert.equal(manifest.signatureSizeBytes, 420);
   assert.equal(Object.isFrozen(manifest), true);
+});
+
+test('0.3.50 pins the final manual installer and signed bytes to both reviewed source commits', () => {
+  const manifest = loadPinnedManifest('0.3.50');
+  assert.equal(manifest.version, '0.3.50');
+  assert.equal(manifest.sourceSha, 'cbb467117a651ac446c6cc350bb58db190080390');
+  assert.equal(manifest.backendSourceSha, '64b8470f02b971b8cdf8ce56781d3b1702e465af');
+  assert.equal(EXPECTED_BACKEND_SOURCE_SHA, manifest.backendSourceSha);
+  assert.equal(manifest.rolloutPercent, 0);
+  assert.equal(manifest.url, MANIFEST_050.url);
+  assert.equal(manifest.notes, MANIFEST_050.notes);
+  assert.equal(manifest.sha256, '803968cd29a626ee5104f3d55a989ebe32b09952fd5704c4b8fcf9cb5714959e');
+  assert.equal(manifest.sizeBytes, 11993267);
+  assert.equal(manifest.signatureSha256, '16987e5cec241cfe85fbda2a8f7fe4fd94f9fbb806a8db0ac97ff1200f0bdae6');
+  assert.equal(manifest.signatureSizeBytes, 420);
+  assert.equal(Object.isFrozen(manifest), true);
+  for (const version of ['0.3.46', '0.3.47', '0.3.48', '0.3.49']) {
+    assert.equal(loadPinnedManifest(version).rolloutPercent, 100);
+  }
+  assert.equal(loadPinnedManifest('0.3.49').backendSourceSha, 'dcb2c4658c71eb24b31c62c784b1a41707773fb4');
+});
+
+test('0.3.50 publishes only its new row live at zero percent and leaves 0.3.49 unchanged', async () => {
+  const previous = release({ id: 'previous-049', status: 'live', rolloutPercent: 100 }, MANIFEST_049);
+  const mock = scenario({ manifest: MANIFEST_050, initialReleases: [previous] });
+  assert.deepEqual(await mock.run(), { status: 'published', version: '0.3.50', id: RELEASE_ID });
+  assert.deepEqual(mock.calls.slice(0, 2).map((call) => call.url), [MANIFEST_050.url, `${MANIFEST_050.url}.sig`]);
+  assert.deepEqual(mutations(mock.calls).map((call) => call.pathname), ['/api/admin/releases', `/api/admin/releases/${RELEASE_ID}/publish`]);
+  assert.deepEqual(mutations(mock.calls)[1].body, { rolloutPercent: 0 });
+  assert.equal(mock.calls.some((call) => call.pathname.includes('previous-049')), false);
+  assert.equal(JSON.parse(mock.logs[0]).rolloutPercent, 0);
+  assertNoSecrets(mock.logs.join('\n'));
+});
+
+for (const status of ['draft', 'live']) {
+  test(`0.3.50 resumes an identical ${status} at zero without widening rollout`, async () => {
+    const mock = scenario({ manifest: MANIFEST_050, initialReleases: [release({ status, rolloutPercent: 0 }, MANIFEST_050)] });
+    assert.deepEqual(await mock.run(), { status: status === 'live' ? 'already-live' : 'published', version: '0.3.50', id: RELEASE_ID });
+    assert.deepEqual(mutations(mock.calls).map((call) => call.pathname), status === 'live' ? [] : [`/api/admin/releases/${RELEASE_ID}/publish`]);
+    if (status === 'draft') assert.deepEqual(mutations(mock.calls)[0].body, { rolloutPercent: 0 });
+  });
+}
+
+for (const overrides of [
+  { rolloutPercent: 100 }, { rolloutPercent: 1 },
+  { sourceSha: MANIFEST_049.sourceSha }, { backendSourceSha: MANIFEST_049.backendSourceSha },
+]) {
+  test(`0.3.50 rejects unreviewed rollout or sources before requests: ${JSON.stringify(overrides)}`, async () => {
+    const mock = scenario({ manifest: MANIFEST_050 });
+    await assert.rejects(mock.run({ manifest: { ...MANIFEST_050, ...overrides } }), /MANIFEST_INVALID/);
+    assert.equal(mock.calls.length, 0);
+  });
+}
+
+test('0.3.50 cannot resume a row that was made automatically available', async () => {
+  const mock = scenario({ manifest: MANIFEST_050, initialReleases: [release({ status: 'live', rolloutPercent: 100 }, MANIFEST_050)] });
+  await assert.rejects(mock.run(), /RELEASE_STATUS_NOT_RESUMABLE/);
+  assert.equal(mutations(mock.calls).length, 0);
+});
+
+test('0.3.50 rejects concurrent rollout widening before publication', async () => {
+  const mock = scenario({ manifest: MANIFEST_050,
+    initialReleases: [release({}, MANIFEST_050)],
+    prepublishRows: [release({ status: 'live', rolloutPercent: 100 }, MANIFEST_050)],
+  });
+  await assert.rejects(mock.run(), /RELEASE_STATUS_NOT_RESUMABLE/);
+  assert.equal(mutations(mock.calls).length, 0);
+});
+
+test('0.3.50 does not claim success if publication or readback widens rollout', async () => {
+  for (const options of [
+    { publishOverrides: { rolloutPercent: 100 } },
+    { readbackRows: [release({ status: 'live', rolloutPercent: 100 }, MANIFEST_050)] },
+  ]) {
+    const mock = scenario({ manifest: MANIFEST_050, ...options });
+    await assert.rejects(mock.run(), /RELEASE_STATUS_NOT_RESUMABLE/);
+    assert.deepEqual(mock.logs, []);
+  }
+});
+
+test('0.3.50 preserves exact bytes before authentication for both artifact and signature', async () => {
+  for (const options of [
+    { artifactBytes: Buffer.from('x'.repeat(ARTIFACT.length)) },
+    { signatureBytes: Buffer.concat([SIGNATURE_BYTES, Buffer.from('\r\n')]) },
+  ]) {
+    const mock = scenario({ manifest: MANIFEST_050, ...options });
+    await assert.rejects(mock.run(), /CHECKSUM_MISMATCH/);
+    assert.equal(mock.calls.some((call) => call.pathname === '/api/admin/login'), false);
+  }
 });
 
 test('absent release flag performs no reads of credentials or environment and no network calls', async () => {
@@ -265,7 +364,7 @@ for (const overrides of [
   { VERCEL_ENV: 'preview' },
   { VERCEL_ENV: 'development' },
   { VERCEL_ENV: undefined },
-  { WINDOWS_RELEASE_VERSION: '0.3.50' },
+  { WINDOWS_RELEASE_VERSION: '0.3.51' },
   { WINDOWS_RELEASE_VERSION: ' 0.3.46 ' },
 ]) {
   test(`invalid activation is rejected before network: ${JSON.stringify(overrides)}`, async () => {
@@ -449,7 +548,7 @@ test('0.3.47 cannot use the old source commit even with the new artifact URL', a
   assert.equal(mock.calls.length, 0);
 });
 
-for (const [manifest, newerVersion] of [[MANIFEST, '0.3.47'], [MANIFEST_047, '0.3.48'], [MANIFEST_048, '0.3.49'], [MANIFEST_049, '0.3.50']]) {
+for (const [manifest, newerVersion] of [[MANIFEST, '0.3.47'], [MANIFEST_047, '0.3.48'], [MANIFEST_048, '0.3.49'], [MANIFEST_049, '0.3.50'], [MANIFEST_050, '0.3.51']]) {
   test(`${manifest.version} refuses publication after ${newerVersion} is live`, async () => {
     const mock = scenario({
       manifest,

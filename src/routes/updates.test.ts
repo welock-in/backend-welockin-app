@@ -455,6 +455,25 @@ test("an Intel Mac's download resolves through its own row to the dmg", async (t
  * visitor has nothing to regress from — and gating this on 100% meant the
  * site's primary button answered 404 for the whole of every canary.
  */
+test("manual transition remains downloadable while every automatic bucket is held", async (t) => {
+  const installer = 'https://cdn.example/releases/0.3.50/welockin_0.3.50_x64-setup.exe';
+  fakeReleases(t, [
+    release({ version: '0.3.49', versionKey: toSortKey('0.3.49'), rolloutPercent: 100 }),
+    release({ id: 'r50', version: '0.3.50', versionKey: toSortKey('0.3.50'), rolloutPercent: 0, url: installer }),
+  ]);
+  const download = await request(app).get('/api/updates/download/windows');
+  assert.equal(download.status, 302);
+  assert.equal(download.headers.location, installer);
+  const latest = await request(app).get('/api/updates/latest');
+  assert.equal(latest.body.version, '0.3.50');
+  for (const version of ['0.3.48', '0.3.49', '0.3.50']) {
+    for (const bucket of ['stable', ...Array.from({ length: 100 }, (_, index) => String(index))]) {
+      const update = await request(app).get(`/api/updates/windows/x86_64/${bucket}/${version}`);
+      assert.equal(update.status, 204, `version ${version}, bucket ${bucket} must not fall back to the older automatic release`);
+    }
+  }
+});
+
 test("a canary is still downloadable, but a paused release is not", async (t) => {
   fakeReleases(t, [release({ rolloutPercent: 1 })]);
   const canary = await request(app).get("/api/updates/download");

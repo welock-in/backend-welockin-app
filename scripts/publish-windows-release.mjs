@@ -6,8 +6,8 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const API = "https://app.connect.welock.in";
-export const RELEASE_VERSION = "0.3.49";
-export const EXPECTED_BACKEND_SOURCE_SHA = "dcb2c4658c71eb24b31c62c784b1a41707773fb4";
+export const RELEASE_VERSION = "0.3.50";
+export const EXPECTED_BACKEND_SOURCE_SHA = "64b8470f02b971b8cdf8ce56781d3b1702e465af";
 // SHA-256 of the manifest's JSON with top-level keys sorted. Whitespace/CRLF
 // changes do not matter; changing any manifest value requires explicit review.
 const RELEASE_PINS = Object.freeze({
@@ -26,8 +26,14 @@ const RELEASE_PINS = Object.freeze({
   }),
   "0.3.49": Object.freeze({
     sourceSha: "8656b34e30e0ab5057e60e5c0504b603d89f8fed",
-    backendSourceSha: EXPECTED_BACKEND_SOURCE_SHA,
+    backendSourceSha: "dcb2c4658c71eb24b31c62c784b1a41707773fb4",
     manifestSha256: "05733b6c553a0ed0bc84f2b1e0923efa9001987b76f4f51cb52213bdbc40070f",
+  }),
+  "0.3.50": Object.freeze({
+    sourceSha: "cbb467117a651ac446c6cc350bb58db190080390",
+    backendSourceSha: EXPECTED_BACKEND_SOURCE_SHA,
+    rolloutPercent: 0,
+    manifestSha256: "db7cae4e47db770fbb9df7deffa8baffc6cbc12c0fe3da6ccc64b9452deb9897",
   }),
 });
 const artifactUrl = (version) => `https://pub-9a9e884e54304893952b71510391fcd4.r2.dev/releases/${version}/welockin_${version}_x64-setup.exe`;
@@ -58,7 +64,7 @@ export function loadPinnedManifest(version = "0.3.46") {
 
 function validateManifest(m, version) {
   if (!m || m.version !== version || m.target !== "windows" || m.arch !== "x86_64" ||
-      m.channel !== "stable" || m.rolloutPercent !== 100 || m.url !== artifactUrl(version) || m.sourceSha !== RELEASE_PINS[version].sourceSha ||
+      m.channel !== "stable" || m.rolloutPercent !== (RELEASE_PINS[version].rolloutPercent ?? 100) || m.url !== artifactUrl(version) || m.sourceSha !== RELEASE_PINS[version].sourceSha ||
       (RELEASE_PINS[version].backendSourceSha && m.backendSourceSha !== RELEASE_PINS[version].backendSourceSha) ||
       !/^[a-f0-9]{64}$/.test(m.sha256) || !/^[a-f0-9]{64}$/.test(m.signatureSha256) ||
       !Number.isSafeInteger(m.sizeBytes) || m.sizeBytes <= 0 ||
@@ -104,7 +110,7 @@ function validateRow(row, manifest, signature, expectedId) {
     refuse("IMMUTABLE_RELEASE_COLLISION");
   }
   if (!((row.status === "draft" && row.rolloutPercent === 0) ||
-        (row.status === "live" && row.rolloutPercent === 100))) refuse("RELEASE_STATUS_NOT_RESUMABLE");
+        (row.status === "live" && row.rolloutPercent === manifest.rolloutPercent))) refuse("RELEASE_STATUS_NOT_RESUMABLE");
 }
 
 export async function publishWindowsRelease({ env = process.env, fetchImpl = globalThis.fetch, manifest, log = console.log } = {}) {
@@ -187,7 +193,7 @@ export async function publishWindowsRelease({ env = process.env, fetchImpl = glo
   }
   if (row.status === "draft") {
     const published = await jsonRequest(`/api/admin/releases/${id}/publish`, {
-      method: "POST", headers, body: JSON.stringify({ rolloutPercent: 100 }),
+      method: "POST", headers, body: JSON.stringify({ rolloutPercent: manifest.rolloutPercent }),
     }, "PUBLISH_RELEASE");
     validateRow(published, manifest, signature, id);
     if (published.status !== "live") refuse("PUBLICATION_NOT_CONFIRMED");
@@ -197,7 +203,7 @@ export async function publishWindowsRelease({ env = process.env, fetchImpl = glo
   validateRow(confirmed, manifest, signature, id);
   if (confirmed.status !== "live") refuse("LIVE_READBACK_FAILED");
   const result = { status: alreadyLive ? "already-live" : "published", version: manifest.version, id };
-  log(JSON.stringify({ ...result, target: "windows", arch: "x86_64", rolloutPercent: 100, sha256: manifest.sha256 }));
+  log(JSON.stringify({ ...result, target: "windows", arch: "x86_64", rolloutPercent: manifest.rolloutPercent, sha256: manifest.sha256 }));
   return result;
 }
 

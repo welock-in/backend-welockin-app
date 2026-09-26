@@ -1,0 +1,15 @@
+{
+  "version": "0.3.50",
+  "target": "windows",
+  "arch": "x86_64",
+  "channel": "stable",
+  "rolloutPercent": 0,
+  "url": "https://pub-9a9e884e54304893952b71510391fcd4.r2.dev/releases/0.3.50/welockin_0.3.50_x64-setup.exe",
+  "sourceSha": "cbb467117a651ac446c6cc350bb58db190080390",
+  "sha256": "803968cd29a626ee5104f3d55a989ebe32b09952fd5704c4b8fcf9cb5714959e",
+  "sizeBytes": 11993267,
+  "signatureSha256": "16987e5cec241cfe85fbda2a8f7fe4fd94f9fbb806a8db0ac97ff1200f0bdae6",
+  "signatureSizeBytes": 420,
+  "notes": "Manual installation only: finish every focus session before running this installer. Improve account switching and email verification recovery, persist focus history sync, protect update handoff, and bind Study Room departures to the exact membership. Automatic updates remain disabled for the transition from 0.3.49.",
+  "backendSourceSha": "64b8470f02b971b8cdf8ce56781d3b1702e465af"
+}

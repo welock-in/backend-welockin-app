@@ -1,6 +1,7 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
-import type { FocusEventInput } from "../validation/schemas";
+import type { FocusEventInput, FocusEventV2Input } from "../validation/schemas";
+import { HttpError } from "../lib/http-error";
 import { deterministicObjectId } from "../lib/deterministic-id";
 
 // Idempotent FocusEvent ingestion. Mobile clients may retry after an uncertain
@@ -93,4 +94,60 @@ export async function upsertFocusEvents(userId: string, events: FocusEventInput[
   for (const e of events) {
     await upsertFocusEvent(userId, e);
   }
+}
+
+function assertCompatibleV2(stored: IngestResult["event"], input: FocusEventV2Input): void {
+  const expected = { ...toData(stored.userId, input, false), eventVersion: 2, actualSeconds: input.actualSeconds };
+  for (const key of ["name", "plannedSeconds", "completed", "hardLock", "killedTotal", "deviceId", "platform",
+    "clientEventId", "emergencyUsed", "eventVersion", "actualSeconds"] as const) {
+    if (stored[key] !== expected[key]) throw new HttpError(409, "Event identity already contains different data", {
+      code: "FOCUS_EVENT_CONFLICT", details: { clientEventId: input.clientEventId },
+    });
+  }
+  if (stored.startedAt.getTime() !== input.startedAt.getTime() || stored.endedAt.getTime() !== input.endedAt.getTime()) {
+    throw new HttpError(409, "Event identity already contains different dates", {
+      code: "FOCUS_EVENT_CONFLICT", details: { clientEventId: input.clientEventId },
+    });
+  }
+}
+
+/** v2 does not acknowledge a lossy v1 copy, or mutate a prior quarantine verdict. */
+export async function upsertFocusEventsV2(userId: string, events: FocusEventV2Input[]) {
+  // Preflight the whole validated lot before writing. A concurrent collision or
+  // interrupted write is still safe: deterministic IDs and replay check content.
+  const existing = await prisma.focusEvent.findMany({ where: { userId,
+    clientEventId: { in: events.map((event) => event.clientEventId) } } });
+  const inputs = new Map(events.map((event) => [event.clientEventId, event]));
+  const byId = new Map<string, IngestResult["event"]>();
+  // Check every historical row, including legacy duplicates with a random _id.
+  // A Map constructed first could hide an incompatible copy behind another row.
+  for (const saved of existing) {
+    const input = inputs.get(saved.clientEventId!);
+    if (input) {
+      assertCompatibleV2(saved, input);
+      byId.set(input.clientEventId, saved);
+    }
+  }
+  const results = [];
+  for (const input of events) {
+    let saved = byId.get(input.clientEventId);
+    let status: "stored" | "deduped" = "deduped";
+    if (!saved) {
+      const id = deterministicObjectId("focus-event", userId, input.clientEventId);
+      const quarantined = await shouldQuarantine(userId, input);
+      try {
+        saved = await prisma.focusEvent.create({ data: { id, ...toData(userId, input, quarantined),
+          eventVersion: 2, actualSeconds: input.actualSeconds } });
+        status = "stored";
+      } catch (error) {
+        if (!isDuplicateKey(error)) throw error;
+        saved = await prisma.focusEvent.findUnique({ where: { id } }) ?? undefined;
+        if (!saved) throw error;
+        assertCompatibleV2(saved, input);
+      }
+    }
+    byId.set(input.clientEventId, saved);
+    results.push({ clientEventId: input.clientEventId, status, credited: saved.quarantined !== true });
+  }
+  return { eventVersion: 2 as const, results };
 }

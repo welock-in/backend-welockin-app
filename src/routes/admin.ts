@@ -1,6 +1,7 @@
 import { Router } from "express";
 import crypto from "node:crypto";
 import { prisma } from "../lib/prisma";
+import { focusEventDurationView } from "../services/focus-duration";
 import { env, variantGate } from "../lib/env";
 import { asyncHandler } from "../middleware/async-handler";
 import { requireAdmin } from "../middleware/admin-auth";
@@ -362,7 +363,7 @@ adminRouter.get(
           }
         : null,
       liveSessions: live,
-      recentEvents,
+      recentEvents: recentEvents.map(focusEventDurationView),
     });
   }),
 );
@@ -389,7 +390,7 @@ adminRouter.get(
         take,
       }),
     ]);
-    res.json({ events, total, skip, take });
+    res.json({ events: events.map(focusEventDurationView), total, skip, take });
   }),
 );
 

@@ -12,6 +12,7 @@ import {
   friendFocusCreateSchema,
   friendFocusJoinSchema,
   friendFocusReadySchema,
+  friendFocusLeaveV2Schema,
 } from "../validation/schemas";
 import { deliver } from "../services/notifications/deliver";
 
@@ -42,6 +43,7 @@ async function changeRoom<T>(
   where: Prisma.FriendFocusRoomWhereUniqueInput,
   validate: (room: RoomWithMembers) => void,
   mutate: (tx: RoomDb, room: RoomWithMembers) => Promise<T>,
+  absent?: () => T,
 ): Promise<T> {
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
@@ -49,7 +51,10 @@ async function changeRoom<T>(
         const room = await tx.friendFocusRoom.findUnique({
           where, include: { members: { orderBy: { joinedAt: "asc" } } },
         });
-        if (!room) throw notFound("Room not found");
+        if (!room) {
+          if (absent) return absent();
+          throw notFound("Room not found");
+        }
         validate(room);
         // Explicitly advance even inside the same millisecond, so the parent
         // write cannot collapse to a no-op and admit two stale snapshots.
@@ -251,6 +256,36 @@ friendFocusRouter.post(
     res.json({ left: true });
   }),
 );
+
+friendFocusRouter.post("/rooms/:id/leave/v2", requireAuth, asyncHandler(async (req, res) => {
+  const { expectedMemberId } = friendFocusLeaveV2Schema.parse(req.body);
+  if (!/^[0-9a-f]{24}$/i.test(req.params.id)) throw notFound("Room not found");
+  const userId = req.user!.id;
+  const ack = (status: "left" | "already_left" | "superseded") => ({ version: 2, membershipId: expectedMemberId, status });
+  const result = await changeRoom({ id: req.params.id }, (room) => {
+    const member = room.members.find((candidate) => candidate.userId === userId);
+    if (member?.id !== expectedMemberId) return;
+    const active = room.status === "active" && room.endsAt != null && room.endsAt.getTime() > Date.now();
+    if (active && room.hardLock) throw conflict("A Hard Lock room cannot be left before the shared timer ends");
+  }, async (tx, room) => {
+    const member = room.members.find((candidate) => candidate.userId === userId);
+    if (!member) return ack("already_left");
+    if (member.id !== expectedMemberId) return ack("superseded");
+    // Match the legacy cancellation: ending a waiting room retains its host
+    // membership, so remaining clients can still read the final room state.
+    // An ended room that never started is the durable acknowledgement on retry.
+    if (room.hostUserId === userId && room.status === "ended" && room.startsAt == null) {
+      return ack("already_left");
+    }
+    if (room.hostUserId === userId && room.status === "waiting") {
+      await tx.friendFocusRoom.update({ where: { id: room.id }, data: { status: "ended" } });
+      return ack("left");
+    }
+    await tx.friendFocusMember.delete({ where: { id: member.id } });
+    return ack("left");
+  }, () => ack("already_left"));
+  res.json(result);
+}));
 
 friendFocusRouter.get(
   "/invitations/:code",

@@ -2,16 +2,13 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { env } from "../lib/env";
 import { computeDayStreak } from "./analytics";
+import { creditableFocusWhere, focusDuration, focusDurationSelect, durationBreakdown } from "./focus-duration";
 
 // Rich aggregations for the admin console. Kept separate from the per-user
 // `analytics.ts` (which powers the desktop's own small summary) so the admin
 // surface can evolve freely.
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-
-function secondsBetween(a: Date, b: Date): number {
-  return Math.max(0, Math.floor((b.getTime() - a.getTime()) / 1000));
-}
 
 function localDayKey(date: Date): string {
   const y = date.getFullYear();
@@ -47,6 +44,7 @@ export function computeLongestStreak(startedAts: Date[]): number {
 }
 
 export interface UserStats {
+  durationQuality: ReturnType<typeof durationBreakdown>;
   totalSessions: number;
   completedSessions: number;
   abortedSessions: number;
@@ -76,10 +74,9 @@ export async function computeUserStats(
   now: Date = new Date(),
 ): Promise<UserStats> {
   const events = await prisma.focusEvent.findMany({
-    where: { userId },
+    where: { userId, ...creditableFocusWhere },
     select: {
-      startedAt: true,
-      endedAt: true,
+      ...focusDurationSelect,
       completed: true,
       hardLock: true,
       killedTotal: true,
@@ -108,7 +105,7 @@ export async function computeUserStats(
   const completedDays: Date[] = [];
 
   for (const e of events) {
-    const secs = secondsBetween(e.startedAt, e.endedAt);
+    const secs = focusDuration(e).seconds;
     totalFocus += secs;
     totalKilled += e.killedTotal ?? 0;
     if (e.completed) {
@@ -156,6 +153,7 @@ export async function computeUserStats(
 
   return {
     totalSessions: total,
+    durationQuality: durationBreakdown(events),
     completedSessions: completed,
     abortedSessions: total - completed,
     completionRate: total === 0 ? 0 : completed / total,
@@ -180,6 +178,7 @@ export async function computeUserStats(
 }
 
 export interface GlobalOverview {
+  durationQuality: ReturnType<typeof durationBreakdown>;
   totalUsers: number;
   suspendedUsers: number;
   usersByPlan: Record<string, number>;
@@ -220,21 +219,21 @@ export async function overview(now: Date = new Date()): Promise<GlobalOverview> 
     prisma.user.groupBy({ by: ["plan"], _count: { _all: true } }),
     prisma.user.count({ where: { createdAt: { gte: week } } }),
     prisma.user.count({ where: { createdAt: { gte: month } } }),
-    prisma.focusEvent.count(),
+    prisma.focusEvent.count({ where: creditableFocusWhere }),
     prisma.device.count(),
     prisma.liveSession.count({ where: liveSessionWhere(now) }),
     // Events within the last 30 days drive today's + 7d focus/session counts.
     prisma.focusEvent.findMany({
-      where: { startedAt: { gte: month } },
-      select: { startedAt: true, endedAt: true },
+      where: { startedAt: { gte: month }, ...creditableFocusWhere },
+      select: focusDurationSelect,
     }),
     prisma.focusEvent.groupBy({
       by: ["userId"],
-      where: { startedAt: { gte: week } },
+      where: { startedAt: { gte: week }, ...creditableFocusWhere },
     }),
     prisma.focusEvent.groupBy({
       by: ["userId"],
-      where: { startedAt: { gte: month } },
+      where: { startedAt: { gte: month }, ...creditableFocusWhere },
     }),
   ]);
 
@@ -242,10 +241,11 @@ export async function overview(now: Date = new Date()): Promise<GlobalOverview> 
   // this ever grows large). We piggyback the 30-day fetch for the windows and do
   // a separate lean fetch for the all-time sum.
   const allEventsTimes = await prisma.focusEvent.findMany({
-    select: { startedAt: true, endedAt: true },
+    where: creditableFocusWhere,
+    select: focusDurationSelect,
   });
   const totalFocusSeconds = allEventsTimes.reduce(
-    (sum, e) => sum + secondsBetween(e.startedAt, e.endedAt),
+    (sum, e) => sum + focusDuration(e).seconds,
     0,
   );
 
@@ -256,7 +256,7 @@ export async function overview(now: Date = new Date()): Promise<GlobalOverview> 
     if (e.startedAt >= startOfToday) sessionsToday += 1;
     if (e.startedAt >= week) {
       sessions7d += 1;
-      focusSeconds7d += secondsBetween(e.startedAt, e.endedAt);
+      focusSeconds7d += focusDuration(e).seconds;
     }
   }
 
@@ -275,6 +275,7 @@ export async function overview(now: Date = new Date()): Promise<GlobalOverview> 
     sessionsToday,
     sessions7d,
     totalFocusSeconds,
+    durationQuality: durationBreakdown(allEventsTimes),
     focusSeconds7d,
     liveSessionsCount,
     totalDevices,
@@ -282,6 +283,7 @@ export async function overview(now: Date = new Date()): Promise<GlobalOverview> 
 }
 
 export interface UserListItem {
+  durationQuality: ReturnType<typeof durationBreakdown>;
   id: string;
   email: string;
   plan: string;
@@ -351,8 +353,8 @@ export async function usersList(
       _count: { _all: true },
     }),
     prisma.focusEvent.findMany({
-      where: { userId: { in: ids } },
-      select: { userId: true, startedAt: true, endedAt: true },
+      where: { userId: { in: ids }, ...creditableFocusWhere },
+      select: { userId: true, ...focusDurationSelect },
     }),
     prisma.liveSession.findMany({
       where: { userId: { in: ids }, ...liveSessionWhere(now) },
@@ -367,7 +369,7 @@ export async function usersList(
   for (const e of pageEvents) {
     const a = sessionAgg.get(e.userId) ?? { count: 0, focus: 0, last: null };
     a.count += 1;
-    a.focus += secondsBetween(e.startedAt, e.endedAt);
+    a.focus += focusDuration(e).seconds;
     if (!a.last || e.endedAt > a.last) a.last = e.endedAt;
     sessionAgg.set(e.userId, a);
   }
@@ -389,6 +391,7 @@ export async function usersList(
         deviceCount: deviceCounts.get(u.id) ?? 0,
         sessionCount: agg?.count ?? 0,
         totalFocusSeconds: agg?.focus ?? 0,
+        durationQuality: durationBreakdown(pageEvents.filter((event) => event.userId === u.id)),
         lastActiveAt: agg?.last ? agg.last.toISOString() : null,
         liveNow: liveIds.has(u.id),
       };

@@ -249,6 +249,40 @@ export const focusEventInputSchema = z.object({
   emergencyUsed: z.boolean().optional().default(false),
 });
 
+// Separate route and strict envelope prevent silent v1 stripping or snapshot writes.
+export const focusEventV2Schema = focusEventInputSchema.extend({
+  eventVersion: z.literal(2).optional(),
+  actualSeconds: z.number().int().nonnegative().max(2147483647),
+  plannedSeconds: z.number().int().nonnegative().max(2147483647),
+  killedTotal: z.number().int().nonnegative().max(2147483647).optional().default(0),
+  clientEventId: z.string().trim().min(1).max(256),
+  deviceId: z.string().trim().min(1).max(256),
+  platform: z.enum(["android", "ios", "ipados", "macos", "windows"]),
+}).strict().superRefine((event, ctx) => {
+  // A failed dateInput transform can still reach superRefine with z.NEVER.
+  // Preserve its validation issue instead of turning malformed input into 500.
+  if (!(event.startedAt instanceof Date) || !(event.endedAt instanceof Date)) return;
+  const wallSeconds = Math.floor((event.endedAt.getTime() - event.startedAt.getTime()) / 1000);
+  if (wallSeconds < 0 || event.actualSeconds > Math.min(event.plannedSeconds, wallSeconds)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["actualSeconds"],
+      message: "Focus duration must fit the final budget and elapsed whole seconds" });
+  }
+});
+
+export const focusEventsV2Schema = z.object({
+  eventVersion: z.literal(2),
+  events: z.array(focusEventV2Schema).min(1).max(50),
+}).strict().superRefine((batch, ctx) => {
+  if (new Set(batch.events.map((event) => event.clientEventId)).size !== batch.events.length) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["events"], message: "Duplicate clientEventId in batch" });
+  }
+});
+export type FocusEventV2Input = z.infer<typeof focusEventV2Schema>;
+
+export const friendFocusLeaveV2Schema = z.object({
+  expectedMemberId: z.string().regex(/^[0-9a-f]{24}$/i).transform((id) => id.toLowerCase()),
+}).strict();
+
 export const syncPushSchema = z
   .object({
     blocklists: z.array(z.unknown()).optional(),

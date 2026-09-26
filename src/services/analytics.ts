@@ -1,8 +1,10 @@
 import { prisma } from "../lib/prisma";
+import { creditableFocusWhere, focusDuration, focusDurationSelect, durationBreakdown } from "./focus-duration";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export interface AnalyticsSummary {
+  durationQuality: ReturnType<typeof durationBreakdown>;
   focusedSecondsWeek: number;
   sessionsCount: number;
   dayStreak: number;
@@ -23,16 +25,13 @@ export async function computeSummary(
 ): Promise<AnalyticsSummary> {
   const weekAgo = new Date(now.getTime() - 7 * DAY_MS);
 
-  // Exclude quarantined events (Part D) from every stat — anti-abuse events are
-  // kept for audit but never credited. `{ not: true }` also matches legacy events
-  // where the field is null/false.
-  const notQuarantined = { quarantined: { not: true } };
+  const notQuarantined = creditableFocusWhere;
 
   const [weekEvents, totalSessions, completedEvents] = await Promise.all([
     // Events started in the last 7 days — drive week focus + session count.
     prisma.focusEvent.findMany({
       where: { userId, startedAt: { gte: weekAgo }, ...notQuarantined },
-      select: { startedAt: true, endedAt: true },
+      select: focusDurationSelect,
     }),
     prisma.focusEvent.count({ where: { userId, ...notQuarantined } }),
     // Completed events — drive the day streak.
@@ -42,13 +41,7 @@ export async function computeSummary(
     }),
   ]);
 
-  const focusedSecondsWeek = weekEvents.reduce((sum, e) => {
-    const seconds = Math.max(
-      0,
-      Math.floor((e.endedAt.getTime() - e.startedAt.getTime()) / 1000),
-    );
-    return sum + seconds;
-  }, 0);
+  const focusedSecondsWeek = weekEvents.reduce((sum, e) => sum + focusDuration(e).seconds, 0);
 
   const dayStreak = computeDayStreak(
     completedEvents.map((e) => e.startedAt),
@@ -56,6 +49,7 @@ export async function computeSummary(
   );
 
   return {
+    durationQuality: durationBreakdown(weekEvents),
     focusedSecondsWeek,
     sessionsCount: weekEvents.length,
     dayStreak,

@@ -393,6 +393,8 @@ model FocusEvent {
   startedAt      DateTime
   endedAt        DateTime
   plannedSeconds Int
+  eventVersion   Int?
+  actualSeconds  Int?
   completed      Boolean
   hardLock       Boolean
   killedTotal    Int      @default(0)

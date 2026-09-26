@@ -3,11 +3,16 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
-import { syncPushSchema } from "../validation/schemas";
-import { upsertFocusEvents } from "../services/focus-events";
+import { syncPushSchema, focusEventsV2Schema } from "../validation/schemas";
+import { upsertFocusEvents, upsertFocusEventsV2 } from "../services/focus-events";
 import { shouldReplaceSnapshot } from "../services/sync-policy";
 
 export const syncRouter = Router();
+
+syncRouter.post("/events/v2", requireAuth, asyncHandler(async (req, res) => {
+  const input = focusEventsV2Schema.parse(req.body);
+  res.json(await upsertFocusEventsV2(req.user!.id, input.events));
+}));
 
 /**
  * Last-write-wins push of the desktop's local state. Upserts the user's single

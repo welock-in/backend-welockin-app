@@ -402,6 +402,11 @@ test("a blocked-app attempt notifies every other active room member, never the a
   ]);
   stubMethod(t, deliveries, "findMany", async () => []);
   const deliveryWrites = stubMethod(t, deliveries, "createMany", async () => ({ count: 1 }));
+  stubMethod(t, prisma.friendFocusEvent as any, "findUnique", async () => null);
+  stubMethod(t, prisma.friendFocusEvent as any, "create", async ({ data }: any) => ({ id: "65f000000000000000000301", ...data }));
+  stubMethod(t, prisma.friendFocusEvent as any, "updateMany", async () => ({ count: 1 }));
+  stubMethod(t, rooms, "update", async () => ({}));
+  stubMethod(t, prisma.friendFocusMember as any, "update", async () => ({}));
 
   const originalFetch = global.fetch;
   const expoRequests: Array<{ url: string; init?: RequestInit }> = [];

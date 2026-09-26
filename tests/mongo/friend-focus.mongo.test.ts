@@ -8,6 +8,7 @@ let app: any;
 let signToken: (payload: { sub: string; email: string }) => string;
 let originalFetch: typeof fetch;
 let failMemberCreate = false;
+let failPushClaim = false;
 let failAttemptCooldownWrite = false;
 let failDeliveryAuditWrite = false;
 let afterPushClaim: (() => Promise<void>) | null = null;
@@ -36,6 +37,9 @@ before(async () => {
     }
     if (failDeliveryAuditWrite && params.model === "NotificationDelivery" && params.action === "createMany") {
       throw new Error("Injected delivery audit failure after Expo acceptance");
+    }
+    if (failPushClaim && params.model === "FriendFocusEvent" && params.action === "updateMany" && params.args.data.pushClaimedAt) {
+      throw new Error("Injected pre-dispatch claim failure");
     }
     const result = await next(params);
     if (afterPushClaim && params.model === "FriendFocusEvent" && params.action === "updateMany" && params.args.data.pushClaimedAt) {
@@ -416,4 +420,23 @@ test("deleting an actor removes their event records through the Prisma cascade",
   await prisma.user.delete({ where: { id: accounts[1].user.id } });
   assert.equal(await prisma.friendFocusEvent.count({ where: { roomId: room.id } }), 0);
   assert.equal((await stored(room.id)).members.length, 1);
+});
+
+
+test("a push claim storage outage preserves accepted events for desktop and legacy iOS", async () => {
+  for (const legacy of [false, true]) {
+    const { room, accounts } = await activeRoom();
+    const token = (await stored(room.id)).members.find((m: any) => m.userId === accounts[0].user.id).attemptToken;
+    failPushClaim = true;
+    let result;
+    try {
+      result = legacy
+        ? await request(app).post(`/api/friend-focus/rooms/${room.id}/blocked-attempt`).send({ attemptToken: token })
+        : await attempt(room, accounts[0], "claim-storage-outage");
+    } finally { failPushClaim = false; }
+    assert.equal(result.status, 202);
+    assert.equal(result.body.accepted, true);
+    assert.equal(result.body.notified, 0);
+    assert.equal(await prisma.friendFocusEvent.count({ where: { roomId: room.id } }), 1);
+  }
 });

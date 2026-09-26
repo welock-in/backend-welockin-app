@@ -363,19 +363,19 @@ async function recordAttempt(
 async function pushAttempt(event: FriendFocusEvent, appName?: string): Promise<number> {
   if (event.sequence == null) return 0;
   const claimedAt = new Date();
-  const claim = await prisma.friendFocusEvent.updateMany({
-    where: {
-      id: event.id,
-      AND: [
-        { OR: [{ pushCompletedAt: null }, { pushCompletedAt: { isSet: false } }] },
-        { OR: [{ pushClaimedAt: null }, { pushClaimedAt: { isSet: false } }] },
-      ],
-    },
-    data: { pushClaimedAt: claimedAt },
-  });
-  if (claim.count === 0) return 0;
   let dispatchStarted = false;
   try {
+    const claim = await prisma.friendFocusEvent.updateMany({
+      where: {
+        id: event.id,
+        AND: [
+          { OR: [{ pushCompletedAt: null }, { pushCompletedAt: { isSet: false } }] },
+          { OR: [{ pushClaimedAt: null }, { pushClaimedAt: { isSet: false } }] },
+        ],
+      },
+      data: { pushClaimedAt: claimedAt },
+    });
+    if (claim.count === 0) return 0;
     const room = await prisma.friendFocusRoom.findUnique({ where: { id: event.roomId }, include: { members: true } });
     if (!room || !activeRoom(room) || !room.members.some((member) => member.userId === event.actorUserId)) {
       await prisma.friendFocusEvent.updateMany({ where: { id: event.id, pushClaimedAt: claimedAt }, data: { pushCompletedAt: new Date() } });

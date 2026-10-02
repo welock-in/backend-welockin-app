@@ -23,6 +23,8 @@ export function focusDuration(event: DurationInput): { seconds: number; basis: D
     return { seconds: 0, basis: "unavailable" };
   }
   if (event.eventVersion === 2) {
+    // actualSeconds inclut déjà la déduction des pauses côté client ; le serveur
+    // valide ses bornes sans soustraire une seconde fois ni corriger la mesure.
     const actual = event.actualSeconds;
     return Number.isInteger(actual) && actual! >= 0 && actual! <= Math.min(budget!, wall)
       ? { seconds: actual!, basis: "measured" } : { seconds: 0, basis: "unavailable" };

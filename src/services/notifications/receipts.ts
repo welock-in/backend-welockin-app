@@ -23,6 +23,8 @@ export async function checkNotificationReceipts() {
     const receipt = row.ticketId ? receipts[row.ticketId] : undefined;
     if (!receipt) { waiting++; continue; }
     if (receipt.status === "ok") {
+      // Ce changement confirme le transport fournisseur, sans transformer
+      // le reçu en acquittement de présentation par le téléphone.
       await prisma.notificationDelivery.updateMany({ where: { id: row.id, status: "sent" }, data: { status: "provider_confirmed", error: null } });
       confirmed++;
     } else {

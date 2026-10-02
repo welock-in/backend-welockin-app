@@ -27,6 +27,8 @@ syncRouter.post(
     const userId = req.user!.id;
 
     let snapshot = await prisma.syncSnapshot.findUnique({ where: { userId } });
+    // La décision de remplacement précède l'écriture : un rejeu mobile
+    // d'événements seuls doit conserver la configuration desktop déjà stockée.
     if (shouldReplaceSnapshot(input)) {
       // Guaranteed by syncPushSchema when this branch is selected.
       const blocklistsJson = blocklists as unknown as Prisma.InputJsonValue;

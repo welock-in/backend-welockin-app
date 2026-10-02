@@ -51,7 +51,11 @@ credits 1800 seconds. The backend never subtracts pauses again.
 
 Register the reporting device under the authenticated account before the first
 upload. An unknown/foreign device is persisted in quarantine with `credited:false`.
-That verdict is immutable on retries, even after later device registration.
+The v2 replay handler preserves the stored verdict. Source limitation observed
+on 3 October 2026 (`88e6409`): `creditPendingEvents` in `src/routes/devices.ts`
+clears quarantine on matching user/device rows at registration without filtering
+eventVersion. Therefore immutability after later device registration is not
+currently guaranteed end to end; this document must not be read as proving it.
 This is attribution validation, not proof that blocking actually occurred.
 
 ## Acknowledgement and retry

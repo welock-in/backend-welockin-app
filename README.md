@@ -1,5 +1,16 @@
 # WeLockin Backend
 
+## Documentation à jour
+
+Lecture de référence : `origin/main` au 3 octobre 2026, commit `88e6409`. Le paquet backend reste `0.1.0` ; ce numéro est distinct des versions des clients et de la production déployée.
+
+- [Architecture et contrats entre dépôts](docs/ARCHITECTURE.md) : flux, données, droits et limites.
+- [Développement et opérations](docs/DEVELOPMENT.md) : installation, variables et commandes présentes, vérifications et migrations.
+- [Notes de version sourcées](CHANGELOG.md) : sélection chronologique du journal Git.
+- [Événements de focus v2](FOCUS-EVENTS-V2.md), [événements Study Rooms](docs/STUDY-ROOM-EVENTS.md), [lifetime desktop](DESKTOP-LIFETIME.md) et [records de release Windows](scripts/releases/README.md) : contrats et contexte spécialisé.
+
+Les explications historiques détaillées ci-dessous restent utiles ; pour les flux récents, commencer par les guides ci-dessus et `src/app.ts` / `src/lib/env.ts`. Les notes de tests ou publication datées ne prouvent pas l'état actuel d'un appareil ou d'un déploiement.
+
 The cloud backend for the WeLockin focus / app-&-site-blocking product (Windows &
 macOS desktop app, iOS/Android mobile app, and a web admin console). A single
 Express + TypeScript service on Prisma/**MongoDB**, deployed as one Vercel
@@ -15,9 +26,9 @@ auth (bcryptjs + jsonwebtoken) · zod validation · helmet + cors · Resend (ema
 | Area | Summary |
 |---|---|
 | **Accounts & auth** | Email/password + **Sign in with Apple**, JWT sessions. |
-| **Entitlement** | Server-authoritative access: a 14-day trial claimed **per machine** (not per account, which would be free), a Lemon Squeezy lifetime licence, admin comps and revocations — resolved by one pure function on the server clock. |
+| **Entitlement** | Server-authoritative, platform-scoped access: existing machine trial windows, purchases/subscriptions, signup lifetime grants, admin comps and revocations. New cardless signup trials default to OFF (`SIGNUP_TRIAL_ENABLED`); decisions use the server clock. |
 | **Multi-device sync** | The desktop pushes/pulls its local state (blocklists, focus-session cards, weekly schedules) as one last-write-wins snapshot, plus an idempotent log of completed focus events. |
-| **Devices** | Device registry with a **one-active-phone-per-account** binding (takeover + rebind cooldown), and a desktop device list. |
+| **Devices** | Device inventory for phones and desktops, idempotent by stable device identity. Multiple phones are supported; the former takeover/cooldown rule was removed. |
 | **Analytics** | Weekly focus stats + a consecutive-day streak, per user and (aggregated) for admins. |
 | **Live sessions** | Near-real-time focus heartbeats so the admin console can see who is focusing now, with an admin **force-end**. |
 | **Feedback board** | Auth-gated feature-request board (vote / report / auto-hide) with a built-in same-origin admin page. |
@@ -35,7 +46,7 @@ npm install                     # runs `prisma generate` (postinstall)
 # 2. Configure
 cp .env.example .env            # then set DATABASE_URL + JWT_SECRET at minimum
 
-# 3. Schema (needs a live DB — see MongoDB note below)
+# 3. Schema on a disposable development DB only — see DEVELOPMENT.md
 npx prisma db push
 
 # 4. Run
@@ -70,7 +81,7 @@ npm run dev                     # tsx watch, hot reload → http://localhost:878
 | `npm run prisma:generate` | Regenerate the Prisma client. |
 | `npm run prisma:push` | `prisma db push` (needs a live DB). |
 | `npm run protection:seed` | Seed the `protection` collection from `data/protection-blocklist.json` (idempotent; never clobbers admin edits). |
-| `npm run device:migrate` | One-off: backfill device columns + create the partial unique indexes for phone binding. |
+| `npm run device:migrate` | Backfill device columns, collapse duplicate identities, remove the former phone-binding index and create partial device/event/break indexes. Review before use on an existing DB. |
 | `npm run entitlement:migrate` | Creates the `TrialClaim` unique index, then grandfathers the pre-paywall cohort with a reversible 30-day comp. `-- --dry-run` counts, `-- --revert` undoes. **Run BEFORE deploying the ledger** (see below) and before flipping `ENTITLEMENT_ENFORCED`. |
 | `npm run feedback:set-admin` | Grant `User.isAdmin` to an email (feedback-board moderator). |
 | `npm run reconcile:feedback` | Recompute denormalized `voteCount`/`reportCount`. |
@@ -268,6 +279,7 @@ Render / Railway / Docker) with graceful shutdown.
 - **User JWT** — `requireAuth`: `Authorization: Bearer <jwt>` → `req.user = {id, email}`.
 - **Admin JWT** — `requireAdmin`: a *separate* token from `POST /api/admin/login`, signed with `ADMIN_JWT_SECRET`, role `admin`. Independent of `User.isAdmin`.
 - **`User.isAdmin`** — a per-user DB flag gating the *feedback-board* admin actions (`/api/feedback/admin`, moderation) and the `/admin` HTML page. This is a different mechanism from the admin-console JWT above.
+- **Current account/session** — `requireCurrentSession` rejects deleted accounts and stale password sessions; `requireVerifiedAccount` adds email verification when enabled. `src/app.ts` deliberately distinguishes routes needed before verification from the fully gated routes.
 - **App Attest** — `requireAttest` on counter-crediting routes (`/api/focus-events`, `/api/breaks`). Off by default (`ATTEST_REQUIRED`). *(The former `requireBoundDevice` device-binding layer was removed with the one-active-phone rule.)*
 
 **Error shape — every error is `{ "error": string }`** (via `src/middleware/error.ts`):
@@ -302,11 +314,11 @@ Collections (`@@map` name in parentheses when different from the model):
 - **Purchase** — one row per storefront transaction. `@@unique([provider, externalId])` — unique *with* the provider, never alone: two shops number their orders independently, and a collision would hand one customer's licence to another. `isRefunded` is what revokes access.
 - **TrialClaim** — the anti-abuse ledger: one free window per MACHINE. `deviceIdHash` is `@unique` **globally** (not per user, which would be no constraint at all) and is `HMAC-SHA256(TRIAL_LEDGER_PEPPER, deviceId)` — keyed, so a database copy alone cannot be walked back to the machines it names. The row **outlives the account**: `DELETE /api/me` nulls `firstUserId` and keeps the claim. `endsAt` is stamped once and never moves.
 - **AdminAuditLog** — every override that changes what someone may do, with a reason and before/after. Comps and revocations are the two ways a human can outrank the resolver, and an override nobody can explain later is indistinguishable from a mistake.
-- **WebhookEvent** — at-least-once delivery ledger. `@@unique([provider, eventId])`, where `eventId` is `"<event_name>:<order_id>"`. `status` is `processing` → `processed` | `skipped` | `failed`; only the last two are **terminal**. A redelivery finding `processing` or `failed` re-runs the work, because treating mere existence as "done" loses the purchase of anyone whose first delivery died halfway.
+- **WebhookEvent** — at-least-once delivery ledger. `@@unique([provider, eventId])`, where `eventId` is `"<event_name>:<order_id>"`. `status` is `processing` → `processed` | `skipped` | `failed`; only `processed` and `skipped` are **terminal**. A redelivery finding `processing` or `failed` re-runs the work, because treating mere existence as "done" loses the purchase of anyone whose first delivery died halfway.
 
 > ⚠️ **Both `@@unique` above must exist in the production database before the
 > first real order.** They are not decoration — they *are* the idempotency and the
-> concurrency lock. `npx prisma db push` creates them; verify with
+> concurrency lock. Qualify a targeted index procedure for an existing DB; verify with
 > `db.purchases.getIndexes()` / `db.webhookevents.getIndexes()`.
 
 ---
@@ -451,13 +463,17 @@ route-scoped CSP. Distinct from the `/api/admin` JSON console below.
 
 `vercel.json` builds `api/index.ts` with `@vercel/node` and routes `/(.*)` to it.
 Set the environment variables above in the Vercel project. `prisma generate` runs
-on install; run `npx prisma db push` once against the production `DATABASE_URL`
-(locally with that URL, or a one-off job) to create collections/indexes, and
-`npm run device:migrate` once to create the phone-binding partial indexes.
+on install and does not change database indexes. For an existing production DB,
+inventory indexes and duplicates and review targeted operations as described in
+[DEVELOPMENT.md](docs/DEVELOPMENT.md); global `prisma db push` is not a general
+production migration procedure. `device:migrate` includes data deletion and
+removes the retired phone-binding index.
 
 #### The billing cron — READ BEFORE GO-LIVE
 
-`vercel.json` declares one scheduled job:
+`vercel.json` declares four jobs: notification receipts every 5 minutes, billing
+tasks every 15 minutes, trial reminders hourly and abandoned checkouts every 6
+hours. The billing entry is:
 
 ```json
 { "path": "/api/cron/billing-tasks", "schedule": "*/15 * * * *" }
@@ -497,7 +513,7 @@ given up and a customer may still be paying.
 - [ ] `APPLE_BUNDLE_ID` = `in.welock.app` (if Sign in with Apple is used).
 - [ ] `RESEND_API_KEY` + `RESEND_FROM` — for the addiction-protection partner OTP email.
 - [ ] `CORS_ORIGIN` — the web/admin origins (not `*`) if browser clients call the API. ⚠️ The desktop app is a Tauri webview on the `tauri://localhost` origin — narrow this only after checking it still passes.
-- [ ] Run `npx prisma db push` and `npm run device:migrate` once, and `npm run protection:seed` to load the curated blocklist.
+- [ ] Review and qualify targeted DB/index operations and seed effects against the selected database; do not apply a global schema push to existing production data by default.
 
 **Deploying the trial ledger — run the migration BEFORE the code:**
 
@@ -508,7 +524,7 @@ protection is silently absent, and by the time anyone notices there are duplicat
 rows that make the index impossible to build.
 
 ```bash
-DATABASE_URL="<prod>" npm run entitlement:migrate -- --dry-run   # index + a count, no writes
+DATABASE_URL="<prod>" npm run entitlement:migrate -- --dry-run   # checks + counts, no index creation
 DATABASE_URL="<prod>" npm run entitlement:migrate                # index + grandfather
 ```
 
@@ -520,7 +536,7 @@ the ledger enforces nothing.
 1. [ ] In the Lemon Squeezy dashboard: create the store, the **Lifetime licence** product with a single variant, and note `store_id` + `variant_id`. They **differ between test and live** — copying a product to live mode assigns it a new id.
 2. [ ] Create the webhook → `https://<domain>/api/webhooks/lemonsqueezy`, events `order_created` and `order_refunded`. Keep **test and live as separate webhooks** pointing at separate deployments with separate databases; that is cleaner than `LEMONSQUEEZY_ALLOW_TEST_MODE`, which risks being left on in production.
 3. [ ] Set **all four** required vars *before* the store can take an order. A half-configured deploy switches purchasing off and says so in the boot log; an order that still arrives is recorded as `failed` (retryable) rather than dropped — but the safe path is simply to configure first, in one go.
-4. [ ] Confirm `npx prisma db push` created the `Purchase` and `WebhookEvent` unique indexes (see the data-model note).
+4. [ ] Confirm the targeted, reviewed index procedure created the `Purchase` and `WebhookEvent` unique indexes (see the data-model note).
 5. [ ] Send a **test-mode order** end to end and confirm a `Purchase` row appears and `GET /api/entitlement` flips to `active`. This is also the check that the raw body survives the platform: `verifyWebhookSignature` fails closed on an empty `rawBody`, so a silent regression there looks exactly like a wrong secret — and the tempting fix is to stop verifying.
 6. [ ] Only then, and only after grandfathering the existing cohort, set `ENTITLEMENT_ENFORCED=true`. Boot refuses this while the storefront is unconfigured.
 
@@ -539,9 +555,9 @@ Honest posture (some are intentional product decisions, some are open work):
 - **Secrets fail *closed* in production.** With `NODE_ENV=production`, boot throws if `DATABASE_URL` or `JWT_SECRET` is unset (or `JWT_SECRET` is still the `change-me` placeholder) — no silent fallback to a guessable secret. In dev/test the fallbacks keep zero-config runs working.
 - **Partner OTP is stored in plaintext and shown to admins** — *intentional*: it's a friction code (with a 5-try cap), not a credential.
 - **Day-streak analytics use the server timezone (UTC on Vercel)**, so a streak can flip at a different local time than a non-UTC user expects.
-- **App Attest is scaffolded but fail-closed** — `/api/attest/register` always returns `501` and `ATTEST_REQUIRED` must stay `false` until the native verifier is wired. Focus/break counters are binding-protected but forgeable by the account owner until then.
+- **App Attest is scaffolded but fail-closed** — `/api/attest/register` returns `501` and `ATTEST_REQUIRED` must stay `false` until the native verifier is wired. Device attribution and quarantine are not proof of native blocking or tamper resistance.
 - **`deviceId` is client-supplied, so the trial ledger has a ceiling.** The macOS app derives it from `IOPlatformUUID` (`src-tauri/src/device.rs`), which survives reinstall and disk erase — but it travels in a header, and a patched build can send whatever it likes. The ledger's job is to stop "make another account" from being a bypass, not to be unforgeable. Raising the ceiling further means attestation, which does not exist for Developer-ID macOS apps today.
-- **Nothing server-side is gated on entitlement.** `computeEntitlement` is read by its own route and nothing else: no endpoint refuses service to a non-pro user. Enforcement is entirely the client's decision, which means it is only as strong as the client.
+- **Native blocking depends on the client.** The backend resolves access and purchase eligibility, and money routes apply acquisition guards; the server does not operate the native blocker. See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for current platform-scoped rights and flow boundaries.
 - **Admin comp/revoke are real routes** — `POST/DELETE /api/admin/users/:id/comp` and `.../revoke`, each requiring a reason and writing an `AdminAuditLog` row, and `POST .../plan` is routed to the comp lever so it changes what the resolver actually reads. `POST .../suspend` remains moderation-only: `User.status` is not a resolver input and does not take access away.
 - **Trial-claim reset is an admin route** — `POST /api/admin/users/:id/trial-reset` (reason + `confirmUserId` repeated, audited) deletes the account's claims and signals and clears the legacy window, for the replaced-logic-board / resold-Mac case the machine rule gets wrong.
 - **A partial refund keeps the licence.** Only a FULL `order_refunded` revokes; a partial one is recorded (`rawEvent`) and logged for support, and a partial refund for an order we never saw created is parked `failed` for a human rather than guessed at.

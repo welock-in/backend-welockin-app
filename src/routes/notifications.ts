@@ -4,8 +4,36 @@ import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { pushTokenSchema } from "../validation/schemas";
+import { z } from "zod";
+import { getMotivationSettings, saveMotivationChoices, saveMotivationContext } from "../services/motivation/service";
+import { validTimeZone } from "../services/motivation/schedule";
 
 export const notificationsRouter = Router();
+
+const motivationContextSchema = z.object({
+  timeZone: z.string().min(1).max(100).refine(validTimeZone, "Invalid IANA timezone"),
+  language: z.enum(["en", "fr"]),
+});
+const motivationChoicesSchema = z.object({
+  enabled: z.boolean().optional(),
+  weekdays: z.array(z.number().int().min(0).max(6)).max(7)
+    .refine((days) => new Set(days).size === days.length, "Duplicate weekday").optional(),
+}).refine((value) => value.enabled !== undefined || value.weekdays !== undefined, "No change supplied");
+
+notificationsRouter.get("/motivation", requireAuth, asyncHandler(async (req, res) => {
+  res.json(await getMotivationSettings(req.user!.id));
+}));
+
+notificationsRouter.put("/motivation/context", requireAuth, asyncHandler(async (req, res) => {
+  const input = motivationContextSchema.parse(req.body);
+  res.json(await saveMotivationContext(req.user!.id, input.timeZone, input.language));
+}));
+
+notificationsRouter.patch("/motivation", requireAuth, asyncHandler(async (req, res) => {
+  const input = motivationChoicesSchema.parse(req.body);
+  res.json(await saveMotivationChoices(req.user!.id, input));
+}));
+
 
 /**
  * Register / refresh this device's push token (P0 — notification foundation).

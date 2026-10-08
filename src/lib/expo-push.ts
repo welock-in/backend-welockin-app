@@ -23,6 +23,7 @@ export interface PushPayload {
   sound?: string | null; // default "default"; null = silent
   badge?: number;
   expiration?: number;
+  ttl?: number;
 }
 
 export interface PushResult {
@@ -84,6 +85,7 @@ export async function sendExpoPush(tokens: string[], payload: PushPayload): Prom
     ...(payload.sound === null ? {} : { sound: payload.sound ?? "default" }),
     ...(payload.badge !== undefined ? { badge: payload.badge } : {}),
     ...(payload.expiration !== undefined ? { expiration: payload.expiration } : {}),
+    ...(payload.ttl !== undefined ? { ttl: payload.ttl } : {}),
   }));
 
   // Order is preserved, so concatenated tickets align 1:1 with `messages` / `validIdx`.

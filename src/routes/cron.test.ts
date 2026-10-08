@@ -284,3 +284,15 @@ test("the sweep looks only at ready intents inside a bounded window", async (t) 
   assert.ok(!("token" in select), "the intent token must never be selected");
   assert.ok(!("checkoutUrl" in select), "the checkout URL must never be selected");
 });
+
+test("motivation cron requires the secret and accepts the scheduler's GET", async (t) => {
+  setSecret(t, SECRET);
+  const model = prisma.motivationPreference as any;
+  const original = model.findMany;
+  model.findMany = async () => [];
+  t.after(() => { model.findMany = original; });
+  assert.equal((await request(app).get("/api/cron/motivation")).status, 401);
+  const good = await request(app).get("/api/cron/motivation").set("authorization", `Bearer ${SECRET}`);
+  assert.equal(good.status, 200);
+  assert.deepEqual(good.body, { due: 0, sent: 0, skipped: 0, failed: 0, contended: 0 });
+});

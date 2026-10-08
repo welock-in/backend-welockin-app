@@ -8,6 +8,7 @@ export interface DeliverPayload {
   body: string;
   data?: Record<string, unknown>;
   expiration?: number;
+  ttl?: number;
 }
 
 export interface DeliverSummary {

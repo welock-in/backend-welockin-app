@@ -568,6 +568,39 @@ model PushToken {
 // One row per push sent to one device — the audit log + inbox source + receipt
 // reconciliation target. No User back-relation (raw userId, like Break) → cleaned
 // up explicitly in me.ts. NEW → purely additive (P1).
+// One account-level schedule. Existing accounts acquire the default (enabled,
+// every day) when the mobile client first reports its timezone.
+model MotivationPreference {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId     String   @unique(map: "uniq_motivation_user") @db.ObjectId
+  enabled    Boolean  @default(true)
+  weekdays   Int[]    @default([0, 1, 2, 3, 4, 5, 6]) // Monday = 0
+  timeZone   String
+  language   String   @default("en")
+  nextSendAt DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([enabled, nextSendAt], map: "idx_motivation_due")
+  @@map("motivation_preferences")
+}
+
+// Atomic daily claim: a retry or an overlapping cron cannot send twice.
+model MotivationSend {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId      String   @db.ObjectId
+  localDate   String   // YYYY-MM-DD in the user's timezone at scheduling time
+  scheduledAt DateTime
+  textKey     String
+  status      String   @default("reserved")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([userId, localDate], map: "uniq_motivation_user_day")
+  @@index([userId, createdAt], map: "idx_motivation_recent")
+  @@map("motivation_sends")
+}
+
 model NotificationDelivery {
   id        String   @id @default(auto()) @map("_id") @db.ObjectId
   userId    String?  @db.ObjectId // recipient (null for a token with no known owner)

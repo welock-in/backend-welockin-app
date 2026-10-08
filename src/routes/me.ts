@@ -270,6 +270,11 @@ meRouter.delete(
     // deleteMany is idempotent).
     await prisma.break.deleteMany({ where: { userId } });
 
+    // Raw userId collections have no Prisma cascade. A failure must keep the
+    // account so the deletion can be retried without leaving personal data.
+    await prisma.motivationPreference.deleteMany({ where: { userId } });
+    await prisma.motivationSend.deleteMany({ where: { userId } });
+
     // The account row itself is the deletion that MUST succeed — do NOT swallow a
     // real failure (returning 204 while the account and its credentials survive is
     // both a lie to the user and an App/Play data-deletion compliance gap). Only a

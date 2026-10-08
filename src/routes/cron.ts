@@ -7,6 +7,7 @@ import { drainCancels } from "../lib/billing-tasks";
 import { sendTrialReminders } from "../lib/trial-reminders";
 import { sweepAbandonedCheckouts } from "../lib/checkout-abandoned";
 import { checkNotificationReceipts } from "../services/notifications/receipts";
+import { drainMotivationReminders } from "../services/motivation/service";
 
 /**
  * Scheduled work.
@@ -128,6 +129,16 @@ const runTrialReminders = asyncHandler(async (req, res) => {
 // two verbs cannot drift apart the way two copies would.
 cronRouter.get("/trial-reminders", runTrialReminders);
 cronRouter.post("/trial-reminders", runTrialReminders);
+
+const runMotivation = asyncHandler(async (req, res) => {
+  requireCronSecret(req.header("authorization") ?? undefined);
+  const report = await drainMotivationReminders();
+  console.info(`[cron] motivation ${JSON.stringify(report)}`);
+  res.json(report);
+});
+cronRouter.get("/motivation", runMotivation);
+cronRouter.post("/motivation", runMotivation);
+
 
 /**
  * Report the desktop checkouts that were started and never paid.

@@ -287,6 +287,9 @@ test("the sweep looks only at ready intents inside a bounded window", async (t) 
 
 test("motivation cron requires the secret and accepts the scheduler's GET", async (t) => {
   setSecret(t, SECRET);
+  const runCommand = (prisma as any).$runCommandRaw;
+  (prisma as any).$runCommandRaw = async () => ({});
+  t.after(() => { (prisma as any).$runCommandRaw = runCommand; });
   const model = prisma.motivationPreference as any;
   const original = model.findMany;
   model.findMany = async () => [];

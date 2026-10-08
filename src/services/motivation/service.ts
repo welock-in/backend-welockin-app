@@ -3,6 +3,7 @@ import { prisma } from "../../lib/prisma";
 import { notFound } from "../../lib/http-error";
 import { deliver } from "../notifications/deliver";
 import { MOTIVATION_TEXTS, renderMotivationText } from "./content";
+import { ensureMotivationIndexes } from "./indexes";
 import { ALL_WEEKDAYS, localDateKey, localDayBounds, nextMotivationAt } from "./schedule";
 
 export type MotivationSettings = {
@@ -39,6 +40,7 @@ async function nextUnsentAt(now: Date, timeZone: string, weekdays: readonly numb
 }
 
 export async function saveMotivationContext(userId: string, timeZone: string, language: "en" | "fr") {
+  await ensureMotivationIndexes();
   const now = new Date();
   const existing = await prisma.motivationPreference.findUnique({ where: { userId } });
   if (!existing) {
@@ -123,6 +125,7 @@ async function chooseText(userId: string, from: Date, language: string, name: st
 }
 
 export async function drainMotivationReminders(now = new Date()) {
+  await ensureMotivationIndexes();
   const due = await prisma.motivationPreference.findMany({
     where: { enabled: true, nextSendAt: { lte: now } },
     // Bound one invocation. Vercel calls this every minute; parallel dispatch

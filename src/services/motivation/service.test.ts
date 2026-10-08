@@ -8,6 +8,10 @@ import { nextMotivationAt } from "./schedule";
 const USER = "507f1f77bcf86cd799439011";
 const TOKEN = "ExponentPushToken[test-motivation-token]";
 
+// The index command is verified separately by the production migration script.
+// Service tests isolate scheduling and delivery from MongoDB itself.
+(prisma as any).$runCommandRaw = async () => ({});
+
 function stub(t: TestContext, object: Record<string, any>, key: string, replacement: (...args: any[]) => any) {
   const original = object[key];
   object[key] = replacement;

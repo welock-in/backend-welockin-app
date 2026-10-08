@@ -16,16 +16,17 @@ notification delivery path; Expo receipts remain the delivery diagnostic.
 
 ## Production order
 
-1. Create the new collections' indexes additively from this checkout, then
-   verify them:
+1. The backend creates the new collections' indexes additively on the first
+   settings registration or cron invocation. When direct database access is
+   available, verify them with:
 
    ```sh
-   npm run motivation:indexes -- --apply
    npm run motivation:indexes
    ```
 
    The script reads `DATABASE_URL`. It never prints the credential. Do not use
-   `prisma db push` on production MongoDB for this rollout.
+   `prisma db push` on production MongoDB for this rollout. The automatic
+   installer fails closed if MongoDB rejects index creation.
 2. Deploy the backend code and the new cron route. There are no preference rows
    until a new mobile client reports its context.
 3. Release the mobile client. A development build on a physical iPhone is needed

@@ -945,9 +945,10 @@ for (const [platform, expectedStatus] of [["ios", 201], ["windows", 409], ["andr
     assert.equal(settings.length, 1);
     if (expectedStatus === 201) {
       assert.equal(users.creates.length, 1);
-      assert.equal(res.body.user.signupLifetimeOffer, "ios");
+      assert.equal(res.body.user.signupLifetimeOffer, "all");
       assert.equal(res.body.user.emailVerified, true);
       assert.ok(users.creates[0][0].data.iosLifetimeGrantedAt instanceof Date);
+      assert.ok(users.creates[0][0].data.desktopLifetimeGrantedAt instanceof Date);
     } else {
       assert.equal(res.body.code, "DEVICE_LINKED_TO_PAYING_ACCOUNT");
       assert.equal(users.creates.length, 0);

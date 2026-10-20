@@ -2,6 +2,17 @@
 
 Sélection non exhaustive du journal Git atteignable depuis `origin/main` au 3 octobre 2026 (`88e6409`). Les dates sont celles des commits. Le paquet reste `0.1.0` : les versions Windows citées sont des manifestes/outils conservés dans ce dépôt. Un commit, y compris intitulé « publish », ne prouve pas à lui seul une publication, un déploiement ou une installation actuels.
 
+## 2026-10-20 — lifetime entre plateformes
+
+- Les nouvelles inscriptions réservent toutes les offres ON, quelle que soit
+  l’application utilisée. La vérification email active les deux droits pour
+  ON/ON ; le contrat du precheck reste compatible avec les clients publiés.
+- L’API admin expose les droits par plateforme dans la liste des utilisateurs.
+- Outil d’attribution exceptionnelle avec décompte préalable, exclusions exactes,
+  cohorte figée, audit transactionnel et relance idempotente.
+- Validation : 1 018 tests backend, 10 tests avec MongoDB local et build TypeScript.
+  Les mocks de suppression de compte incluent les tables motivation déjà utilisées.
+
 ## 2026-10-03 — documentation
 
 - Ajout des guides architecture/développement, navigation et historique sourcé ; commentaires sur les invariants des flux. Aucun comportement exécutable, version de paquet ni configuration modifiés.

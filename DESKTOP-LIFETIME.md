@@ -7,10 +7,14 @@ vérification tardive d’un ancien compte ne l’inscrit pas à l’offre.
 
 ## Réservation et activation
 
-La création enregistre `User.signupPlatform` et `signupLifetimeOffer` (`ios`,
-`desktop` ou null) avec le compte. La réservation seule n’accorde aucun accès.
+La création depuis iOS, Windows ou Mac enregistre `User.signupPlatform` et
+`signupLifetimeOffer` (`ios`, `desktop`, `all` ou null) avec le compte.
+La réservation capture **toutes les offres activées**, indépendamment de
+l’appareil d’inscription. ON/ON réserve `all` ; ON/OFF réserve `ios` ;
+OFF/ON réserve `desktop`. Une origine inconnue ne réserve aucune offre.
+La réservation seule n’accorde aucun accès.
 Après validation du code email, la même transaction marque le compte vérifié et
-enregistre `iosLifetimeGrantedAt` ou `desktopLifetimeGrantedAt`. Les répétitions
+enregistre `iosLifetimeGrantedAt`, `desktopLifetimeGrantedAt`, ou les deux. Les répétitions
 ne changent pas la date du premier cadeau. Un nouveau compte Apple dont l’adresse
 est vérifiée par Apple reçoit le cadeau dans son écriture de création.
 
@@ -35,19 +39,22 @@ restent inchangés pour les parcours d'achat et de restauration.
 
 Le backend relit le réglage une seule fois avant le contrôle Apple de création
 (`/register` ou nouveau compte `/apple`) et enregistre ce même résultat avec le
-compte. Seule une réservation `ios` contourne ce contrôle Apple ; les doublons
+compte. Seule une réservation incluant iOS sur un client iOS contourne ce contrôle Apple ; les doublons
 d'email et les autres contrôles restent actifs. Une offre desktop ne le
 contourne pas, et aucun achat Apple n'est transféré. Une erreur de lecture du
 réglage reste une erreur réessayable, sans offrir ni autoriser implicitement.
 
-- L’origine d’inscription décide du cadeau réservé. La plateforme de la requête
-  courante décide si ce cadeau s’applique. Les clients iOS transmettent
+- Les interrupteurs à l’inscription décident des cadeaux réservés au compte.
+  La plateforme de la requête courante décide quel droit utiliser. Les clients iOS transmettent
   `X-WeLockIn-Platform: ios` ou `ipados` ; les identifiants desktop `win-…`/`mac-…`
   restent compatibles. Ces informations identifient le client sans constituer
   une attestation matérielle. Une plateforme inconnue n’est jamais supposée iOS.
 - Le droit desktop suit le compte entre Windows et Mac ; le droit iOS suit le
-  compte entre iPhone et iPad. Aucun cadeau ne se propage à l’autre portée ou
-  dans le cache global `User.plan`/`isProCached`.
+  compte entre iPhone et iPad. Quand les deux offres sont ON, le compte reçoit
+  les deux droits. Une offre seule n’accorde pas l’autre portée. Les droits ne
+  sont pas inscrits dans le cache global `User.plan`/`isProCached`.
+  L’admin affiche les timestamps par portée au lieu de présenter ce cache
+  potentiellement `expired` comme le statut d’un titulaire lifetime.
 - La réponse standard est `status=active`, `isPro=true`, `plan=lifetime`,
   `validUntil=null`, `complimentaryLifetime=ios|desktop`. `billingProvider=NONE`
   lorsqu’aucun achat lifetime réel ne prend la priorité.
@@ -82,6 +89,25 @@ autre réglage de paiement n’est changé. En particulier `ENTITLEMENT_ENFORCED
 reste indépendant : cette offre crée un droit, elle ne désactive pas les gates.
 
 ## Livraison et retour arrière
+
+Le correctif du 20 octobre 2026 utilise la valeur additive `all` dans le champ
+String existant : aucun changement de structure MongoDB ni index supplémentaire.
+Le precheck garde son ancien contrat `ios|desktop|null` pour les applications
+publiées. Ne pas revenir à un backend qui ignore `all` tant que des réservations
+de ce type attendent leur vérification email.
+
+Une attribution exceptionnelle aux comptes existants est distincte des offres
+d’inscription. `scripts/grant-existing-lifetime.ts` accepte
+`LIFETIME_COHORT_MODE=dry-run|apply`, `LIFETIME_COHORT_CUTOFF`,
+`LIFETIME_COHORT_EXCLUDE` (emails exacts séparés par des virgules) et
+`LIFETIME_COHORT_REASON`. Le mode apply exige aussi le `LIFETIME_COHORT_HASH`
+retourné par le dry-run. Sans mode, le script ne fait rien. Chaque compte reçoit
+les dates manquantes dans une transaction avec son audit ; une relance conserve
+les dates déjà accordées. Les exclusions doivent correspondre exactement à
+des comptes et sont contrôlées après l’opération. Les achats, abonnements,
+vérifications email et restrictions de compte restent indépendants.
+
+Les notes suivantes décrivent la livraison initiale du système :
 
 Régénérer Prisma et construire le backend. Les champs utilisateur ajoutés sont
 optionnels ; aucun compte existant n’est migré ou automatiquement gratifié.

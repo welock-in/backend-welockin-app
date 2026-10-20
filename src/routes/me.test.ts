@@ -47,7 +47,7 @@ function stubDelete(
   for (const model of [
     "focusEvent", "device", "liveSession", "authProvider", "syncSnapshot", "vote",
     "pushToken", "notificationDelivery", "emailVerification", "passwordReset",
-    "featureRequest", "break",
+    "featureRequest", "break", "trialReminderSent", "motivationPreference", "motivationSend",
   ]) {
     stub(t, (prisma as any)[model], "deleteMany", noop);
   }

@@ -26,7 +26,7 @@ import { deterministicObjectId } from "../lib/deterministic-id";
 import { readDeviceId } from "../lib/device";
 import { claimTrialOnSignup } from "../lib/trial-claim";
 import { findPayingAccountForDevice } from "../lib/precheck";
-import { readClientPlatform, reserveSignupLifetimeOffer, signupLifetimeGrantData } from "../lib/signup-lifetime";
+import { readClientPlatform, reserveSignupLifetimeOffer, signupLifetimeGrantData, signupLifetimeOfferForPlatform } from "../lib/signup-lifetime";
 
 const isDuplicateKey = (err: unknown) =>
   err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
@@ -75,7 +75,7 @@ authRouter.post(
     // above, which says "sign in" — the right advice — rather than this
     // refusal. A reserved iOS gift needs no Apple purchase, so it waives only
     // this paying-device refusal. The same snapshot is persisted below.
-    if (env.signupPayingDeviceBlock && signupLifetimeOffer !== "ios") {
+    if (env.signupPayingDeviceBlock && signupLifetimeOfferForPlatform(signupLifetimeOffer, platform) !== "ios") {
       const precheck = await findPayingAccountForDevice({
         deviceId,
         signals: fingerprint.signals,
@@ -204,7 +204,7 @@ authRouter.post(
       // belt-and-braces: a paying account with this very address would have
       // been found by the `existing` lookup above. As in /register, an iOS
       // gift waives this refusal without borrowing the other account's purchase.
-      if (!existing && env.signupPayingDeviceBlock && signupLifetimeOffer !== "ios") {
+      if (!existing && env.signupPayingDeviceBlock && signupLifetimeOfferForPlatform(signupLifetimeOffer, platform) !== "ios") {
         const precheck = await findPayingAccountForDevice({
           deviceId: readDeviceId(req),
           signals: parseFingerprint(req).signals,

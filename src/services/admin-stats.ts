@@ -287,6 +287,10 @@ export interface UserListItem {
   id: string;
   email: string;
   plan: string;
+  emailVerified: boolean | null;
+  accessRevoked: boolean | null;
+  iosLifetimeGrantedAt: string | null;
+  desktopLifetimeGrantedAt: string | null;
   status: string;
   createdAt: string;
   deviceCount: number;
@@ -337,7 +341,8 @@ export async function usersList(
       orderBy: { [sortBy]: sortDir },
       skip,
       take,
-      select: { id: true, email: true, plan: true, status: true, createdAt: true },
+      select: { id: true, email: true, plan: true, status: true, createdAt: true,
+        emailVerified: true, accessRevoked: true, iosLifetimeGrantedAt: true, desktopLifetimeGrantedAt: true },
     }),
   ]);
 
@@ -386,6 +391,10 @@ export async function usersList(
         id: u.id,
         email: u.email,
         plan: u.plan,
+        emailVerified: u.emailVerified,
+        accessRevoked: u.accessRevoked,
+        iosLifetimeGrantedAt: u.iosLifetimeGrantedAt?.toISOString() ?? null,
+        desktopLifetimeGrantedAt: u.desktopLifetimeGrantedAt?.toISOString() ?? null,
         status: u.status ?? "active",
         createdAt: u.createdAt.toISOString(),
         deviceCount: deviceCounts.get(u.id) ?? 0,

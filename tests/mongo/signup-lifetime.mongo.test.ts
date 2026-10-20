@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { before, after, test } from "node:test";
 import request from "supertest";
 import { startMongo, stopMongo, runId } from "./harness";
+import { grantLifetimeCohort } from "../../src/lib/lifetime-cohort";
 
 // Real, disposable replica-set checks. No production connection or provider call.
 let prisma: any;
@@ -100,6 +101,50 @@ test("legacy optional fields remain readable and cannot acquire a grant during v
   assert.equal(user.desktopLifetimeGrantedAt, null);
 });
 
+for (const platform of ["ios", "windows", "macos"]) {
+  test(`${platform} signup, verification, and cross-device login retain both lifetime grants after offers turn OFF`, async () => {
+    await patch({ iosSignupLifetimeEnabled: true, desktopSignupLifetimeEnabled: true }).expect(200);
+    const email = `${runId}-cross-${platform}@example.test`;
+    const password = "cross-device-test-password";
+    const registered = await request(app).post("/api/auth/register")
+      .set("x-welockin-platform", platform).set("x-welockin-device-id", `${platform}-signup`)
+      .send({ email, password }).expect(201);
+    const userId = registered.body.user.id;
+    assert.equal(registered.body.user.signupLifetimeOffer, "all");
+    assert.equal(registered.body.user.iosLifetimeGrantedAt, null);
+    assert.equal(registered.body.user.desktopLifetimeGrantedAt, null);
+    const code = await prisma.emailVerification.findFirst({ where: { userId }, orderBy: { createdAt: "desc" } });
+    await prisma.emailVerification.update({ where: { id: code.id }, data: { codeHash: hashCode("123456") } });
+    await patch({ iosSignupLifetimeEnabled: false, desktopSignupLifetimeEnabled: false }).expect(200);
+    await request(app).post("/api/auth/verify-email")
+      .set("authorization", `Bearer ${registered.body.token}`).send({ code: "123456" }).expect(200);
+    const saved = await prisma.user.findUnique({ where: { id: userId } });
+    assert.deepEqual(saved.iosLifetimeGrantedAt, saved.emailVerifiedAt);
+    assert.deepEqual(saved.desktopLifetimeGrantedAt, saved.emailVerifiedAt);
+
+    for (const [destination, deviceId] of [["ios", "ios-cross"], ["windows", "win-cross"], ["macos", "mac-cross"]]) {
+      const login = await request(app).post("/api/auth/login")
+        .set("x-welockin-platform", destination).set("x-welockin-device-id", deviceId)
+        .send({ email, password }).expect(200);
+      const auth = { authorization: `Bearer ${login.body.token}`, "x-welockin-platform": destination,
+        "x-welockin-device-id": deviceId };
+      for (const path of ["/api/entitlement", "/api/billing/entitlement"]) {
+        const view = await request(app).get(path).set(auth).expect(200);
+        assert.equal(view.body.isPro, true);
+        assert.equal(view.body.plan, "lifetime");
+        assert.equal(view.body.validUntil, null);
+        assert.equal(view.body.trialEndsAt, null);
+        assert.equal(view.body.purchaseEligibility.lifetime.canPurchase, false);
+      }
+    }
+    const replay = await prisma.user.findUnique({ where: { id: userId } });
+    assert.deepEqual(replay.iosLifetimeGrantedAt, saved.iosLifetimeGrantedAt);
+    assert.deepEqual(replay.desktopLifetimeGrantedAt, saved.desktopLifetimeGrantedAt);
+    assert.equal(await prisma.purchase.count({ where: { userId } }), 0);
+    assert.equal(await prisma.subscription.count({ where: { userId } }), 0);
+  });
+}
+
 test("reservation activation is atomic with verification and rolls back with code consumption", async () => {
   const entry = await account({ signupPlatform: "ios", signupLifetimeOffer: "ios" });
   assert.equal((await patch({ iosSignupLifetimeEnabled: false })).status, 200);
@@ -185,7 +230,7 @@ test("real signup snapshots OFF/ON, verifies after a toggle and grants only the 
   const reserved = [];
   for (const platform of ["ios", "windows", "macos"] as const) {
     const entry = await register(platform);
-    assert.equal(entry.user.signupLifetimeOffer, platform === "ios" ? "ios" : "desktop");
+    assert.equal(entry.user.signupLifetimeOffer, "all");
     const pending = await request(app).get("/api/entitlement").set(entry.auth).set(contexts[platform]);
     assert.equal(pending.status, 200);
     assert.equal(pending.body.isPro, false, "a reservation cannot open the paywall before verification");
@@ -203,16 +248,13 @@ test("real signup snapshots OFF/ON, verifies after a toggle and grants only the 
 
     for (const platform of ["ios", "windows", "macos"] as const) {
       const access = await request(app).get("/api/entitlement").set(entry.auth).set(contexts[platform]);
-      const shouldGrant = (platform === "ios") === (entry.platform === "ios");
       assert.equal(access.status, 200);
-      assert.equal(access.body.isPro, shouldGrant, `${entry.platform} signup used on ${platform}`);
-      assert.equal(access.body.plan, shouldGrant ? "lifetime" : null);
-      assert.equal(access.body.complimentaryLifetime, shouldGrant ? (entry.platform === "ios" ? "ios" : "desktop") : null);
-      if (shouldGrant) {
-        assert.equal(access.body.validUntil, null);
-        assert.equal(access.body.purchaseEligibility.lifetime.canPurchase, false);
-        assert.equal(access.body.billingProvider, "NONE");
-      }
+      assert.equal(access.body.isPro, true, `${entry.platform} signup used on ${platform}`);
+      assert.equal(access.body.plan, "lifetime");
+      assert.equal(access.body.complimentaryLifetime, platform === "ios" ? "ios" : "desktop");
+      assert.equal(access.body.validUntil, null);
+      assert.equal(access.body.purchaseEligibility.lifetime.canPurchase, false);
+      assert.equal(access.body.billingProvider, "NONE");
     }
 
     const login = await request(app).post("/api/auth/login").set(contexts[entry.platform])
@@ -231,4 +273,50 @@ test("real signup snapshots OFF/ON, verifies after a toggle and grants only the 
   assert.equal(await prisma.subscription.count(), 0);
   assert.equal(await prisma.trialClaim.count(), 0);
   assert.equal(externalRequests, 0, "neither email nor payment providers were contacted");
+});
+
+test("one-off lifetime cohort is previewed, audited, idempotent and excludes both protected accounts", async () => {
+  const createdAt = new Date("2020-01-01T00:00:00Z");
+  const cutoff = new Date("2020-01-02T00:00:00Z");
+  const oldGrant = new Date("2020-01-01T12:00:00Z");
+  const protectedUsers = await Promise.all(["maaref", "reviewer-expired"].map((name) =>
+    prisma.user.create({ data: { email: `${runId}-${name}@example.test`, createdAt, plan: "expired" } })));
+  const eligible = await prisma.user.create({ data: {
+    email: `${runId}-cohort@example.test`, createdAt, emailVerified: true, iosLifetimeGrantedAt: oldGrant,
+  } });
+  const unverified = await prisma.user.create({ data: {
+    email: `${runId}-unverified@example.test`, createdAt, emailVerified: false,
+  } });
+  const future = await prisma.user.create({ data: { email: `${runId}-later@example.test` } });
+  const options = { cutoff, excludedEmails: protectedUsers.map((user: any) => user.email), reason: "Fixture operator request" };
+  const preview = await grantLifetimeCohort(prisma, options);
+  assert.equal(preview.accounts, 4);
+  assert.equal(preview.targets, 2);
+  assert.equal(preview.pending, 2);
+  assert.equal(preview.granted, 0);
+  assert.equal(preview.awaitingEmailVerification, 1);
+  assert.equal((await prisma.user.findUnique({ where: { id: eligible.id } })).desktopLifetimeGrantedAt, null);
+  await assert.rejects(grantLifetimeCohort(prisma, { ...options, apply: true }), /not previewed/);
+  await assert.rejects(grantLifetimeCohort(prisma, {
+    ...options, excludedEmails: ["missing@example.test"], apply: true, expectedCohortHash: preview.cohortHash,
+  }), /resolve exactly once/);
+  failAudit = true;
+  try {
+    await assert.rejects(grantLifetimeCohort(prisma, { ...options, apply: true, expectedCohortHash: preview.cohortHash }));
+  } finally { failAudit = false; }
+  assert.equal((await prisma.user.findUnique({ where: { id: eligible.id } })).desktopLifetimeGrantedAt, null);
+  const applied = await grantLifetimeCohort(prisma, { ...options, apply: true, expectedCohortHash: preview.cohortHash });
+  assert.equal(applied.granted, 2);
+  const saved = await prisma.user.findUnique({ where: { id: eligible.id } });
+  assert.deepEqual(saved.iosLifetimeGrantedAt, oldGrant);
+  assert.ok(saved.desktopLifetimeGrantedAt instanceof Date);
+  assert.equal((await prisma.user.findUnique({ where: { id: unverified.id } })).emailVerified, false);
+  for (const before of [...protectedUsers, future]) {
+    assert.deepEqual(await prisma.user.findUnique({ where: { id: before.id } }), before);
+  }
+  const replay = await grantLifetimeCohort(prisma, { ...options, apply: true, expectedCohortHash: preview.cohortHash });
+  assert.equal(replay.granted, 0);
+  assert.equal(replay.pending, 0);
+  assert.equal(await prisma.adminAuditLog.count({ where: { action: "grant_lifetime_all_platforms" } }), 2);
+  assert.deepEqual(await prisma.user.findUnique({ where: { id: eligible.id } }), saved);
 });

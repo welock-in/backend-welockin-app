@@ -13,7 +13,7 @@ import { verifyToken } from "../lib/jwt";
 import { clientIp, consumeRateLimit } from "../lib/rate-limit";
 import { asyncHandler } from "../middleware/async-handler";
 import { precheckSchema } from "../validation/schemas";
-import { readClientPlatform, reserveSignupLifetimeOffer } from "../lib/signup-lifetime";
+import { readClientPlatform, reserveSignupLifetimeOffer, signupLifetimeOfferForPlatform } from "../lib/signup-lifetime";
 
 /**
  * `POST /api/auth/precheck` — "does this phone already have a paying account?"
@@ -88,7 +88,8 @@ authPrecheckRouter.post(
     if (isReliableDeviceId(rawDeviceId)) {
       await consumeRateLimit(`precheck:device:${ledgerHash(rawDeviceId)}`, 30, 15 * 60 * 1000);
     }
-    const signupLifetimeOffer = await reserveSignupLifetimeOffer(readClientPlatform(req));
+    const platform = readClientPlatform(req);
+    const signupLifetimeOffer = signupLifetimeOfferForPlatform(await reserveSignupLifetimeOffer(platform), platform);
 
     // OPTIONAL auth — the same verification `requireAuth` performs, minus the
     // refusal. Only a VALID token names a caller; anything else is anonymous,

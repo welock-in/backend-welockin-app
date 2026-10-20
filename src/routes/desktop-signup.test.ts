@@ -276,7 +276,7 @@ function appleIdentity(t: TestContext, subject: string, emailVerified = true) {
   });
 }
 
-test("a new verified Apple signup activates the reserved offer atomically with creation", async (t) => {
+test("a new verified Apple signup activates both enabled offers atomically with creation", async (t) => {
   const state = setup(t);
   state.settings.iosSignupLifetimeEnabled = true;
   stubMethod(t, prisma.authProvider, "findUnique", async () => null);
@@ -285,12 +285,32 @@ test("a new verified Apple signup activates the reserved offer atomically with c
   assert.equal(res.status, 201);
   const data = state.creates[0][0].data;
   assert.equal(data.emailVerified, true);
-  assert.equal(data.signupLifetimeOffer, "ios");
+  assert.equal(data.signupLifetimeOffer, "all");
   assert.ok(data.iosLifetimeGrantedAt instanceof Date);
   assert.deepEqual(data.iosLifetimeGrantedAt, data.emailVerifiedAt);
-  assert.equal(data.desktopLifetimeGrantedAt, undefined);
+  assert.deepEqual(data.desktopLifetimeGrantedAt, data.emailVerifiedAt);
   assert.equal(state.trialCreates.length, 0);
 });
+
+for (const platform of ["ios", "windows", "macos"]) {
+  for (const [ios, desktop, expected] of [
+    [false, false, null], [true, false, "ios"], [false, true, "desktop"], [true, true, "all"],
+  ] as const) {
+    test(`${platform} registration reserves enabled account scopes: iOS=${ios}, desktop=${desktop}`, async (t) => {
+      const state = setup(t, desktop);
+      state.settings.iosSignupLifetimeEnabled = ios;
+      const res = await request(app).post("/api/auth/register")
+        .set("x-welockin-platform", platform).set("x-welockin-device-id", "supported-device")
+        .send({ email: EMAIL, password: PASSWORD, signupLifetimeOffer: "all",
+          desktopLifetimeGrantedAt: new Date().toISOString() });
+      assert.equal(res.status, 201, JSON.stringify(res.body));
+      assert.equal(state.users[0].signupLifetimeOffer, expected);
+      assert.equal(state.users[0].iosLifetimeGrantedAt, undefined);
+      assert.equal(state.users[0].desktopLifetimeGrantedAt, undefined);
+      assert.equal(state.trialCreates.length, expected ? 0 : 1);
+    });
+  }
+}
 
 for (const alreadyLinked of [true, false]) {
   test(`Apple ${alreadyLinked ? "login" : "linking"} never enrolls an existing account`, async (t) => {

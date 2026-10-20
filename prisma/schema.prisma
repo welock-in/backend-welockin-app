@@ -52,7 +52,7 @@ model User {
   /// Optional signup provenance. Only creation writes these fields; existing
   /// accounts are never enrolled by signing in or verifying an old address.
   signupPlatform          String? // "ios" | "windows" | "macos"; absent = unknown
-  signupLifetimeOffer     String? // "ios" | "desktop"; reservation, not access
+  signupLifetimeOffer     String? // "ios" | "desktop" | "all"; enabled scopes at signup, not access
   /// Permanent iOS/iPadOS access activated after verified signup.
   iosLifetimeGrantedAt    DateTime?
 

@@ -200,6 +200,43 @@ const iosContext = (platform = "ios", id = MOBILE) => ({
   ...device(id), "x-welockin-platform": platform,
 });
 
+test("one verified account with both signup grants has lifetime access and cannot buy again on any supported app", async (t) => {
+  const { user, provider } = fixture(t, {
+    iosLifetimeGrantedAt: new Date(), signupPlatform: "ios", signupLifetimeOffer: "all",
+  });
+  for (const [platform, id, scope] of [
+    ["ios", MOBILE, "ios"], ["ipados", MOBILE, "ios"],
+    ["windows", "win-same-account", "desktop"], ["macos", "mac-same-account", "desktop"],
+  ]) {
+    const headers = iosContext(platform, id);
+    for (const path of ["/api/entitlement", "/api/billing/entitlement"]) {
+      const res = await request(app).get(path).set(auth).set(headers);
+      assert.equal(res.status, 200);
+      assert.equal(res.body.isPro, true);
+      assert.equal(res.body.plan, "lifetime");
+      assert.equal(res.body.complimentaryLifetime, scope);
+      assert.equal(res.body.validUntil, null);
+      assert.equal(res.body.trialEndsAt, null);
+      assert.equal(readReceipt(res.body.receipt).isPro, true);
+      assert.equal(readReceipt(res.body.receipt).deviceId, id);
+    }
+    const sub = await request(app).get("/api/subscription").set(auth).set(headers);
+    for (const plan of ["monthly", "yearly", "lifetime"]) {
+      assert.equal(sub.body.purchaseEligibility[plan].canPurchase, false);
+      const checkout = await request(app).post("/api/checkout").set(auth).set(headers).send({ plan });
+      assert.equal(checkout.status, 409);
+      assert.equal(checkout.body.code, "LIFETIME_ALREADY_OWNED");
+    }
+  }
+  assert.equal(provider.callCount(), 0);
+  user.accessRevoked = true;
+  for (const headers of [iosContext(), device("win-same-account")]) {
+    const res = await request(app).get("/api/entitlement").set(auth).set(headers);
+    assert.equal(res.body.isPro, false);
+    assert.equal(readReceipt(res.body.receipt).isPro, false);
+  }
+});
+
 test("explicit desktop context and legacy ids resolve the same desktop gift", async (t) => {
   fixture(t);
   for (const platform of ["windows", "macos"]) {

@@ -4,7 +4,8 @@ import { HttpError } from "./http-error";
 import { prisma } from "./prisma";
 
 export type ClientPlatform = "ios" | "windows" | "macos" | "unknown";
-export type SignupLifetimeOffer = "ios" | "desktop";
+export type SignupLifetimeOffer = "ios" | "desktop" | "all";
+export type SignupLifetimeScope = "ios" | "desktop";
 export const SIGNUP_LIFETIME_SETTINGS_ID = "signup-lifetime";
 
 /** Legacy desktop IDs take precedence over a conflicting mobile header. */
@@ -58,12 +59,31 @@ export async function readSignupLifetimeSettings(): Promise<SignupLifetimeSettin
   }
 }
 
-/** Read-only offer lookup: precheck previews it; only account creation persists a reservation. */
+export function signupLifetimeOfferFromSettings(
+  settings: Pick<SignupLifetimeSettingsView, "iosSignupLifetimeEnabled" | "desktopSignupLifetimeEnabled">,
+): SignupLifetimeOffer | null {
+  if (settings.iosSignupLifetimeEnabled && settings.desktopSignupLifetimeEnabled) return "all";
+  if (settings.iosSignupLifetimeEnabled) return "ios";
+  if (settings.desktopSignupLifetimeEnabled) return "desktop";
+  return null;
+}
+
+export function includesSignupLifetimeScope(offer: string | null | undefined, scope: SignupLifetimeScope): boolean {
+  return offer === "all" || offer === scope;
+}
+
+/** The reservation belongs to the account, regardless of which supported app creates it. */
 export async function reserveSignupLifetimeOffer(platform: ClientPlatform): Promise<SignupLifetimeOffer | null> {
   const settings = await readSignupLifetimeSettings();
-  if (platform === "ios" && settings.iosSignupLifetimeEnabled) return "ios";
-  if ((platform === "windows" || platform === "macos") && settings.desktopSignupLifetimeEnabled) return "desktop";
-  return null;
+  return platform === "unknown" ? null : signupLifetimeOfferFromSettings(settings);
+}
+
+/** Keep the shipped precheck contract scoped to the app currently asking. */
+export function signupLifetimeOfferForPlatform(
+  offer: string | null | undefined, platform: ClientPlatform,
+): SignupLifetimeScope | null {
+  const scope = platform === "ios" ? "ios" : platform === "windows" || platform === "macos" ? "desktop" : null;
+  return scope && includesSignupLifetimeScope(offer, scope) ? scope : null;
 }
 
 type ReservedSignup = {
@@ -78,12 +98,11 @@ export function signupLifetimeGrantData(user: ReservedSignup, now: Date): {
   iosLifetimeGrantedAt?: Date;
   desktopLifetimeGrantedAt?: Date;
 } {
-  if (user.signupLifetimeOffer === "ios" && user.signupPlatform === "ios" && !user.iosLifetimeGrantedAt) {
-    return { iosLifetimeGrantedAt: now };
-  }
-  if (user.signupLifetimeOffer === "desktop" &&
-      (user.signupPlatform === "windows" || user.signupPlatform === "macos") && !user.desktopLifetimeGrantedAt) {
-    return { desktopLifetimeGrantedAt: now };
-  }
-  return {};
+  if (!["ios", "windows", "macos"].includes(user.signupPlatform ?? "")) return {};
+  return {
+    ...(includesSignupLifetimeScope(user.signupLifetimeOffer, "ios") && !user.iosLifetimeGrantedAt
+      ? { iosLifetimeGrantedAt: now } : {}),
+    ...(includesSignupLifetimeScope(user.signupLifetimeOffer, "desktop") && !user.desktopLifetimeGrantedAt
+      ? { desktopLifetimeGrantedAt: now } : {}),
+  };
 }

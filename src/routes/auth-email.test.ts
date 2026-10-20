@@ -531,6 +531,11 @@ for (const [platform, offer, grantField] of [
   ["ios", "ios", "iosLifetimeGrantedAt"],
   ["windows", "desktop", "desktopLifetimeGrantedAt"],
   ["macos", "desktop", "desktopLifetimeGrantedAt"],
+  ["ios", "all", "desktopLifetimeGrantedAt"],
+  ["windows", "all", "iosLifetimeGrantedAt"],
+  ["macos", "all", "iosLifetimeGrantedAt"],
+  ["ios", "desktop", "desktopLifetimeGrantedAt"],
+  ["windows", "ios", "iosLifetimeGrantedAt"],
 ] as const) {
   test(`first email verification activates the saved ${platform} offer even after the switch is OFF`, async (t) => {
     const users = fakeUsers(t, [{ id: USER_ID, email: USER_EMAIL, emailVerified: false,
@@ -544,6 +549,10 @@ for (const [platform, offer, grantField] of [
     const granted = users.store[0][grantField];
     assert.ok(granted instanceof Date);
     assert.deepEqual(granted, users.store[0].emailVerifiedAt);
+    if (offer === "all") {
+      assert.deepEqual(users.store[0].iosLifetimeGrantedAt, users.store[0].emailVerifiedAt);
+      assert.deepEqual(users.store[0].desktopLifetimeGrantedAt, users.store[0].emailVerifiedAt);
+    }
     assert.equal(settingReads.length, 0);
     const repeat = await request(app).post("/api/auth/verify-email").set(auth).send({ code: "000000" });
     assert.equal(repeat.status, 200);

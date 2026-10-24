@@ -15,7 +15,7 @@ export function validTimeZone(timeZone: string): boolean {
   }
 }
 
-function localParts(instant: Date, timeZone: string): LocalParts {
+export function localParts(instant: Date, timeZone: string): LocalParts {
   let formatter = formatters.get(timeZone);
   if (!formatter) {
     formatter = new Intl.DateTimeFormat("en-US", {
@@ -29,6 +29,35 @@ function localParts(instant: Date, timeZone: string): LocalParts {
     year: Number(fields.year), month: Number(fields.month), day: Number(fields.day),
     hour: Number(fields.hour), minute: Number(fields.minute),
   };
+}
+
+export type FocusScheduleWindow = {
+  days: number[]; // Monday = 0
+  start: number; end: number; enabled: boolean; activeFrom: number;
+  skipped?: string[]; // local YYYYMMDD occurrence start keys
+};
+
+/** A recurring phone schedule that has already begun on this local calendar
+ * day counts as focus, even when its completed event has not uploaded yet. */
+export function scheduleFocusedToday(windows: FocusScheduleWindow[], timeZone: string, from: Date, now: Date): boolean {
+  const startDay = localParts(from, timeZone);
+  for (const window of windows) {
+    if (!window.enabled || !window.days.length) continue;
+    for (const offset of [-1, 0]) {
+      const day = new Date(Date.UTC(startDay.year, startDay.month - 1, startDay.day + offset));
+      const weekday = (day.getUTCDay() + 6) % 7;
+      if (!window.days.includes(weekday)) continue;
+      const key = `${day.getUTCFullYear()}${String(day.getUTCMonth() + 1).padStart(2, "0")}${String(day.getUTCDate()).padStart(2, "0")}`;
+      if (window.skipped?.includes(key)) continue;
+      const start = localToUtc(day.getUTCFullYear(), day.getUTCMonth() + 1, day.getUTCDate(), Math.floor(window.start / 60), window.start % 60, timeZone);
+      const overnight = window.end <= window.start;
+      const endDay = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate() + (overnight ? 1 : 0)));
+      const endMinute = window.end === 1440 ? 1439 : window.end;
+      const end = localToUtc(endDay.getUTCFullYear(), endDay.getUTCMonth() + 1, endDay.getUTCDate(), Math.floor(endMinute / 60), endMinute % 60, timeZone);
+      if (start && end && window.activeFrom < end.getTime() && window.activeFrom <= now.getTime() && start < now && end > from) return true;
+    }
+  }
+  return false;
 }
 
 export function localDateKey(instant: Date, timeZone: string): string {

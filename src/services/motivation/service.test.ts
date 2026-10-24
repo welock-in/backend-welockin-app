@@ -94,3 +94,19 @@ test("a focus session already recorded today suppresses the reminder", async (t)
   assert.equal(report.skipped, 1);
   assert.equal(report.sent, 0);
 });
+
+test("a mobile schedule already begun today suppresses the reminder before event upload", async (t) => {
+  const scheduledAt = nextMotivationAt(new Date("2026-10-23T12:00:00Z"), "Europe/Paris", [0, 1, 2, 3, 4, 5, 6], USER);
+  assert.ok(scheduledAt);
+  stub(t, prisma.motivationPreference as any, "findMany", async () => [{
+    id: "507f1f77bcf86cd799439012", userId: USER, enabled: true,
+    weekdays: [0, 1, 2, 3, 4, 5, 6], timeZone: "Europe/Paris", language: "fr", nextSendAt: scheduledAt,
+    scheduleWindows: [{ days: [4], start: 9 * 60, end: 10 * 60, enabled: true, activeFrom: scheduledAt.getTime() - 86_400_000 }],
+  }]);
+  stub(t, prisma.motivationPreference as any, "updateMany", async () => ({ count: 1 }));
+  stub(t, prisma.focusEvent as any, "findFirst", async () => { throw new Error("unexpected focus event query"); });
+  stub(t, prisma.motivationSend as any, "create", async () => { throw new Error("unexpected reminder claim"); });
+  const report = await drainMotivationReminders(scheduledAt);
+  assert.equal(report.skipped, 1);
+  assert.equal(report.sent, 0);
+});

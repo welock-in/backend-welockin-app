@@ -578,6 +578,7 @@ model MotivationPreference {
   timeZone   String
   language   String   @default("en")
   nextSendAt DateTime?
+  scheduleWindows Json? // mobile recurring focus windows, used only to suppress a daily CTA
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 

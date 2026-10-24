@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chosenLocalMinute, localDateKey, localDayBounds, nextMotivationAt } from "./schedule";
+import { chosenLocalMinute, localDateKey, localDayBounds, nextMotivationAt, scheduleFocusedToday } from "./schedule";
 
 test("daily time is stable, in the agreed window, and never on :00 or :30", () => {
   for (let day = 1; day <= 31; day++) {
@@ -36,4 +36,16 @@ test("local day bounds adapt across the autumn daylight-saving change", () => {
 test("local day bounds adapt across the spring daylight-saving change", () => {
   const { from, to } = localDayBounds(new Date("2027-03-28T12:00:00Z"), "Europe/Paris");
   assert.equal(to.getTime() - from.getTime(), 23 * 60 * 60 * 1000);
+});
+
+test("a completed or active mobile schedule suppresses the day's CTA, including an overnight tail", () => {
+  const now = new Date("2026-10-23T16:00:00Z"); // Friday 18:00 in Paris
+  const { from } = localDayBounds(now, "Europe/Paris");
+  const morning = { days: [4], start: 9 * 60, end: 10 * 60, enabled: true, activeFrom: from.getTime() - 1 };
+  assert.equal(scheduleFocusedToday([morning], "Europe/Paris", from, now), true);
+  assert.equal(scheduleFocusedToday([{ ...morning, enabled: false }], "Europe/Paris", from, now), false);
+  assert.equal(scheduleFocusedToday([{ ...morning, skipped: ["20261023"] }], "Europe/Paris", from, now), false);
+  assert.equal(scheduleFocusedToday([{ ...morning, activeFrom: now.getTime() }], "Europe/Paris", from, now), false);
+  const overnight = { days: [3], start: 23 * 60, end: 60, enabled: true, activeFrom: from.getTime() - 86_400_000 };
+  assert.equal(scheduleFocusedToday([overnight], "Europe/Paris", from, now), true);
 });

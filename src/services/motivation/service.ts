@@ -4,7 +4,7 @@ import { notFound } from "../../lib/http-error";
 import { deliver } from "../notifications/deliver";
 import { MOTIVATION_TEXTS, renderMotivationText } from "./content";
 import { ensureMotivationIndexes } from "./indexes";
-import { ALL_WEEKDAYS, localDateKey, localDayBounds, nextMotivationAt } from "./schedule";
+import { ALL_WEEKDAYS, localDateKey, localDayBounds, nextMotivationAt, scheduleFocusedToday, type FocusScheduleWindow } from "./schedule";
 
 export type MotivationSettings = {
   enabled: boolean;
@@ -82,7 +82,12 @@ export async function saveMotivationChoices(userId: string, input: { enabled?: b
   return publicSettings(row);
 }
 
-async function focusedToday(userId: string, from: Date, to: Date, now: Date): Promise<boolean> {
+export async function saveMotivationSchedules(userId: string, windows: FocusScheduleWindow[]) {
+  await prisma.motivationPreference.update({ where: { userId }, data: { scheduleWindows: windows } });
+}
+
+async function focusedToday(userId: string, from: Date, to: Date, now: Date, windows: FocusScheduleWindow[], timeZone: string): Promise<boolean> {
+  if (scheduleFocusedToday(windows, timeZone, from, now)) return true;
   const [event, live] = await Promise.all([
     prisma.focusEvent.findFirst({ where: { userId, startedAt: { gte: from, lt: to } }, select: { id: true } }),
     prisma.liveSession.findFirst({ where: { userId, lastHeartbeatAt: { gte: new Date(now.getTime() - 10 * 60_000) } }, select: { id: true } }),
@@ -144,7 +149,8 @@ export async function drainMotivationReminders(now = new Date()) {
         return;
       }
       const { from, to } = localDayBounds(scheduledAt, preference.timeZone);
-      if (await focusedToday(preference.userId, from, to, now)) {
+      const windows = Array.isArray(preference.scheduleWindows) ? preference.scheduleWindows as FocusScheduleWindow[] : [];
+      if (await focusedToday(preference.userId, from, to, now, windows, preference.timeZone)) {
         report.skipped++;
         return;
       }

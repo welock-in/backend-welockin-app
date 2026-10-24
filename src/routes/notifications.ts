@@ -5,7 +5,7 @@ import { requireAuth } from "../middleware/auth";
 import { asyncHandler } from "../middleware/async-handler";
 import { pushTokenSchema } from "../validation/schemas";
 import { z } from "zod";
-import { getMotivationSettings, saveMotivationChoices, saveMotivationContext } from "../services/motivation/service";
+import { getMotivationSettings, saveMotivationChoices, saveMotivationContext, saveMotivationSchedules } from "../services/motivation/service";
 import { validTimeZone } from "../services/motivation/schedule";
 
 export const notificationsRouter = Router();
@@ -32,6 +32,21 @@ notificationsRouter.put("/motivation/context", requireAuth, asyncHandler(async (
 notificationsRouter.patch("/motivation", requireAuth, asyncHandler(async (req, res) => {
   const input = motivationChoicesSchema.parse(req.body);
   res.json(await saveMotivationChoices(req.user!.id, input));
+}));
+
+const scheduleWindowsSchema = z.array(z.object({
+  days: z.array(z.number().int().min(0).max(6)).max(7),
+  start: z.number().int().min(0).max(1439),
+  end: z.number().int().min(0).max(1440),
+  enabled: z.boolean(),
+  activeFrom: z.number().int().nonnegative(),
+  skipped: z.array(z.string().regex(/^\d{8}$/)).max(30).optional(),
+})).max(100);
+
+notificationsRouter.put("/motivation/schedules", requireAuth, asyncHandler(async (req, res) => {
+  const windows = scheduleWindowsSchema.parse(req.body?.windows);
+  await saveMotivationSchedules(req.user!.id, windows);
+  res.json({ ok: true });
 }));
 
 

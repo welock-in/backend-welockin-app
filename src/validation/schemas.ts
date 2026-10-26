@@ -654,6 +654,9 @@ export const onboardingSubmitSchema = z.object({
   // other answer. v2 clients always send the key (`answers.university ?? null`);
   // only pre-v2 binaries omit it.
   university: z.string().trim().min(1).max(160).nullable().optional(),
+  // New clients pair the display name with this stable identity. Old clients
+  // omit it; the route clears a previous ID when they replace the name.
+  universityRorId: z.string().regex(/^https:\/\/ror\.org\/[0-9a-z]{9}$/).nullable().optional(),
   goal: answerSlug.optional(),
   // Tap order is preserved (screen 12 renders the first three). 32 is a raw-input
   // bound; the normaliser dedupes and stores at most 16.

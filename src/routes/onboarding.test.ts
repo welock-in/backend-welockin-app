@@ -47,6 +47,7 @@ function row(overrides: Partial<OnboardingProfile> = {}): OnboardingProfile {
     ageBand: "25_34",
     profileSlug: "founder_or_freelancer",
     university: null,
+    universityRorId: null,
     goalSlug: "focus_better",
     distractingAppSlugs: ["instagram", "tiktok", "youtube"],
     selfReportedDailyHours: 6,
@@ -288,6 +289,19 @@ test("a submission carrying a university stores it and returns it", async (t) =>
   assert.equal(res.body.onboarding.profile, "undergraduate");
 });
 
+test("a selected ROR university stores its stable ID with its name", async (t) => {
+  stubMethod(t, prisma.onboardingProfile as any, "findUnique", async () => null);
+  const createCalls = stubCreate(t);
+  stubUserUpdate(t);
+  const id = "https://ror.org/02s376052";
+  const res = await request(app).post("/api/onboarding").set(auth).send(
+    body({ profile: "undergraduate", university: "École Polytechnique Fédérale de Lausanne", universityRorId: id }),
+  );
+  assert.equal(res.status, 201);
+  assert.equal(createCalls[0][0].data.universityRorId, id);
+  assert.equal(res.body.onboarding.universityRorId, id);
+});
+
 test("an edit without a university leaves the stored value untouched", async (t) => {
   const existing = row({ profileSlug: "undergraduate", university: "EPFL" });
   stubMethod(t, prisma.onboardingProfile as any, "findUnique", async () => existing);
@@ -326,7 +340,20 @@ test("an edit sending university: null CLEARS the stored value", async (t) => {
   const data = updateCalls[0][0].data as Record<string, unknown>;
   assert.equal("university" in data, true, "null must reach the update, not be dropped");
   assert.equal(data.university, null);
+  assert.equal(data.universityRorId, null);
   assert.equal(res.body.onboarding.university, null);
+});
+
+test("an old client changing the name clears any previous ROR ID", async (t) => {
+  const existing = row({ university: "École Polytechnique Fédérale de Lausanne", universityRorId: "https://ror.org/02s376052" });
+  stubMethod(t, prisma.onboardingProfile as any, "findUnique", async () => existing);
+  const updateCalls = stubUpdate(t, existing);
+  stubUserUpdate(t);
+  const res = await request(app).post("/api/onboarding").set(auth).send(
+    body({ clientSubmissionId: "submission-0000-0002", university: "EPFL" }),
+  );
+  assert.equal(res.status, 200);
+  assert.equal(updateCalls[0][0].data.universityRorId, null);
 });
 
 test("university: null on a FIRST submission is accepted and stores null", async (t) => {

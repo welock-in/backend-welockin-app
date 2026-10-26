@@ -238,7 +238,7 @@ export const env = {
   // API key from resend.com. Email sending is DISABLED (no-op, logged) while empty.
   resendApiKey: process.env.RESEND_API_KEY ?? "",
   // Verified sender. Must be on a domain verified in your Resend account.
-  resendFrom: process.env.RESEND_FROM ?? "WeLockin <protection@welock.in>",
+  resendFrom: process.env.RESEND_FROM ?? "WeLockin <notifications@auth.welock.in>",
 
   // --- Expo push notifications ---
   // Optional Expo access token (recommended for enhanced security + higher rate

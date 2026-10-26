@@ -193,7 +193,7 @@ project's environment settings.
 | Var | Default | Purpose |
 |---|---|---|
 | `RESEND_API_KEY` | *(empty)* | Resend key. Email is a logged **no-op** while empty. |
-| `RESEND_FROM` | `WeLockin <protection@welock.in>` | Verified sender (domain must be verified in Resend). |
+| `RESEND_FROM` | `WeLockin <notifications@auth.welock.in>` | Verified sender for all transactional emails (domain must be verified in Resend). |
 
 ### Payments — Lemon Squeezy (desktop lifetime licence)
 

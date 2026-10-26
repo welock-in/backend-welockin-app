@@ -25,6 +25,7 @@ import { attestRouter } from "./routes/attest";
 import { breaksRouter } from "./routes/breaks";
 import { notificationsRouter } from "./routes/notifications";
 import { onboardingRouter } from "./routes/onboarding";
+import { universitiesRouter } from "./routes/universities";
 import { checkoutRouter } from "./routes/checkout";
 import { subscriptionRouter } from "./routes/subscription";
 import { lemonSqueezyWebhookRouter } from "./routes/webhooks-lemonsqueezy";
@@ -116,6 +117,8 @@ export function createApp(): Express {
   // platform allow-list, hard shape caps and a per-run write ceiling inside
   // the route, not by auth.
   app.use("/api/funnel", funnelRouter);
+  // The university step runs before signup, so search is public and bounded.
+  app.use("/api/universities", universitiesRouter);
   // Screen Time extensions run outside the authenticated React Native process.
   // This one narrow route authenticates with a per-member room capability.
   app.use("/api/friend-focus", friendFocusReportRouter);

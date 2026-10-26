@@ -693,6 +693,8 @@ model OnboardingProfile {
   // Optional like every column added after launch (create-time defaults never
   // rewrite existing documents on MongoDB); absent on pre-v2 rows.
   university             String?
+  // Stable ROR ID for a selected institution; null for free text or old clients.
+  universityRorId        String?
   goalSlug               String? // e.g. "focus_better"
   // SELF-DECLARED distractions from a fixed list — NOT the FamilyControls
   // selection (those tokens are opaque and never leave the device). Order is the

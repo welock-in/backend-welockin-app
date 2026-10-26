@@ -52,6 +52,7 @@ function onboardingProfileDto(p: OnboardingProfile) {
     ageBand: p.ageBand,
     profile: p.profileSlug ?? null,
     university: p.university ?? null,
+    universityRorId: p.universityRorId ?? null,
     goal: p.goalSlug ?? null,
     distractingApps: p.distractingAppSlugs,
     selfReportedDailyHours: p.selfReportedDailyHours,
@@ -146,6 +147,11 @@ onboardingRouter.post(
       // through on purpose: it CLEARS the column (student → non-student re-run),
       // which is exactly why absent and null must stay distinguishable here.
       ...(input.university !== undefined ? { university: input.university } : {}),
+      // A new name from an old client, or a free-text pick, must not retain an
+      // ID from the preceding selection. Omission alone is a partial edit.
+      ...(input.university !== undefined
+        ? { universityRorId: input.university === null ? null : (input.universityRorId ?? null) }
+        : input.universityRorId !== undefined ? { universityRorId: input.universityRorId } : {}),
       ...(input.goal !== undefined ? { goalSlug: normalizeSlug(input.goal) } : {}),
       ...(input.distractingApps !== undefined
         ? { distractingAppSlugs: normalizeSlugList(input.distractingApps) }

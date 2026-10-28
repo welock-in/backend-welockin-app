@@ -1,4 +1,10 @@
-# WeLockin Backend
+# WeLockIn — backend services
+
+Shared backend services for the WeLockIn focus applications, built with TypeScript, Express and Prisma with MongoDB.
+
+This is the backend repository. The [organisation](https://github.com/welock-in) also maintains the website, administration interface and separate desktop/mobile clients; several client repositories are private. Platform availability and protection behaviour must be checked against the relevant client release rather than inferred from this service.
+
+Start with the architecture and development guides linked below. The detailed documentation is retained, including dated implementation notes and limitations.
 
 ## Documentation à jour
 
